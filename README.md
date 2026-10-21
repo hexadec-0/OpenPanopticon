@@ -1,6 +1,4 @@
-# OPENPANOPTICON
-
-**OSINT Data Fusion**
+# OpenPanopticon | OSINT Data Fusion
 
 A geospatial intelligence terminal that runs on your own machine. Point it at
 anywhere on Earth and it overlays live public data on a 3D globe (internet-exposed
