@@ -1,0 +1,5 @@
+# Secrets
+.env
+
+# Cached upstream API responses (OSM data under ODbL, etc.)
+vendor/cache/
