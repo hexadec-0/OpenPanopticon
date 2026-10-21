@@ -79,18 +79,17 @@ each optional key in `.env.example` upgrades one layer.
 [![ Demonstration Video & Tour ](https://img.youtube.com/vi/AVqyvgPxVO8/0.jpg)](https://www.youtube.com/watch?v=AVqyvgPxVO8)
 
 **Demo Images**
+<img width="2351" height="1226" alt="OpenPanopticon Demo1" src="https://github.com/user-attachments/assets/aeedf12d-1f3b-4f8c-87a7-6b51a7cf1ccd" />
 
-<img width="2351" height="1226" alt="OpenPanopticon Demo1" src="https://github.com/user-attachments/assets/929b9135-87b7-48f5-9895-8fdbf9308655" />
+<img width="2352" height="1223" alt="OpenPanopticon Demo2" src="https://github.com/user-attachments/assets/4d1f91c8-02f5-46c3-8c2b-8d899ee0df84" />
 
-<img width="2352" height="1223" alt="OpenPanopticon Demo2" src="https://github.com/user-attachments/assets/999bcc94-b733-47ef-ad50-665350c3dea7" />
+<img width="2347" height="1183" alt="OpenPanopticon Demo3" src="https://github.com/user-attachments/assets/9ad7bd67-ed1e-4b22-83b3-b437590dbe0e" />
 
-<img width="2347" height="1183" alt="OpenPanopticon Demo3" src="https://github.com/user-attachments/assets/bb0c1ac1-0381-4e0d-81e6-c0cf3115e07c" />
+<img width="2345" height="1175" alt="OpenPanopticon Demo4" src="https://github.com/user-attachments/assets/52eb6549-8900-43af-9cd5-71820e843573" />
 
-<img width="2345" height="1175" alt="OpenPanopticon Demo4" src="https://github.com/user-attachments/assets/0a446041-e714-4b3b-a71f-d1251b24132f" />
+<img width="2347" height="1188" alt="OpenPanopticon Demo5" src="https://github.com/user-attachments/assets/5cbf4d94-f7f2-4617-b2be-84a1944034a0" />
 
-<img width="2347" height="1188" alt="OpenPanopticon Demo5" src="https://github.com/user-attachments/assets/0979bb53-e240-4fdb-9a79-43ba1746ce4f" />
-
-<img width="2346" height="1186" alt="OpenPanopticon Demo6" src="https://github.com/user-attachments/assets/1bf3af5d-89dd-4dda-b9fa-96599cd9d40f" />
+<img width="2346" height="1186" alt="OpenPanopticon Demo6" src="https://github.com/user-attachments/assets/23d9c10a-8ef3-40e5-ade3-98c5ffe8cc23" />
 
 
 ## What's on the globe
