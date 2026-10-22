@@ -10,7 +10,7 @@
 [![Built on CesiumJS](https://img.shields.io/badge/globe-CesiumJS-6CADDF)](https://cesium.com/platform/cesiumjs/)
 [![Demo video](https://img.shields.io/badge/demo-YouTube-FF0000?logo=youtube&logoColor=white)](https://www.youtube.com/watch?v=AVqyvgPxVO8)
 
-[Run it](#run-it) · [Live demo](https://DEMO-URL.com) · [Screenshots](#screenshots-and-demo-video) · [Layers](#whats-on-the-globe) · [Caching](#caching) · [Architecture](#how-its-put-together) · [Responsible use](#using-this-responsibly)
+[Run it](#run-it) · [Live demo](https://hexadec-0.github.io/OpenPanopticon/) · [Screenshots](#screenshots-and-demo-video) · [Layers](#whats-on-the-globe) · [Caching](#caching) · [Architecture](#how-its-put-together) · [Responsible use](#using-this-responsibly)
 
 </div>
 
@@ -97,7 +97,7 @@ ceilings use more API credits. See [Altitude gate](#altitude-gate).
 ## Screenshots and demo video
 
 **Live demo**: a static, no-install version runs on GitHub Pages at
-<https://DEMO-URL.com>.
+<https://hexadec-0.github.io/OpenPanopticon/>.
 
 **Demonstration video and tour**
 
@@ -499,7 +499,7 @@ providers/           runtime data written by the server, never committed:
 package.json         Node engine, scripts. No runtime dependencies
 test/                the test suite (see test/README.md)
 demo/                static GitHub Pages demo (see demo/README.md;
-                     live at https://DEMO-URL.com)
+                     live at https://hexadec-0.github.io/OpenPanopticon/)
 docs/                the built demo, once captured (served by GitHub Pages)
 LICENSE              GPL-3.0-or-later
 ```
