@@ -118,15 +118,19 @@ describe('loopback server', () => {
       assert.match(r.headers['content-type'], /^application\/json/);
     });
 
-    test('the page carries a report-only CSP; assets do not', async () => {
+    test('the page carries an enforced CSP; assets do not', async () => {
       const html = await s.request('/');
-      const csp = html.headers['content-security-policy-report-only'];
+      assert.equal(html.headers['content-security-policy-report-only'], undefined, 'enforced, not report-only');
+      const csp = html.headers['content-security-policy'];
       assert.ok(csp);
-      for (const d of ["default-src 'self'", "object-src 'none'", "base-uri 'none'", "frame-ancestors 'none'"]) {
+      for (const d of ["default-src 'self'", "script-src-attr 'none'", "object-src 'none'",
+        "base-uri 'none'", "frame-ancestors 'none'"]) {
         assert.ok(csp.includes(d), d);
       }
-      assert.ok(!/script-src[^;]*'unsafe-inline'/.test(csp), 'no inline scripts allowed');
-      assert.equal((await s.request('/js/app.js')).headers['content-security-policy-report-only'], undefined);
+      assert.ok(!/script-src[^;]*'unsafe-inline'/.test(csp), 'no inline scripts');
+      const img = /img-src ([^;]*)/.exec(csp)[1].split(/\s+/);
+      assert.ok(!img.includes('http:'), 'images are https only');
+      assert.equal((await s.request('/js/app.js')).headers['content-security-policy'], undefined);
     });
 
     test('errors are JSON with the same headers', async () => {

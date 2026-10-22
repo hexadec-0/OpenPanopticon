@@ -63,7 +63,8 @@ describe('cachedPersistent() and the disk tier', () => {
     assert.equal(files.length >= 1, true);
     const rec = JSON.parse(fs.readFileSync(path.join(S.DISK_CACHE_DIR, files.find((f) => f.endsWith('.json'))), 'utf8'));
     assert.ok(rec.savedAt > 0);
-    assert.ok(typeof rec.key === 'string');
+    assert.equal(rec.keyHash, S.diskKeyHash('disk:a'));
+    assert.equal(rec.key, undefined, 'the key itself is not written in clear');
   });
 
   test('a fresh process (empty memory) is served from disk', async () => {
@@ -78,7 +79,7 @@ describe('cachedPersistent() and the disk tier', () => {
     await S.writeDiskCache('disk:c', 'old');
     const file = fs.readdirSync(S.DISK_CACHE_DIR)
       .map((f) => path.join(S.DISK_CACHE_DIR, f))
-      .find((f) => JSON.parse(fs.readFileSync(f, 'utf8')).key === 'disk:c');
+      .find((f) => f.endsWith(S.diskName('disk:c')));
     const rec = JSON.parse(fs.readFileSync(file, 'utf8'));
     rec.savedAt = Date.now() - 2 * 60_000;
     fs.writeFileSync(file, JSON.stringify(rec));
@@ -90,9 +91,9 @@ describe('cachedPersistent() and the disk tier', () => {
     await S.writeDiskCache('disk:d', 'value');
     const file = fs.readdirSync(S.DISK_CACHE_DIR)
       .map((f) => path.join(S.DISK_CACHE_DIR, f))
-      .find((f) => JSON.parse(fs.readFileSync(f, 'utf8')).key === 'disk:d');
+      .find((f) => f.endsWith(S.diskName('disk:d')));
     const rec = JSON.parse(fs.readFileSync(file, 'utf8'));
-    rec.key = 'something else';
+    rec.keyHash = S.diskKeyHash('something else');
     fs.writeFileSync(file, JSON.stringify(rec));
     assert.equal(await S.readDiskCache('disk:d', 60_000), undefined);
   });
@@ -101,7 +102,7 @@ describe('cachedPersistent() and the disk tier', () => {
     await S.writeDiskCache('disk:e', 'value');
     for (const f of fs.readdirSync(S.DISK_CACHE_DIR)) {
       const p = path.join(S.DISK_CACHE_DIR, f);
-      if (JSON.parse(fs.readFileSync(p, 'utf8')).key === 'disk:e') fs.writeFileSync(p, '{not json');
+      if (f === S.diskName('disk:e')) fs.writeFileSync(p, '{not json');
     }
     assert.equal(await S.readDiskCache('disk:e', 60_000), undefined);
   });
@@ -110,6 +111,52 @@ describe('cachedPersistent() and the disk tier', () => {
     await S.cachedPersistent('disk:f', 60_000, async () => 'stored');
     S.cache.clear();
     assert.equal(await fresh(() => S.cachedPersistent('disk:f', 60_000, async () => 'new')), 'new');
+  });
+
+  test('pruneDiskCache() deletes what can no longer be served and keeps the rest', async () => {
+    await S.writeDiskCache('prune:old', 'old');
+    await S.writeDiskCache('prune:new', 'new');
+    const old = path.join(S.DISK_CACHE_DIR, S.diskName('prune:old'));
+    const past = (Date.now() - S.DISK_MAX_AGE - 60_000) / 1000;
+    fs.utimesSync(old, past, past);
+    const stale = path.join(S.DISK_CACHE_DIR, 'abandoned.json.123.tmp');
+    fs.writeFileSync(stale, '{');
+    fs.utimesSync(stale, past, past);
+
+    const r = await S.pruneDiskCache();
+    assert.ok(r.removed >= 2);
+    assert.equal(fs.existsSync(old), false);
+    assert.equal(fs.existsSync(stale), false);
+    assert.equal(await S.readDiskCache('prune:new', 60_000), 'new');
+  });
+
+  test('pruneDiskCache() rewrites old-format records without the key in clear', async () => {
+    const file = path.join(S.DISK_CACHE_DIR, S.diskName('legacy:shodan custom query'));
+    fs.mkdirSync(S.DISK_CACHE_DIR, { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ key: 'legacy:shodan custom query', savedAt: Date.now() - 3_600_000, value: [7] }));
+    // Still served before the rewrite, so an upgrade does not re-spend credits.
+    assert.deepEqual(await S.readDiskCache('legacy:shodan custom query', 2 * 3_600_000), [7]);
+
+    const expired = path.join(S.DISK_CACHE_DIR, S.diskName('legacy:expired'));
+    fs.writeFileSync(expired, JSON.stringify({ key: 'legacy:expired', savedAt: Date.now() - S.DISK_MAX_AGE - 1, value: 1 }));
+
+    const r = await S.pruneDiskCache();
+    assert.ok(r.rewritten >= 1);
+    const raw = fs.readFileSync(file, 'utf8');
+    assert.ok(!raw.includes('custom query'), 'key no longer stored in clear');
+    assert.ok(Math.abs(fs.statSync(file).mtimeMs - JSON.parse(raw).savedAt) < 2000, 'rewrite keeps the record age');
+    assert.deepEqual(await S.readDiskCache('legacy:shodan custom query', 2 * 3_600_000), [7]);
+    assert.equal(fs.existsSync(expired), false);
+  });
+
+  test('an entry past the longest TTL is deleted when read', async () => {
+    await S.writeDiskCache('disk:h', 'v');
+    const file = path.join(S.DISK_CACHE_DIR, S.diskName('disk:h'));
+    const rec = JSON.parse(fs.readFileSync(file, 'utf8'));
+    rec.savedAt = Date.now() - S.DISK_MAX_AGE - 60_000;
+    fs.writeFileSync(file, JSON.stringify(rec));
+    assert.equal(await S.readDiskCache('disk:h', 60_000), undefined);
+    assert.equal(fs.existsSync(file), false);
   });
 
   test('leaves no temporary files behind', async () => {

@@ -228,6 +228,17 @@ const api = async (path, params, {
   }
 };
 
+// Images in detail panels that fail to load are hidden rather than left as a
+// broken-image box. One capturing listener instead of inline onerror
+// attributes, which the page's Content-Security-Policy refuses to run.
+// (error does not bubble, so this listens in the capture phase.)
+if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+  document.addEventListener('error', (e) => {
+    const t = e.target;
+    if (t && t.tagName === 'IMG' && t.hasAttribute('data-hide-on-error')) t.style.display = 'none';
+  }, true);
+}
+
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g,
   (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
@@ -1082,8 +1093,7 @@ export class FlightLayer extends Layer {
       // table, so it is the first thing seen on a pick.
       const ps = photoSlot();
       if (ac.photo && ps) {
-        ps.innerHTML = `<img class="cam" src="${esc(safeUrl(ac.photo) || '')}" alt="aircraft"
-                         onerror="this.style.display='none'">`;
+        ps.innerHTML = `<img class="cam" src="${esc(safeUrl(ac.photo) || '')}" alt="aircraft" data-hide-on-error>`;
       }
     }
 
@@ -1679,8 +1689,7 @@ export class AlprLayer extends Layer {
       title: rec.operator || rec.manufacturer || vendorLabel,
       accent,
       html: `
-        ${safeUrl(rec.image) ? `<img class="cam" src="${esc(safeUrl(rec.image))}" alt="camera"
-                            onerror="this.style.display='none'">` : ''}
+        ${safeUrl(rec.image) ? `<img class="cam" src="${esc(safeUrl(rec.image))}" alt="camera" data-hide-on-error>` : ''}
         <table>${rows([
           ['Vendor', vendorLabel],
           ['Manufacturer', rec.manufacturer],
@@ -2275,7 +2284,7 @@ export class NetInfraLayer extends Layer {
           ...Object.entries(rec.detail || {}),
           ['Tags', rec.tags],
         ])}</table>
-        ${rec.source === 'atlas' ? `<a class="ext" href="https://atlas.ripe.net/probes/${rec.id.split(':')[1]}/"
+        ${rec.source === 'atlas' ? `<a class="ext" href="https://atlas.ripe.net/probes/${encodeURIComponent(rec.id.split(':')[1] ?? '')}/"
            target="_blank" rel="noopener">Open in RIPE Atlas ↗</a>` : ''}
         ${rec.source === 'wigle' ? '<p class="hint">Wireless survey data is contributed by volunteers '
           + 'and reflects where a network was observed, not who owns it.</p>' : ''}`,
@@ -2464,8 +2473,7 @@ export class TrafficLayer extends Layer {
         title: rec.title,
         accent: '#ffd166',
         html: `
-          ${safeUrl(rec.image) ? `<img class="cam" src="${esc(safeUrl(rec.image))}" alt="camera view"
-                              onerror="this.style.display='none'">` : ''}
+          ${safeUrl(rec.image) ? `<img class="cam" src="${esc(safeUrl(rec.image))}" alt="camera view" data-hide-on-error>` : ''}
           <table>${rows([
             ['Roadway', rec.roadway],
             ['Direction', rec.direction],

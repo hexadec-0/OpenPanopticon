@@ -236,7 +236,9 @@ than queried for a view box, and altitude is where you look at them from.
 
 Retention periods are set in one table near the top of `server.js`. Cached
 responses are kept in memory and on disk (`providers/cache/`), so they survive
-a restart.
+a restart. Geocoding results are the exception and stay in memory only (see
+[Privacy](#privacy)). Files on disk are pruned once they are older than the
+longest retention period (72 hours), at startup and every six hours.
 
 Every view-scoped source goes through `viewCell()`, which snaps the requested
 box outward onto a fixed grid and hands back both the box to query and the key
@@ -269,7 +271,7 @@ Classes are sorted not by importance but by how an answer goes wrong as it ages:
 
 | Class | Held | What |
 |---|---|---|
-| `static` | **72 hours** | Where fixed things are: OSM infrastructure, ALPR and webcam directories, Shodan hosts, cell and WiFi, Tor relays, seismometer stations, geocoding, airframes. |
+| `static` | **72 hours** | Where fixed things are: OSM infrastructure, ALPR and webcam directories, Shodan hosts, cell and WiFi, Tor relays, seismometer stations, geocoding (memory only), airframes. |
 | `orbit` | 24 hours | Orbital elements. |
 | `hazard` | 1 hour | Present-tense claims: active alerts and hazards, traffic incidents, outages, live sensor readings. |
 | `schedule` | 30 minutes | Flight schedules (see below). |
@@ -559,7 +561,7 @@ under [Caching](#caching).
 - **NWS**: about 85% of active alerts reference forecast zones instead of carrying a polygon. Resolving each zone would be hundreds of extra requests, so those are counted in the layer note but not drawn. The layer says how many.
 - **OpenWebcamDB**: free for non-commercial use only, and the documented list route has no spatial filter, so the whole catalogue (~1,500 cameras) is paged once and cached (`static`, 72 hours), then filtered locally.
 - **Overpass**: a donated, shared service with roughly two execution slots per IP. Every selected feature class goes out as **one** unioned query, not one query per class, and all Overpass-backed layers (infrastructure and ALPR) share a single serial queue with a minimum gap between requests. On a 429 the three mirrors rotate, then a cooldown applies and the layer schedules its own retry, and the sidebar shows the countdown rather than just failing.
-- **Nominatim**: 1 request/second; searches are debounced and cached for 72 hours (`static`).
+- **Nominatim**: 1 request/second; searches are debounced and cached in memory for 72 hours (`static`), never on disk.
 
 ---
 
@@ -603,6 +605,12 @@ is not anonymous:
   button bypasses that) and is never written to disk.
 - **Keyed queries are tied to your accounts.** Shodan, WiGLE, GreyNoise and
   the other keyed services log what your key searched for.
+- **Cached answers on disk show where you looked.** `providers/cache/` holds
+  upstream responses for the areas you viewed, for up to 72 hours. The server
+  deletes older files at startup and every six hours, and **FLUSH** deletes
+  them all. Cache keys are stored only as hashes, so a custom Shodan query is
+  not written in clear (its results still are). Place-name searches are never
+  written to disk; they are cached in memory for the session only.
 
 ---
 

@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+name: test
+
+# Actions are pinned to full commit SHAs (tag in the trailing comment), so a
+# moved or compromised tag cannot change what runs here. Bump both together.
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # Unit and functional tests on every OS the launch scripts support.
+  server:
+    name: unit + functional (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+
+  # The browser suite, against the Chrome preinstalled on the runner.
+  e2e:
+    name: puppeteer (ubuntu-latest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run test:e2e
+        env:
+          E2E_REQUIRED: '1'
+          CHROME_PATH: /usr/bin/google-chrome

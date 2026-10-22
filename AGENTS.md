@@ -22,6 +22,13 @@ on a Cesium globe. `npm start` runs it on http://127.0.0.1:8420.
   plain objects, never `Map`/`Set`, and rebuild them after reading.
 - All upstream text rendered in the browser goes through `esc()`. All upstream
   URLs go through `safeUrl()` on the server (`{ httpsOnly: true }` for iframes).
+- The page runs under an enforced Content-Security-Policy (`CSP` in
+  `server.js`): no inline `<script>`, no `on*=` attributes, and no `eval` in
+  app code (`'unsafe-eval'` is allowed only because Cesium needs it). Attach
+  handlers with `addEventListener` (hide broken images with
+  `data-hide-on-error`). The e2e suite fails on any CSP violation.
+- Nothing the operator types (searches, custom queries) is written to disk in
+  clear: disk cache records carry only a hash of their key.
 - The app carries no version number anywhere: not in `package.json`, the page,
   the startup banner, the API or the User-Agent.
 - Write comments as present-tense rationale, not debugging history.
@@ -34,6 +41,7 @@ Changes in these areas need a security review before they count as done:
 - **Upstream data rendered in the browser**: the `detail()` and `enrich()`
   methods in `public/js/layers.js`, and anything that sets `innerHTML`,
   `href` or iframe `src`.
+- **Browser policy**: the `CSP` and `SECURITY_HEADERS` in `server.js`.
 - **Network exposure**: the `HOST` binding, `ALLOWED_HOSTS`, the access key,
   the `X-Panopticon` header check, and `/api/shodan`.
 

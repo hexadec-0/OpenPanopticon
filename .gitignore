@@ -1,6 +1,12 @@
 # Secrets
 .env
 
+# Left by older versions of chromebook.sh, which wrote them into the project
+# folder. The log can hold the access-key URL. Current versions keep both
+# under ~/.local/state/openpanopticon instead.
+openpanopticon.log
+.openpanopticon.pid
+
 # Runtime data: cached upstream responses (OSM data under ODbL, etc.), the host's geoIP answer, downloaded TLEs and diagnostics. Never commit any of it.
 # Anchored to the root: the bundled satellite.js in public/providers/ IS committed.
 /providers/*

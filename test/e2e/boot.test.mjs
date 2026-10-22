@@ -22,6 +22,27 @@ e2e('boot', () => {
     assert.deepEqual(errors.map((e) => e.message), []);
   });
 
+  test('runs under its enforced CSP without a single violation', async () => {
+    await stack.reset();
+    const { page } = await stack.open();
+    for (const id of ['flights', 'satellites', 'events']) await waitForLayer(page, id);
+    assert.deepEqual(await page.evaluate(() => window.__csp), []);
+  });
+
+  test('the CSP is a backstop: markup that skips esc() still cannot run script', async () => {
+    await stack.reset();
+    const { page } = await stack.open();
+    await page.evaluate(() => {
+      const d = document.createElement('div');
+      d.innerHTML = '<img src="data:," onerror="window.__xss=1"><a id="jsurl" href="javascript:window.__xss=2">x</a>';
+      document.body.append(d);
+      d.querySelector('#jsurl').click();
+    });
+    await page.waitForFunction(() => window.__csp.length >= 1, { timeout: 5000 });
+    assert.equal(await page.evaluate(() => window.__xss), undefined);
+    assert.ok((await page.evaluate(() => window.__csp)).some((v) => /^script-src/.test(v)));
+  });
+
   test('first run switches on aircraft, satellites and hazards, and they draw', async () => {
     await stack.reset();
     const { page } = await stack.open();

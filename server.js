@@ -360,14 +360,29 @@ function viewCell(b, kind) {
 const DISK_CACHE_DIR = path.join(PROVIDERS_DIR, 'cache');
 const diskName = (key) => `${crypto.createHash('sha1').update(key).digest('hex')}.json`;
 
+// A cache key can be something the operator typed (a custom Shodan query), so
+// it is never written in clear. The record carries a hash of it instead,
+// which is still enough to tell a filename collision from a hit.
+const diskKeyHash = (key) => crypto.createHash('sha256').update(`openpanopticon:${key}`).digest('hex');
+
+// Nothing reads the disk tier with a TTL longer than this, so a file older
+// than it can never be served again and is only a record of where the map
+// was pointed. pruneDiskCache() removes those.
+const DISK_MAX_AGE = TTL.static;
+
 async function readDiskCache(key, ttlMs) {
   if (wantsFresh()) return undefined;
+  const file = path.join(DISK_CACHE_DIR, diskName(key));
   try {
-    const file = path.join(DISK_CACHE_DIR, diskName(key));
     const raw = await fsp.readFile(file, 'utf8');
     const rec = JSON.parse(raw);
-    if (rec.key !== key) return undefined;                   // hash collision
-    if (Date.now() - rec.savedAt > ttlMs) return undefined;  // expired
+    // A collision, unless it is a record from before keys were hashed that
+    // pruneDiskCache() has not rewritten yet.
+    if (rec.keyHash !== diskKeyHash(key) && rec.key !== key) return undefined;
+    if (Date.now() - rec.savedAt > ttlMs) {                   // expired
+      if (Date.now() - rec.savedAt > DISK_MAX_AGE) await fsp.unlink(file).catch(() => {});
+      return undefined;
+    }
     return rec.value;
   } catch {
     return undefined;
@@ -381,11 +396,59 @@ async function writeDiskCache(key, value) {
     // Write then rename, so a crash mid-write cannot leave a half file that
     // later parses as valid JSON.
     const tmp = `${file}.${process.pid}.tmp`;
-    await fsp.writeFile(tmp, JSON.stringify({ key, savedAt: Date.now(), value }), 'utf8');
+    await fsp.writeFile(tmp, JSON.stringify({ keyHash: diskKeyHash(key), savedAt: Date.now(), value }), 'utf8');
     await fsp.rename(tmp, file);
   } catch (e) {
     log('warn', `could not persist cache entry: ${e.message}`);
   }
+}
+
+/**
+ * Delete what the disk tier can no longer serve.
+ *
+ * Without this, expired answers stay in providers/cache until FLUSH, and
+ * together they are a history of every place looked at. Runs at startup and
+ * every few hours. Files written before keys were hashed carry the key in
+ * clear: still-live ones are rewritten without it (they may have cost a
+ * Shodan credit), expired ones are deleted.
+ */
+async function pruneDiskCache({ now = Date.now() } = {}) {
+  let names;
+  try { names = await fsp.readdir(DISK_CACHE_DIR); } catch { return { removed: 0, rewritten: 0 }; }
+  let removed = 0; let rewritten = 0;
+  for (const name of names) {
+    const file = path.join(DISK_CACHE_DIR, name);
+    try {
+      const st = await fsp.stat(file);
+      if (!st.isFile()) continue;
+      const age = now - st.mtimeMs;
+      if (name.endsWith('.tmp')) {
+        // A write that never got renamed; give a live one an hour to finish.
+        if (age > 60 * 60_000) { await fsp.unlink(file); removed++; }
+        continue;
+      }
+      if (!name.endsWith('.json')) continue;
+      if (age > DISK_MAX_AGE) { await fsp.unlink(file); removed++; continue; }
+
+      const fh = await fsp.open(file, 'r');
+      const head = Buffer.alloc(16);
+      try { await fh.read(head, 0, 16, 0); } finally { await fh.close(); }
+      if (!head.toString('utf8').startsWith('{"key":')) continue;
+
+      const rec = JSON.parse(await fsp.readFile(file, 'utf8'));
+      if (typeof rec.key !== 'string' || !(now - rec.savedAt <= DISK_MAX_AGE)) {
+        await fsp.unlink(file); removed++; continue;
+      }
+      const tmp = `${file}.${process.pid}.tmp`;
+      await fsp.writeFile(tmp, JSON.stringify({ keyHash: diskKeyHash(rec.key), savedAt: rec.savedAt, value: rec.value }), 'utf8');
+      await fsp.rename(tmp, file);
+      // Keep the original age, which the mtime check above prunes by.
+      const saved = new Date(rec.savedAt);
+      await fsp.utimes(file, saved, saved).catch(() => {});
+      rewritten++;
+    } catch { /* unreadable or already gone: leave it for FLUSH */ }
+  }
+  return { removed, rewritten };
 }
 
 /** cached(), plus a disk tier underneath it. */
@@ -889,7 +952,13 @@ let shodanIdx = null;
 async function shodanIndex() {
   if (!shodanIdx) {
     const stored = await readDiskCache(SHODAN_INDEX_KEY, TTL.static);
-    shodanIdx = Array.isArray(stored) ? stored : [];
+    // The filter can be a query the operator typed, so the index keeps only
+    // a hash of it. Entries saved before that carry it in clear: convert them.
+    shodanIdx = (Array.isArray(stored) ? stored : []).map((e) => {
+      if (!e || typeof e.base !== 'string') return e;
+      const { base, ...rest } = e;
+      return { ...rest, baseHash: diskKeyHash(base) };
+    });
   }
   const cutoff = Date.now() - TTL.static;
   shodanIdx = shodanIdx.filter((e) => e && e.savedAt > cutoff);
@@ -899,7 +968,7 @@ async function shodanIndex() {
 /** The smallest bought box for this filter that covers the view, if any. */
 async function findBoughtShodanBox(view, base, stillCached) {
   const hits = (await shodanIndex())
-    .filter((e) => e.base === base && boxContains(e, view))
+    .filter((e) => e.baseHash === diskKeyHash(base) && boxContains(e, view))
     .sort((x, y) => (x.north - x.south) * (x.east - x.west) - (y.north - y.south) * (y.east - y.west));
   for (const e of hits) {
     const box = { south: e.south, west: e.west, north: e.north, east: e.east, step: e.step };
@@ -911,11 +980,12 @@ async function findBoughtShodanBox(view, base, stillCached) {
 /** Record a box as bought. `fresh` means its answer was just fetched. */
 async function rememberShodanBox(q, base, fresh) {
   const idx = await shodanIndex();
-  const i = idx.findIndex((e) => e.base === base && e.south === q.south && e.west === q.west
+  const baseHash = diskKeyHash(base);
+  const i = idx.findIndex((e) => e.baseHash === baseHash && e.south === q.south && e.west === q.west
     && e.north === q.north && e.east === q.east);
   if (i >= 0 && !fresh) return;            // already known, nothing new to save
   if (i >= 0) idx.splice(i, 1);
-  idx.push({ south: q.south, west: q.west, north: q.north, east: q.east, step: q.step, base, savedAt: Date.now() });
+  idx.push({ south: q.south, west: q.west, north: q.north, east: q.east, step: q.step, baseHash, savedAt: Date.now() });
   if (idx.length > SHODAN_INDEX_MAX) idx.splice(0, idx.length - SHODAN_INDEX_MAX);
   await writeDiskCache(SHODAN_INDEX_KEY, idx);
 }
@@ -2436,7 +2506,7 @@ async function cloudflareRadar() {
     id: a.id, locations: a.locations || [], asns: a.asns || [],
     scope: a.scope || null, eventType: a.eventType || null,
     startDate: a.startDate || null, endDate: a.endDate || null,
-    description: a.description || null, linkedUrl: a.linkedUrl || null,
+    description: a.description || null, linkedUrl: safeUrl(a.linkedUrl),
   }));
 }
 
@@ -2957,8 +3027,8 @@ function normaliseOwcdb(w) {
     updated: w.last_checked ?? w.updated_at ?? w.checked_at ?? null,
     image: safeUrl(w.thumbnail ?? w.thumbnail_url ?? w.image ?? w.preview_url),
     embed: safeUrl(w.embed_url ?? w.player_url, { httpsOnly: true }),
-    stream: w.stream_url ?? null,
-    link: slug ? `https://openwebcamdb.com/webcams/${slug}` : 'https://openwebcamdb.com',
+    stream: safeUrl(w.stream_url),
+    link: slug ? `https://openwebcamdb.com/webcams/${encodeURIComponent(slug)}` : 'https://openwebcamdb.com',
   };
 }
 
@@ -3452,7 +3522,9 @@ async function geocode({ q }) {
   url.searchParams.set('limit', '6');
   url.searchParams.set('addressdetails', '1');
 
-  const raw = await cachedPersistent(`geo:${query.toLowerCase()}`, TTL.static, () =>
+  // Memory only: the key is whatever was typed into the search box, and an
+  // on-disk copy would be a search history that outlives the session.
+  const raw = await cached(`geo:${query.toLowerCase()}`, TTL.static, () =>
     grab(url, {
       headers: { 'User-Agent': USER_AGENT },
     }, { label: 'Nominatim' }));
@@ -3582,17 +3654,37 @@ const SECURITY_HEADERS = {
   'X-Frame-Options': 'DENY',
 };
 
-// Report-only for now: violations show in the browser console without
-// blocking anything. Cesium runs web workers from the CDN, and webcam players
-// and imagery come from many hosts, so watch the console for a while before
-// switching this header to the enforcing Content-Security-Policy.
+// Enforced. What each directive allows, and why:
+//  - script-src: this origin and the pinned Cesium build on cdnjs, nothing
+//    else, and no 'unsafe-inline'. Markup that slips past esc() cannot run:
+//    inline handlers, javascript: URLs and injected <script> are refused, and
+//    script-src-attr 'none' says the same for on* attributes.
+//    'unsafe-eval' is there for Cesium alone: the Knockout build bundled in
+//    Cesium.js calls eval("this") as it loads (and Function() for widget
+//    bindings), and WebAssembly decoders (Draco, Basis) need it too. Without
+//    it Cesium.js throws before the globe exists. It does not let injected
+//    markup run; only script already on the page can eval.
+//  - worker-src: Cesium builds its workers from blob: URLs that importScripts
+//    its own files from cdnjs.
+//  - style-src keeps 'unsafe-inline': the UI sets inline styles throughout,
+//    and CSS cannot run script.
+//  - img-src is https only (plus data:/blob: for Cesium and canvases). Every
+//    camera and photo source in use serves https; an http image now fails
+//    and its panel hides it.
+//  - connect-src stays https: because the browser fetches map tiles itself
+//    from hosts that are configurable (TITILER_URL, SHORTBREAD_URL) and from
+//    Cesium Ion's CDN.
+//  - frame-src stays https: because webcam players come from whatever host a
+//    camera directory names. Those frames are cross-origin and sandboxed
+//    (see WebcamLayer.enrich), so they cannot reach this page.
 const CSP = [
   "default-src 'self'",
-  "script-src 'self' https://cdnjs.cloudflare.com",
+  "script-src 'self' 'unsafe-eval' https://cdnjs.cloudflare.com",
+  "script-src-attr 'none'",
   "worker-src 'self' blob: https://cdnjs.cloudflare.com",
   "style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://fonts.googleapis.com",
   "font-src 'self' data: https://fonts.gstatic.com https://cdnjs.cloudflare.com",
-  "img-src 'self' data: blob: https: http:",
+  "img-src 'self' data: blob: https:",
   "media-src 'self' blob: https:",
   "connect-src 'self' data: blob: https:",
   'frame-src https:',
@@ -4147,7 +4239,7 @@ async function serveStatic(req, res, pathname) {
     const ext = path.extname(target);
     res.writeHead(200, {
       ...SECURITY_HEADERS,
-      ...(ext === '.html' ? { 'Content-Security-Policy-Report-Only': CSP } : {}),
+      ...(ext === '.html' ? { 'Content-Security-Policy': CSP } : {}),
       'Content-Type': MIME[ext] || 'application/octet-stream',
       'Content-Length': data.length,
       'Cache-Control': 'no-cache',
@@ -4243,6 +4335,13 @@ function log(kind, msg) {
 // run directly. Required from the test suite it is a plain module: nothing
 // binds a port, and the tests call server.listen() themselves.
 function start() {
+// Clear out what the disk tier can no longer serve, now and every six hours.
+const prune = () => pruneDiskCache().then(({ removed, rewritten }) => {
+  if (removed || rewritten) log('info', `disk cache: removed ${removed} expired, rewrote ${rewritten} old-format entries`);
+}).catch(() => {});
+prune();
+setInterval(prune, 6 * 60 * 60_000).unref();
+
 server.listen(CFG.port, CFG.host, () => {
   const ok = (b) => (b ? `${C.grn}ready${C.rst}` : `${C.yel}not configured${C.rst}`);
   console.log(`
@@ -4308,6 +4407,7 @@ if (require.main === module) start();
 module.exports = {
   server, start, CFG, TTL, ROUTES, PROVIDERS_DIR, DISK_CACHE_DIR, TLE_DIR,
   cache, inflight, cached, cachedPersistent, readDiskCache, writeDiskCache, clearDiskCache,
+  pruneDiskCache, diskName, diskKeyHash, DISK_MAX_AGE,
   reqCtx, wantsFresh, isCached,
   parse511, loadDotEnv, clip, htmlText, refusalReason, UpstreamError, grab, USER_AGENT,
   parseBbox, clamp, bboxCenter, bboxRadiusKm, snapFixed, viewCell, VIEW_CELL_DEG, VIEW_MAX_DEG,

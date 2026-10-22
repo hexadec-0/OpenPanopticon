@@ -156,6 +156,14 @@ export async function openApp(browser, base, { storage = null, waitForBoot = tru
     if (req.isInterceptResolutionHandled()) return;
     const url = req.url();
     if (intercept && intercept(req) === true) return;
+    // With a local Cesium its workers and assets come from a loopback port
+    // that the page's CSP (rightly) does not allow. Add that one origin to
+    // the served policy so the test runs under the real, enforced CSP
+    // otherwise unchanged.
+    if (browser.cesium && req.isNavigationRequest() && req.frame() === page.mainFrame() && url.startsWith(base)) {
+      relaxCspForLocalCesium(req, browser.cesium.base);
+      return;
+    }
     if (url.startsWith(base) || url.startsWith('data:') || url.startsWith('blob:')) { req.continue(); return; }
 
     // Cesium itself.
@@ -197,6 +205,15 @@ export async function openApp(browser, base, { storage = null, waitForBoot = tru
     req.respond({ status: 404, body: '' });
   });
 
+  // Record every CSP violation, so a test can assert the page runs cleanly
+  // under its enforced policy.
+  await page.evaluateOnNewDocument(() => {
+    window.__csp = [];
+    document.addEventListener('securitypolicyviolation', (e) => {
+      window.__csp.push(`${e.effectiveDirective} blocked ${e.blockedURI || '(inline)'}`);
+    });
+  });
+
   // Record every toast as it appears. The app clears #alerts whenever layer
   // status is redrawn, so a toast can be gone before a poll would see it.
   await page.evaluateOnNewDocument(() => {
@@ -222,6 +239,25 @@ export async function openApp(browser, base, { storage = null, waitForBoot = tru
   await page.goto(`${base}/`, { waitUntil: 'domcontentloaded' });
   if (waitForBoot) await waitForBooted(page);
   return { page, context: ctx, external, errors, consoleErrors };
+}
+
+/** Fetch the page itself and add the local Cesium origin to its CSP. */
+async function relaxCspForLocalCesium(req, cesiumBase) {
+  try {
+    const res = await fetch(req.url(), { headers: req.headers(), redirect: 'manual' });
+    const headers = {};
+    res.headers.forEach((v, k) => { headers[k] = v; });
+    const origin = new URL(cesiumBase).origin;
+    if (headers['content-security-policy']) {
+      headers['content-security-policy'] = headers['content-security-policy']
+        .replace(/(script-src|worker-src|connect-src|img-src|font-src|style-src)( [^;]*)/g, `$1$2 ${origin}`);
+    }
+    delete headers['content-length'];
+    delete headers['content-encoding'];
+    req.respond({ status: res.status, headers, body: Buffer.from(await res.arrayBuffer()) });
+  } catch {
+    req.continue();
+  }
 }
 
 /** Boot is done when the boot screen has faded and the session is restored. */

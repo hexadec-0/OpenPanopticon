@@ -267,6 +267,15 @@ describe('/api/geocode (Nominatim)', () => {
     assert.equal(s.mock.callsTo('nominatim').length, 1);
   });
 
+  test('what was searched for is never written to disk', async () => {
+    await s.api('/api/geocode', { q: 'Secret Place Search' });
+    await s.api('/api/shodan', { bbox: BBOX, q: 'org:"Secret Custom Query"' }, { method: 'POST' });
+    const onDisk = fs.existsSync(s.mod.DISK_CACHE_DIR) ? fs.readdirSync(s.mod.DISK_CACHE_DIR)
+      .map((f) => fs.readFileSync(`${s.mod.DISK_CACHE_DIR}/${f}`, 'utf8')).join('') : '';
+    assert.ok(!/secret place search/i.test(onDisk), 'geocode query persisted');
+    assert.ok(!onDisk.includes('Secret Custom Query'), 'custom Shodan query persisted');
+  });
+
   test('no results, and too-short queries', async () => {
     assert.deepEqual((await s.api('/api/geocode', { q: 'nowhere at all' })).json(), { results: [] });
     assert.equal((await s.api('/api/geocode', { q: 'a' })).status, 400);

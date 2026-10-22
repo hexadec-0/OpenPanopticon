@@ -24,7 +24,8 @@ In scope:
   access-key checks, request routing, the disk cache
 - the frontend (`public/`): rendering of upstream data, URL handling,
   anything that lets a page or upstream run script in the app's origin
-- the launch scripts (`start.sh`, `START.bat`)
+- the launch scripts (`start.sh`, `START.bat`, `chromebook.sh`), including
+  how they install Node, store the access key and write logs
 
 Out of scope:
 
