@@ -12,6 +12,8 @@
 
 [Run it](#run-it) · [Live demo](https://hexadec-0.github.io/OpenPanopticon/) · [Screenshots](#screenshots-and-demo-video) · [Layers](#whats-on-the-globe) · [Caching](#caching) · [Architecture](#how-its-put-together) · [Responsible use](#using-this-responsibly)
 
+### TRY THE DEMO HERE: <https://hexadec-0.github.io/OpenPanopticon/>
+
 </div>
 
 OpenPanopticon is a geospatial intelligence terminal that runs on your own machine. Point it
