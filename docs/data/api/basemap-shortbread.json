@@ -1,0 +1,1 @@
+{"provider":"shortbread","label":"Vector (OSM Shortbread)","attribution":"© OpenStreetMap contributors · Shortbread schema via VersaTiles","url":"data/tiles/shortbread/{z}/{x}/{y}.pbf","vector":true,"maxLevel":14,"scenes":[],"note":"Drawn in the browser from vector tiles, so it carries no imagery date — it is the map, not a photograph."}

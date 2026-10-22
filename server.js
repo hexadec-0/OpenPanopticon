@@ -1,19 +1,30 @@
 #!/usr/bin/env node
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 hexadec
 /**
- * OPENPANOPTICON — OSINT Data Fusion  (ver. 1.0.1)
+ * OPENPANOPTICON — OSINT Data Fusion
  * Zero-dependency Node server: static host + authenticated upstream proxy.
  *
- * Every credential stays in this process. The browser never sees an API key.
- * Run:  node server.js      (Node 18+ required, for global fetch)
+ * Every credential stays in this process, with one deliberate exception: the
+ * Cesium Ion token is handed to the browser (via /api/config), because Cesium
+ * streams terrain and imagery from the browser by design. Scope that token to
+ * read-only access on the assets you use.
+ * Run:  node server.js      (Node 22+ required: global fetch and WebSocket)
  */
 
 'use strict';
+
+if (Number(process.versions.node.split('.')[0]) < 22) {
+  console.error(`  Node ${process.version} is too old. OpenPanopticon needs Node 22 or newer.`);
+  process.exit(1);
+}
 
 const http = require('node:http');
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const net = require('node:net');
 const { AsyncLocalStorage } = require('node:async_hooks');
 const { URL } = require('node:url');
 
@@ -22,10 +33,24 @@ const { URL } = require('node:url');
 // ---------------------------------------------------------------------------
 
 const ROOT = __dirname;
+const PKG = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
 const PUBLIC_DIR = path.join(ROOT, 'public');
-const VENDOR_DIR = path.join(ROOT, 'vendor');
+// Runtime data (disk cache, TLE copies). Overridable so the test suite can
+// point it at a throwaway directory instead of the real cache.
+const PROVIDERS_DIR = process.env.OPENPANOPTICON_DATA_DIR || path.join(ROOT, 'providers');
 
-loadDotEnv(path.join(ROOT, '.env'));
+// This folder used to be called vendor/. Carry an existing one over, so an
+// upgrade keeps the cached answers it already paid for.
+if (!process.env.OPENPANOPTICON_DATA_DIR) {
+  const legacy = path.join(ROOT, 'vendor');
+  try {
+    if (fs.existsSync(legacy) && !fs.existsSync(PROVIDERS_DIR)) fs.renameSync(legacy, PROVIDERS_DIR);
+  } catch (e) {
+    console.warn(`  could not move vendor/ to providers/: ${e.message}`);
+  }
+}
+
+loadDotEnv(process.env.OPENPANOPTICON_ENV_FILE || path.join(ROOT, '.env'));
 
 const CFG = {
   port: parseInt(process.env.PORT || '8420', 10),
@@ -43,8 +68,6 @@ const CFG = {
   openCellIdKey: (process.env.OPENCELLID_API_KEY || '').trim(),
   wigleName: (process.env.WIGLE_API_NAME || '').trim(),
   wigleToken: (process.env.WIGLE_API_TOKEN || '').trim(),
-  censysId: (process.env.CENSYS_API_ID || '').trim(),
-  censysSecret: (process.env.CENSYS_API_SECRET || '').trim(),
   greyNoiseKey: (process.env.GREYNOISE_API_KEY || '').trim(),
   eiaKey: (process.env.EIA_API_KEY || '').trim(),
   cloudflareToken: (process.env.CLOUDFLARE_API_TOKEN || '').trim(),
@@ -117,19 +140,19 @@ async function cached(key, ttlMs, producer) {
 // One table rather than thirty-three magic numbers scattered through the file,
 // so the policy can be read and changed in one place.
 //
-// Almost everything is held for a day and refreshed on demand: mapped
-// infrastructure, scanned hosts, camera directories, orbital elements,
-// airframes, place names. None of it changes meaningfully within a day, and
-// several of these are metered or donated services.
+// Inventories of fixed things are held for three days (`static`) and
+// refreshed on demand: mapped infrastructure, scanned hosts, camera
+// directories, airframes, place names. None of it changes meaningfully in that
+// time, and several of these are metered or donated services.
 //
-// Two classes are deliberately excluded, because holding them for a day would
-// make the map lie rather than merely make it stale:
+// Present-tense data gets far shorter windows, because holding it that long
+// would make the map lie rather than merely make it stale:
 //
 //   live    Positions. An aircraft cached for a day is not a track, it is a
 //           historical record drawn as if it were current.
-//   hazard  Warnings and alerts. A tornado warning, earthquake or wildfire
-//           from yesterday, drawn as though it were live, is worse than the
-//           API call it saved.
+//   hazard  Warnings and alerts, held for an hour. A tornado warning,
+//           earthquake or wildfire from yesterday, drawn as though it were
+//           live, is worse than the API call it saved.
 //
 // SYNC and FLUSH bypass all of it — see wantsFresh().
 const DAY = 24 * 60 * 60_000;
@@ -217,6 +240,10 @@ const VIEW_CELL_DEG = {
   // as a tight one and returns more. Coarse cells also mean panning around a
   // city reuses one answer instead of spending a credit per nudge.
   flights: 1.0,
+  // Hazard feeds and 511 are cheap per call but slow, so a coarse cell lets
+  // panning around a region reuse one answer.
+  events: 1.0,
+  traffic: 0.5,
   atlas: 0.5,
   shake: 0.5,
   iot: 0.25,
@@ -259,11 +286,10 @@ const VIEW_MAX_DEG = {
  * camera lands on the same cells; zooming changes the box by at most a ring
  * of cells rather than re-gridding the world.
  *
- * Earlier this expanded symmetrically from the cell containing the view's
- * centre, which kept the key stable across a zoom but made the box 2k+1
- * cells — never fewer than three. At a close-in view that was nine times the
- * area actually being looked at, and with ten Overpass clauses on top it was
- * enough to run every mirror past its timeout and return nothing. A tight
+ * Expanding symmetrically from the view's centre cell would keep the key
+ * stable across a zoom, but the box would be 2k+1 cells, never fewer than
+ * three: at a close-in view, nine times the area being looked at. With ten
+ * Overpass clauses on top that runs every mirror past its timeout. A tight
  * box that occasionally re-queries is worth more than a stable key that
  * never answers.
  */
@@ -306,20 +332,14 @@ function snapFixed(b, step, maxDeg = Infinity) {
  *
  * Every view-scoped source goes through this, and it returns the key as well
  * as the box for one reason: the upstream query and the cache key have to
- * describe the same ground, and while they were two separate expressions
- * written off the raw view box they did not.
+ * describe the same ground. Built separately from the raw view box, they
+ * would not.
  *
- * That was the bug. RIPE Atlas, OpenCellID, WiGLE, Sensor.Community and
- * Raspberry Shake keyed on the unsnapped box, so the key recorded a camera
- * position rather than a region: 46 stored Atlas answers over one city, none
- * of which could ever be hit again. ALPR and the infrastructure layer did
- * snap, but to a ladder chosen from the view span and anchored on the box
- * edges — so a reload a few metres or one zoom step off the last one landed
- * on a different rung or a different cell and queried Overpass afresh. Seven
- * different ALPR boxes were stored for the same city.
- *
- * snapFixed() had already fixed exactly this for Shodan, and said so in its
- * own comment. The lesson simply never reached the other six.
+ * A key built from the unsnapped box records a camera position rather than a
+ * region, so every small pan or reload mints a new entry that can never be
+ * hit again. A ladder of cell sizes chosen from the view span has the same
+ * problem one zoom step at a time. A fixed grid per source makes the key name
+ * a region, and nearby views land on the same cells.
  */
 function viewCell(b, kind) {
   const step = VIEW_CELL_DEG[kind];
@@ -335,9 +355,9 @@ function viewCell(b, kind) {
  * Results that took a donated Overpass slot or a metered Shodan credit are
  * worth more than the memory they sit in, and throwing them away because the
  * process restarted means paying for them twice. Memory stays the fast path;
- * disk is what makes "keep it for six hours" actually mean six hours.
+ * disk is what makes a three-day TTL actually mean three days.
  */
-const DISK_CACHE_DIR = path.join(VENDOR_DIR, 'cache');
+const DISK_CACHE_DIR = path.join(PROVIDERS_DIR, 'cache');
 const diskName = (key) => `${crypto.createHash('sha1').update(key).digest('hex')}.json`;
 
 async function readDiskCache(key, ttlMs) {
@@ -421,10 +441,9 @@ const htmlText = (h) => h
  * Most APIs explain a refusal ("too many queries today", "invalid key"),
  * which is far more useful in the sidebar than a bare status code. JSON
  * bodies give it as a field. HTML error pages bury it in boilerplate, and
- * flattening the whole page used to produce "500 Internal Server Error
- * Internal Server Error The server encountered… Please con" — the title
- * twice and the useful part cut mid-word. So for HTML take the title and
- * the first paragraph, drop anything repeated, and cut on a word boundary.
+ * flattening the whole page gives the title twice and the useful part cut
+ * mid-word. So for HTML take the title and the first paragraph, drop
+ * anything repeated, and cut on a word boundary.
  */
 function refusalReason(body, max = 220) {
   if (!body) return '';
@@ -485,7 +504,7 @@ class UpstreamError extends Error {
  * covers every call site; a per-call `headers` entry still wins, since the
  * spread below comes last.
  */
-const USER_AGENT = 'OpenPanopticon/1.0.1 (self-hosted OSINT viewer)';
+const USER_AGENT = `OpenPanopticon (self-hosted OSINT viewer; +${PKG.homepage})`;
 
 async function grab(url, opts = {}, { as = 'json', timeoutMs = 25000, label = 'upstream', onHeaders } = {}) {
   const ac = new AbortController();
@@ -676,50 +695,46 @@ async function shodanSearch({ bbox, preset, custom, minGeo = true }) {
   if (!b) throw new UpstreamError(400, 'bbox required as south,west,north,east');
 
   // A fixed cell, not one sized to the view: zooming must not re-charge for
-  // a place already paid for. Before settling on the anchored cell, reuse a
-  // nearby one already bought that covers this view — see shodanCandidates().
+  // a place already paid for. Before settling on the snapped box, reuse any
+  // box already bought that covers this view — see shodanIndex().
+  // Shodan has no bbox filter; geo:lat,lon,radius_km is the spatial primitive.
+  // With the "all" preset the base is empty and the geo filter stands alone,
+  // which Shodan accepts as a valid (credit-consuming) filtered query.
+  const presetDef = SHODAN_PRESETS[preset] || SHODAN_PRESETS.all;
+  const base = custom && custom.trim() ? custom.trim() : presetDef.query;
   const buildQuery = (box) => {
     const cc = bboxCenter(box);
     const rr = bboxRadiusKm(box);
-    const bb = custom && custom.trim()
-      ? custom.trim()
-      : (SHODAN_PRESETS[preset] || SHODAN_PRESETS.ics).query;
-    return `${bb} geo:"${cc.lat.toFixed(4)},${cc.lon.toFixed(4)},${rr}"`.trim();
+    return `${base} geo:"${cc.lat.toFixed(4)},${cc.lon.toFixed(4)},${rr}"`.trim();
   };
 
   let q = snapFixed(b, SHODAN_CELL_DEG, SHODAN_MAX_DEG);
   if (!wantsFresh()) {
-    for (const cand of shodanCandidates(b, SHODAN_CELL_DEG)) {
-      if (await isCached(`shodan:${buildQuery(cand)}`, TTL.static)) { q = cand; break; }
-    }
+    const bought = await findBoughtShodanBox(b, base, (box) => isCached(`shodan:${buildQuery(box)}`, TTL.static));
+    if (bought) q = bought;
   }
-  const c = bboxCenter(q);
-  const radius = bboxRadiusKm(q);
-  const base = custom && custom.trim()
-    ? custom.trim()
-    : (SHODAN_PRESETS[preset] || SHODAN_PRESETS.ics).query;
-
-  // Shodan has no bbox filter; geo:lat,lon,radius_km is the spatial primitive.
-  // With the "all" preset the base is empty and the geo filter stands alone,
-  // which Shodan accepts as a valid (credit-consuming) filtered query.
-  const query = `${base} geo:"${c.lat.toFixed(4)},${c.lon.toFixed(4)},${radius}"`.trim();
+  const query = buildQuery(q);
 
   const url = new URL('https://api.shodan.io/shodan/host/search');
   url.searchParams.set('key', CFG.shodanKey);
   url.searchParams.set('query', query);
   url.searchParams.set('minify', 'true');
 
-  // Two hours, and on disk. Shodan rescans a host over days, so a fresher
+  // TTL.static, and on disk. Shodan rescans a host over days, so a fresher
   // answer would rarely differ — and every miss spends a query credit, which
   // is the one resource here that cannot be earned back by waiting.
   const key = `shodan:${query}`;
+  let fetched = false;
   const raw = await cachedPersistent(key, TTL.static, async () => {
     // About to spend a credit. Stop short of the wall rather than through
     // it: running out mid-session leaves the layer dead until the month
     // rolls over, and the reserve is what a deliberate lookup draws on.
     await assertShodanCredit();
-    return grab(url, {}, { label: 'Shodan' });
+    const out = await grab(url, {}, { label: 'Shodan' });
+    fetched = true;
+    return out;
   });
+  await rememberShodanBox(q, base, fetched);
 
   const matches = (raw.matches || [])
     .map((m) => {
@@ -760,7 +775,7 @@ async function shodanSearch({ bbox, preset, custom, minGeo = true }) {
     cellDeg: SHODAN_CELL_DEG,
     total: raw.total ?? matches.length,
     returned: matches.length,
-    note: custom ? null : (SHODAN_PRESETS[preset] || SHODAN_PRESETS.ics).note,
+    note: custom ? null : presetDef.note,
     byCategory,
     vulnerable: matches.filter((m) => m.vulns.length).length,
     matches,
@@ -858,41 +873,51 @@ function boxContains(outer, b) {
 }
 
 /**
- * Cells we might already have paid for that would cover this view.
+ * The boxes Shodan has already been paid for, per query filter.
  *
- * Anchoring on the centre cell is not quite enough on its own: zooming near a
- * cell boundary nudges the centre across it, and the neighbouring anchor is a
- * different — though heavily overlapping — box. So before spending anything,
- * check the handful of nearby anchors too, and reuse whichever is already
- * cached and actually contains the view. Bounded and cheap: no index to keep,
- * just a few key lookups.
+ * Queries are the minimal whole-cell cover of the view, so a later view that
+ * sits inside an earlier, larger box snaps to a different (smaller) box and
+ * would be charged again. Keeping a list of what was bought lets that view be
+ * answered from the box that already covers it. The list lives in memory and
+ * on disk, so it outlasts a restart just as the answers themselves do; an
+ * entry is only used while its answer is still cached.
  */
-function shodanCandidates(b, step) {
-  const cLat = (b.south + b.north) / 2;
-  const cLon = (b.west + b.east) / 2;
-  const half = Math.max((b.north - b.south) / 2, (b.east - b.west) / 2);
-  const k0 = Math.max(1, Math.ceil(half / step));
-  const i0 = Math.floor(cLat / step);
-  const j0 = Math.floor(cLon / step);
-  const r = (v) => Number(v.toFixed(4));
+const SHODAN_INDEX_KEY = 'shodan:index';
+const SHODAN_INDEX_MAX = 500;
+let shodanIdx = null;
 
-  const out = [];
-  for (const k of [k0, k0 + 1]) {
-    for (const di of [0, -1, 1]) {
-      for (const dj of [0, -1, 1]) {
-        const i = i0 + di, j = j0 + dj;
-        const box = {
-          south: r(clamp((i - k) * step, -85, 85)),
-          west: r(clamp((j - k) * step, -180, 180)),
-          north: r(clamp((i + 1 + k) * step, -85, 85)),
-          east: r(clamp((j + 1 + k) * step, -180, 180)),
-          step,
-        };
-        if (boxContains(box, b)) out.push(box);
-      }
-    }
+async function shodanIndex() {
+  if (!shodanIdx) {
+    const stored = await readDiskCache(SHODAN_INDEX_KEY, TTL.static);
+    shodanIdx = Array.isArray(stored) ? stored : [];
   }
-  return out;
+  const cutoff = Date.now() - TTL.static;
+  shodanIdx = shodanIdx.filter((e) => e && e.savedAt > cutoff);
+  return shodanIdx;
+}
+
+/** The smallest bought box for this filter that covers the view, if any. */
+async function findBoughtShodanBox(view, base, stillCached) {
+  const hits = (await shodanIndex())
+    .filter((e) => e.base === base && boxContains(e, view))
+    .sort((x, y) => (x.north - x.south) * (x.east - x.west) - (y.north - y.south) * (y.east - y.west));
+  for (const e of hits) {
+    const box = { south: e.south, west: e.west, north: e.north, east: e.east, step: e.step };
+    if (await stillCached(box)) return box;
+  }
+  return null;
+}
+
+/** Record a box as bought. `fresh` means its answer was just fetched. */
+async function rememberShodanBox(q, base, fresh) {
+  const idx = await shodanIndex();
+  const i = idx.findIndex((e) => e.base === base && e.south === q.south && e.west === q.west
+    && e.north === q.north && e.east === q.east);
+  if (i >= 0 && !fresh) return;            // already known, nothing new to save
+  if (i >= 0) idx.splice(i, 1);
+  idx.push({ south: q.south, west: q.west, north: q.north, east: q.east, step: q.step, base, savedAt: Date.now() });
+  if (idx.length > SHODAN_INDEX_MAX) idx.splice(0, idx.length - SHODAN_INDEX_MAX);
+  await writeDiskCache(SHODAN_INDEX_KEY, idx);
 }
 
 /** Is this key already answered, in memory or on disk? */
@@ -961,7 +986,12 @@ function openSkyRefillSec() {
 }
 
 function noteOpenSkyHeaders(headers) {
-  const left = Number(headers?.get?.('x-rate-limit-remaining'));
+  // A response without the header (an error page, a proxy's 503) says
+  // nothing about the budget. Number(null) is 0, which would read as "spent"
+  // and block every automatic poll until a manual SYNC.
+  const raw = headers?.get?.('x-rate-limit-remaining');
+  if (raw == null || String(raw).trim() === '') return;
+  const left = Number(raw);
   if (Number.isFinite(left)) {
     openSky.remaining = left;
     openSky.checkedAt = Date.now();
@@ -1149,7 +1179,7 @@ const SAT_GROUPS = {
 // and signals that with a 403 rather than a 304. That is a "you already have
 // the current data" answer, not an outage — so the elements are kept on disk
 // and served back when it comes.
-const TLE_DIR = path.join(VENDOR_DIR, 'tle');
+const TLE_DIR = path.join(PROVIDERS_DIR, 'tle');
 const TLE_STALE_RE = /(has not updated since your last successful download|already have the current data)/i;
 
 function tleCachePath(group) {
@@ -1194,7 +1224,11 @@ async function fetchTle(group) {
       await writeCachedTle(group, text);
       return { text, stale: false, savedAt: new Date().toISOString() };
     }
-    return { text, stale: false, savedAt: new Date().toISOString() };
+    // An empty or "no data" answer: prefer the last good copy, marked stale.
+    // With none on disk, pass the answer through and let the caller report it.
+    const disk = await readCachedTle(group);
+    if (disk) return { text: disk.text, stale: true, savedAt: disk.savedAt };
+    return { text, stale: false, savedAt: null };
   } catch (err) {
     const disk = await readCachedTle(group);
     const refusedAsUnchanged = err.status === 403
@@ -1239,7 +1273,7 @@ async function satellites({ group, limit }) {
   const cap = clamp(parseInt(limit || '300', 10) || 300, 1, 2000);
 
   // Memory only, deliberately. TLEs already have their own disk cache in
-  // vendor/tle, which does something cachedPersistent cannot: when CelesTrak
+  // providers/tle, which does something cachedPersistent cannot: when CelesTrak
   // refuses a repeat download it serves the stored elements back and says
   // they are stale. A second disk tier on top would shadow that.
   const { text, stale, savedAt } = await cached(`sat:${g}`, TTL.orbit,
@@ -1253,7 +1287,7 @@ async function satellites({ group, limit }) {
   // straight into satellite.js twoline2satrec().
   const lines = text.split(/\r?\n/).map((l) => l.trimEnd()).filter((l) => l.length);
   const sats = [];
-  for (let i = 0; i + 2 < lines.length + 1; i += 3) {
+  for (let i = 0; i + 2 < lines.length; i += 3) {
     const [name, l1, l2] = [lines[i], lines[i + 1], lines[i + 2]];
     if (!l1 || !l2 || l1[0] !== '1' || l2[0] !== '2') continue;
     sats.push({
@@ -1297,9 +1331,9 @@ const OVERPASS_ENDPOINTS = [
 // Overpass is a donated, shared service with roughly two execution slots per
 // IP. Every Overpass-backed layer therefore goes through one serial queue
 // with a minimum gap between requests, and a cooldown that all callers
-// observe once a mirror answers 429. Without this, selecting several feature
-// classes fired one request per class simultaneously and got rate-limited
-// immediately — which is exactly the bug this replaces.
+// observe once a mirror answers 429. Without it, selecting several feature
+// classes would fire one request per class at once and be rate-limited
+// immediately.
 // ---------------------------------------------------------------------------
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -1485,11 +1519,10 @@ const OVERPASS_PRESETS = {
 /**
  * Fetch several feature classes in ONE Overpass query.
  *
- * Previously this took a single preset and the browser called it once per
- * selected class, which meant ten simultaneous requests to a service that
- * allows about two — a guaranteed 429. Overpass unions natively, so all
- * selected classes now go out as one query and are partitioned on the way
- * back using each preset's tag predicate.
+ * One request per class would mean ten simultaneous requests to a service
+ * that allows about two, a guaranteed 429. Overpass unions natively, so all
+ * selected classes go out as one query and are partitioned on the way back
+ * using each preset's tag predicate.
  */
 async function overpass({ bbox, presets, preset, limit }) {
   const b = parseBbox(bbox);
@@ -1517,7 +1550,7 @@ async function overpass({ bbox, presets, preset, limit }) {
   const clauses = chosen.map((k) => OVERPASS_PRESETS[k].body(bb)).join('');
   const ql = `[out:json][timeout:40];(${clauses});out center ${cap};`;
 
-  // Six hours. Mapped infrastructure — masts, substations, cameras — changes
+  // TTL.static. Mapped infrastructure — masts, substations, cameras — changes
   // on the order of weeks, and Overpass is donated capacity.
   const key = `overpass:${chosen.join('+')}:${bb}:${cap}`;
   const raw = await cachedPersistent(key, TTL.static, () => overpassQuery(ql));
@@ -1854,8 +1887,8 @@ async function alpr({ bbox, vendor, limit }) {
     + `);out center ${cap};`;
 
   // Shares the Overpass queue with the infrastructure layer, so having both
-  // enabled can't put two concurrent queries on the same mirror. Cached for
-  // six hours like that layer: OSM-sourced and slow-moving.
+  // enabled can't put two concurrent queries on the same mirror. TTL.static
+  // like that layer: OSM-sourced and slow-moving.
   const raw = await cachedPersistent(`alpr:${bb}:${cap}`, TTL.static,
     () => overpassQuery(ql, 'Overpass (ALPR)'));
 
@@ -1892,7 +1925,7 @@ async function alpr({ bbox, vendor, limit }) {
       power: t.electricity || null,
       ref: t.ref || null,
       name: t.name || null,
-      image: t.image || null,
+      image: safeUrl(t.image),
       tags: t,
     });
   }
@@ -2260,16 +2293,21 @@ async function iotSensors({ bbox, includeIndoor }) {
 // ---------------------------------------------------------------------------
 
 /** abuse.ch Feodo Tracker: currently-active botnet command-and-control servers. */
+//
+// The disk cache stores JSON, and a Map serialises to {}. So the list is
+// cached as a plain array and the Map is built after reading it back. The list
+// names servers that are active now, so it takes the `hazard` TTL.
+let feodoIndex = { rows: null, map: null };
 async function feodoSet() {
-  return cachedPersistent('feodo:set', TTL.static, async () => {
-    const rows = await grab('https://feodotracker.abuse.ch/downloads/ipblocklist.json',
+  const rows = await cachedPersistent('feodo:rows', TTL.hazard, async () => {
+    const list = await grab('https://feodotracker.abuse.ch/downloads/ipblocklist.json',
       {}, { label: 'Feodo Tracker', timeoutMs: 25000 });
-    const map = new Map();
-    for (const r of Array.isArray(rows) ? rows : []) {
-      if (r.ip_address) map.set(r.ip_address, r);
-    }
-    return map;
+    return (Array.isArray(list) ? list : []).filter((r) => r && r.ip_address);
   });
+  if (feodoIndex.rows !== rows) {
+    feodoIndex = { rows, map: new Map((Array.isArray(rows) ? rows : []).map((r) => [r.ip_address, r])) };
+  }
+  return feodoIndex.map;
 }
 
 async function greyNoiseLookup(ip) {
@@ -2285,7 +2323,7 @@ async function greyNoiseLookup(ip) {
       classification: j.classification || null,
       name: j.name || null,
       lastSeen: j.last_seen || null,
-      link: j.link || null,
+      link: safeUrl(j.link),
       message: j.message || null,
     };
   } catch (e) {
@@ -2295,40 +2333,15 @@ async function greyNoiseLookup(ip) {
   }
 }
 
-async function censysHost(ip) {
-  if (!CFG.censysId || !CFG.censysSecret) return null;
-  const auth = Buffer.from(`${CFG.censysId}:${CFG.censysSecret}`).toString('base64');
-  try {
-    const j = await grab(`https://search.censys.io/api/v2/hosts/${encodeURIComponent(ip)}`,
-      { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } },
-      { label: 'Censys', timeoutMs: 15000 });
-    const r = j.result || {};
-    return {
-      services: (r.services || []).map((s) => ({
-        port: s.port, protocol: s.service_name, transport: s.transport_protocol,
-        software: (s.software || []).map((x) => [x.vendor, x.product, x.version].filter(Boolean).join(' ')),
-      })),
-      os: r.operating_system?.product || null,
-      asn: r.autonomous_system?.asn || null,
-      asName: r.autonomous_system?.name || null,
-      location: r.location ? [r.location.city, r.location.country].filter(Boolean).join(', ') : null,
-      lastUpdated: r.last_updated_at || null,
-    };
-  } catch (e) {
-    return { error: e.status === 404 ? 'not in Censys' : e.message };
-  }
-}
-
 async function enrich({ ip }) {
   const addr = String(ip || '').trim();
-  if (!/^[0-9.]{7,15}$|^[0-9a-fA-F:]{3,45}$/.test(addr)) {
+  if (!net.isIP(addr)) {
     throw new UpstreamError(400, 'a valid IP address is required');
   }
 
-  const [gn, feodo, censys] = await Promise.allSettled([
+  const [gn, feodo] = await Promise.allSettled([
     greyNoiseLookup(addr),
     feodoSet().then((m) => m.get(addr) || null),
-    censysHost(addr),
   ]);
 
   const c2 = feodo.status === 'fulfilled' ? feodo.value : null;
@@ -2347,8 +2360,6 @@ async function enrich({ ip }) {
       country: c2.country || null,
     } : null,
     onC2List: !!c2,
-    censys: censys.status === 'fulfilled' ? censys.value : { error: censys.reason?.message },
-    censysConfigured: !!CFG.censysId,
   };
 }
 
@@ -2503,7 +2514,6 @@ const FIVE_ELEVEN_HOSTS = {
   UT: 'https://www.udottraffic.utah.gov', CO: 'https://maps.cotrip.org',
   NV: 'https://www.nvroads.com', WY: 'https://www.wyoroad.info', MT: 'https://www.511mt.net',
   SD: 'https://sd511.org', ND: 'https://travel.dot.nd.gov', KS: 'https://www.kandrive.gov',
-  KS2: 'https://www.kandrive.org',
 };
 
 async function fiveElevenState(state, key, b) {
@@ -2527,7 +2537,7 @@ async function fiveElevenState(state, key, b) {
       title: c.Name ?? c.name ?? 'Traffic camera',
       roadway: c.RoadwayName ?? c.roadway ?? null,
       direction: c.DirectionOfTravel ?? null,
-      image: c.Url ?? c.url ?? c.ImageUrl ?? null,
+      image: safeUrl(c.Url ?? c.url ?? c.ImageUrl),
       status: c.Status ?? null,
     })).filter((c) => Number.isFinite(c.lat) && Number.isFinite(c.lon) && inBox(b, c.lat, c.lon))
     : [];
@@ -2572,10 +2582,11 @@ async function traffic({ bbox }) {
     };
   }
 
+  const cell = viewCell(b, 'traffic');
   const settled = await Promise.allSettled(
     states.map(([state, key]) =>
-      cached(`511:${state}:${b.south},${b.west},${b.north},${b.east}`, TTL.hazard,
-        () => fiveElevenState(state, key, b))),
+      cached(`511:${state}:${cell.key}`, TTL.hazard,
+        () => fiveElevenState(state, key, cell))),
   );
 
   const features = [];
@@ -2608,8 +2619,11 @@ async function traffic({ bbox }) {
 
 async function geoip() {
   // Resolved server-side, so it describes the machine running OpenPanopticon
-  // rather than whatever browser happens to be pointed at it.
-  return cachedPersistent('geoip', TTL.static, async () => {
+  // rather than whatever browser happens to be pointed at it. Held in memory
+  // only, for 30 minutes: the app opens over wherever the machine is now, so
+  // a laptop that moved must not reopen over yesterday's city, and the
+  // answer (city, postal code, ISP) is not written to disk.
+  return cached('geoip', 30 * 60_000, async () => {
     const j = await grab('https://ipwho.is/', {}, { label: 'ipwho.is', timeoutMs: 12000 });
     if (!j || j.success === false || !Number.isFinite(j.latitude)) {
       throw new UpstreamError(502, `geoip lookup failed: ${j?.message || 'no coordinates'}`);
@@ -2701,7 +2715,7 @@ async function aircraftInfo({ icao24 }) {
         owner: a.registered_owner || null,
         ownerCountry: a.registered_owner_country_name || null,
         ownerOperatorFlag: a.registered_owner_operator_flag_code || null,
-        photo: a.url_photo_thumbnail || null,
+        photo: safeUrl(a.url_photo_thumbnail),
       };
     } catch (e) {
       if (e.status === 404) return { icao24: hex, known: false };
@@ -2881,9 +2895,9 @@ async function windyWebcams(b) {
     place: [w.location?.city, w.location?.country].filter(Boolean).join(', ') || null,
     status: w.status,
     updated: w.lastUpdatedOn || null,
-    image: w.images?.current?.preview || w.images?.current?.thumbnail || null,
-    embed: w.player?.day || w.player?.live || null,
-    link: w.urls?.detail || null,
+    image: safeUrl(w.images?.current?.preview || w.images?.current?.thumbnail),
+    embed: safeUrl(w.player?.day || w.player?.live, { httpsOnly: true }),
+    link: safeUrl(w.urls?.detail),
   })).filter((w) => w.lat != null && w.lon != null);
 }
 
@@ -2906,9 +2920,9 @@ async function nycWebcams(b) {
         place: c.area || 'New York City',
         status: c.isOnline === 'true' || c.isOnline === true ? 'active' : 'unknown',
         updated: null,
-        image: c.imageUrl || (id ? `https://webcams.nyctmc.org/api/cameras/${id}/image` : null),
+        image: safeUrl(c.imageUrl) || (id ? `https://webcams.nyctmc.org/api/cameras/${encodeURIComponent(id)}/image` : null),
         embed: null,
-        link: id ? `https://webcams.nyctmc.org/map?cid=${id}` : null,
+        link: id ? `https://webcams.nyctmc.org/map?cid=${encodeURIComponent(id)}` : null,
       };
     })
     .filter(Boolean)
@@ -2920,8 +2934,8 @@ async function nycWebcams(b) {
  * (openwebcamdb.com). The public docs cover auth and the two webcam routes
  * but not the list filter parameters, so rather than guess at a bbox filter
  * we page through the whole catalogue once (it is ~1,500 cameras), cache it
- * for six hours, and filter locally. Field names are normalised
- * defensively — see /api/openwebcamdb/probe to inspect the real shape.
+ * (TTL.static), and filter locally. Field names are normalised
+ * defensively.
  */
 const OWCDB_BASE = 'https://openwebcamdb.com/api/v1';
 
@@ -2941,8 +2955,8 @@ function normaliseOwcdb(w) {
     category: w.category ?? w.categories?.[0]?.name ?? w.categories?.[0] ?? null,
     status: w.status ?? (w.is_online === false ? 'offline' : 'active'),
     updated: w.last_checked ?? w.updated_at ?? w.checked_at ?? null,
-    image: w.thumbnail ?? w.thumbnail_url ?? w.image ?? w.preview_url ?? null,
-    embed: w.embed_url ?? w.player_url ?? null,
+    image: safeUrl(w.thumbnail ?? w.thumbnail_url ?? w.image ?? w.preview_url),
+    embed: safeUrl(w.embed_url ?? w.player_url, { httpsOnly: true }),
     stream: w.stream_url ?? null,
     link: slug ? `https://openwebcamdb.com/webcams/${slug}` : 'https://openwebcamdb.com',
   };
@@ -3028,11 +3042,11 @@ async function alertCaWebcams(b) {
       category: 'Wildfire detection',
       status: a.isOnline === 'online' && a.isActive === 'active' ? 'active' : (a.isOnline || 'unknown'),
       updated: a.viewTime || null,
-      image: a.imageURL || null,
+      image: safeUrl(a.imageURL),
       embed: null,
       pan: a.positionPan ?? null,
       tilt: a.positionTilt ?? null,
-      link: a.cameraURL || 'https://cameras.alertcalifornia.org/',
+      link: safeUrl(a.cameraURL) || 'https://cameras.alertcalifornia.org/',
     };
   }).filter((c) => c && inBox(b, c.lat, c.lon));
 }
@@ -3065,29 +3079,6 @@ async function webcams({ bbox }) {
     owcdbConfigured: !!CFG.owcdbKey,
     problems,
     webcams: cams,
-  };
-}
-
-/** Diagnostic: return one raw OpenWebcamDB record so its real field names
- *  can be read off directly, plus the detail-route shape for that slug. */
-async function owcdbProbe() {
-  if (!CFG.owcdbKey) throw new UpstreamError(412, 'OPENWEBCAMDB_API_KEY is not set in .env');
-  const headers = { Authorization: `Bearer ${CFG.owcdbKey}`, Accept: 'application/json' };
-  const list = await grab(`${OWCDB_BASE}/webcams?limit=2`, { headers }, { label: 'OpenWebcamDB' });
-  const first = (list.data ?? list.webcams ?? list.results ?? (Array.isArray(list) ? list : []))[0];
-  let detail = null;
-  const slug = first?.slug ?? first?.id;
-  if (slug) {
-    detail = await grab(`${OWCDB_BASE}/webcams/${encodeURIComponent(slug)}`,
-      { headers }, { label: 'OpenWebcamDB detail' }).catch((e) => ({ error: e.message }));
-  }
-  return {
-    listEnvelopeKeys: Object.keys(list || {}),
-    firstRecordKeys: first ? Object.keys(first) : [],
-    firstRecord: first ?? null,
-    detailKeys: detail && !detail.error ? Object.keys(detail) : [],
-    detail,
-    normalisedAs: first ? normaliseOwcdb(first) : null,
   };
 }
 
@@ -3159,21 +3150,22 @@ async function gdacsEvents(b) {
       time: p.fromdate || null,
       endTime: p.todate || null,
       description: p.htmldescription ? String(p.htmldescription).replace(/<[^>]*>/g, '') : null,
-      url: p.url?.report || null,
+      url: safeUrl(p.url?.report),
       polygon: null,
     };
   }).filter((e) => e && inBox(b, e.lat, e.lon));
 }
 
 /* --- NASA EONET ------------------------------------------------------ */
-async function eonetEvents(b) {
+async function eonetEvents(view) {
+  const b = viewCell(view, 'events');
   const url = new URL('https://eonet.gsfc.nasa.gov/api/v3/events/geojson');
   url.searchParams.set('status', 'open');
   url.searchParams.set('days', '60');
   // EONET's bbox order is min-lon, max-lat, max-lon, min-lat.
   url.searchParams.set('bbox', `${b.west},${b.north},${b.east},${b.south}`);
 
-  const key = `ev:eonet:${b.south},${b.west},${b.north},${b.east}`;
+  const key = `ev:eonet:${b.key}`;
   const raw = await cached(key, TTL.hazard, () =>
     grab(url, {}, { label: 'EONET', timeoutMs: 25000 }));
 
@@ -3205,7 +3197,7 @@ async function eonetEvents(b) {
       time: p.date || null,
       endTime: p.closed || null,
       description: p.description || null,
-      url: p.sources?.[0]?.url || `https://eonet.gsfc.nasa.gov/api/v3/events/${p.id}`,
+      url: safeUrl(p.sources?.[0]?.url) || `https://eonet.gsfc.nasa.gov/api/v3/events/${encodeURIComponent(p.id)}`,
       polygon,
     };
   }).filter(Boolean);
@@ -3238,7 +3230,7 @@ async function usgsEvents(b) {
       endTime: null,
       description: [p.place, p.felt ? `${p.felt} felt reports` : null,
         p.tsunami ? 'TSUNAMI FLAG SET' : null].filter(Boolean).join(' · '),
-      url: p.url || null,
+      url: safeUrl(p.url),
       polygon: null,
       depthKm: depth ?? null,
     };
@@ -3294,7 +3286,7 @@ async function nwsEvents(b) {
       endTime: p.ends || p.expires || null,
       description: p.headline || (p.description || '').slice(0, 500) || null,
       instruction: p.instruction || null,
-      url: p['@id'] || null,
+      url: safeUrl(p['@id']),
       polygon: ring,
     };
   }).filter((e) => e && inBox(b, e.lat, e.lon));
@@ -3314,8 +3306,9 @@ function parseCsv(text) {
   });
 }
 
-async function firmsEvents(b) {
+async function firmsEvents(view) {
   if (!CFG.firmsKey) return [];
+  const b = viewCell(view, 'events');
   const area = `${b.west.toFixed(3)},${b.south.toFixed(3)},${b.east.toFixed(3)},${b.north.toFixed(3)}`;
   const url = `https://firms.modaps.eosdis.nasa.gov/api/area/csv/${encodeURIComponent(CFG.firmsKey)}`
     + `/VIIRS_SNPP_NRT/${area}/2`;
@@ -3392,7 +3385,7 @@ async function edisEvents(b) {
       time: p.date || p.created || p.fromdate || null,
       endTime: null,
       description: p.description || p.summary || null,
-      url: p.url || p.link || null,
+      url: safeUrl(p.url || p.link),
       polygon: null,
     };
   }).filter((e) => e && inBox(b, e.lat, e.lon));
@@ -3481,35 +3474,148 @@ async function geocode({ q }) {
 }
 
 // ---------------------------------------------------------------------------
-// VENDOR SHIM — satellite.js fetched once at runtime, then served locally
+// Request gate — who may talk to this server
+// ---------------------------------------------------------------------------
+//
+// The server holds paid API keys, so a request has to prove it came from this
+// app's own page, not just reach the port:
+//
+//  1. Host check. Only the names this server is meant to be reached by are
+//     accepted. That defeats DNS rebinding, where an attacker's domain is
+//     re-pointed at 127.0.0.1 so their page counts as same-origin.
+//  2. X-Panopticon header on /api/*. A page on another origin cannot add a
+//     custom header without a CORS preflight, and this server never approves
+//     one, so blind cross-site requests (spending Shodan credits, flushing the
+//     cache) are refused. State-changing or free-form routes are POST-only.
+//  3. Access key, only when bound beyond loopback (HOST=0.0.0.0 on Crostini,
+//     or a LAN address). A LAN client can forge any Host header, so there the
+//     browser must first open the URL printed at startup, which carries a
+//     random key and exchanges it for an HttpOnly, SameSite=Strict cookie.
+
+const LOOPBACK_NAMES = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
+const BOUND_TO_LOOPBACK = LOOPBACK_NAMES.has(CFG.host);
+
+const ALLOWED_HOSTS = new Set([
+  `127.0.0.1:${CFG.port}`,
+  `localhost:${CFG.port}`,
+  `[::1]:${CFG.port}`,
+  ...(BOUND_TO_LOOPBACK || CFG.host === '0.0.0.0' || CFG.host === '::'
+    ? [] : [`${CFG.host.includes(':') ? `[${CFG.host}]` : CFG.host}:${CFG.port}`.toLowerCase()]),
+  ...String(process.env.ALLOWED_HOSTS || '')
+    .split(',').map((h) => h.trim().toLowerCase()).filter(Boolean),
+]);
+
+const ACCESS_KEY = BOUND_TO_LOOPBACK ? null
+  : ((process.env.ACCESS_KEY || '').trim() || crypto.randomBytes(18).toString('base64url'));
+const ACCESS_COOKIE = 'op_access';
+
+function sameSecret(a, b) {
+  const x = Buffer.from(String(a)); const y = Buffer.from(String(b));
+  return x.length === y.length && crypto.timingSafeEqual(x, y);
+}
+
+function cookieValue(req, name) {
+  for (const part of String(req.headers.cookie || '').split(';')) {
+    const i = part.indexOf('=');
+    if (i > 0 && part.slice(0, i).trim() === name) return part.slice(i + 1).trim();
+  }
+  return null;
+}
+
+/** Host and (when bound beyond loopback) access-key check. False = handled. */
+function gate(req, res) {
+  const host = String(req.headers.host || '').toLowerCase();
+  if (!ALLOWED_HOSTS.has(host)) {
+    log('warn', `refused request for Host "${host || '(none)'}" — add it to ALLOWED_HOSTS if it is yours`);
+    res.writeHead(421, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain' }).end('Misdirected request');
+    return false;
+  }
+  if (!ACCESS_KEY) return true;
+
+  const url = new URL(req.url, `http://${host}`);
+  const offered = url.searchParams.get('key');
+  if (offered && sameSecret(offered, ACCESS_KEY)) {
+    url.searchParams.delete('key');
+    res.writeHead(303, {
+      ...SECURITY_HEADERS,
+      'Set-Cookie': `${ACCESS_COOKIE}=${ACCESS_KEY}; HttpOnly; SameSite=Strict; Path=/`,
+      Location: url.pathname + url.search,
+    }).end();
+    return false;
+  }
+  const held = cookieValue(req, ACCESS_COOKIE);
+  if (held && sameSecret(held, ACCESS_KEY)) return true;
+  res.writeHead(401, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain; charset=utf-8' })
+    .end('OpenPanopticon is reachable from the network, so it needs its access key.\n'
+      + 'Open the full URL (with ?key=…) printed in the terminal where the server started.');
+  return false;
+}
+
+const POST_ONLY = new Set(['/api/flush']);
+
+/** Custom-header and method rules for /api/*. False = handled. */
+function apiAllowed(req, res, pathname, params) {
+  if (req.headers['x-panopticon'] !== '1') {
+    sendJson(res, 403, { error: 'missing X-Panopticon header', source: pathname });
+    return false;
+  }
+  const needsPost = POST_ONLY.has(pathname) || (pathname === '/api/shodan' && params.has('q'));
+  const ok = needsPost ? req.method === 'POST' : (req.method === 'GET' || req.method === 'POST');
+  if (!ok) {
+    res.setHeader('Allow', needsPost ? 'POST' : 'GET, POST');
+    sendJson(res, 405, { error: `${pathname} needs ${needsPost ? 'POST' : 'GET'}`, source: pathname });
+    return false;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Response hardening
 // ---------------------------------------------------------------------------
 
-const SATJS_SOURCES = [
-  'https://cdn.jsdelivr.net/npm/satellite.js@5.0.0/dist/satellite.min.js',
-  'https://unpkg.com/satellite.js@5.0.0/dist/satellite.min.js',
-  'https://cdn.jsdelivr.net/npm/satellite.js@4.1.4/dist/satellite.min.js',
-  'https://cdnjs.cloudflare.com/ajax/libs/satellite.js/5.0.0/satellite.min.js',
-];
+const SECURITY_HEADERS = {
+  'X-Content-Type-Options': 'nosniff',
+  // The browser default, stated explicitly: same-origin requests (the CARTO
+  // tile proxy) keep the full referrer; third parties see only the origin,
+  // which OSM's tile policy requires.
+  'Referrer-Policy': 'strict-origin-when-cross-origin',
+  'X-Frame-Options': 'DENY',
+};
 
-async function satelliteJs() {
-  const local = path.join(VENDOR_DIR, 'satellite.min.js');
+// Report-only for now: violations show in the browser console without
+// blocking anything. Cesium runs web workers from the CDN, and webcam players
+// and imagery come from many hosts, so watch the console for a while before
+// switching this header to the enforcing Content-Security-Policy.
+const CSP = [
+  "default-src 'self'",
+  "script-src 'self' https://cdnjs.cloudflare.com",
+  "worker-src 'self' blob: https://cdnjs.cloudflare.com",
+  "style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://fonts.googleapis.com",
+  "font-src 'self' data: https://fonts.gstatic.com https://cdnjs.cloudflare.com",
+  "img-src 'self' data: blob: https: http:",
+  "media-src 'self' blob: https:",
+  "connect-src 'self' data: blob: https:",
+  'frame-src https:',
+  "object-src 'none'",
+  "base-uri 'none'",
+  "form-action 'self'",
+  "frame-ancestors 'none'",
+].join('; ');
+
+/**
+ * An upstream-supplied URL, or null unless its scheme is http(s).
+ *
+ * Escaping HTML does nothing about a `javascript:` or `data:` URL, and these
+ * values end up as hrefs, image sources and iframe sources. Iframes run
+ * scripts, so their sources must be https.
+ */
+function safeUrl(u, { httpsOnly = false } = {}) {
+  if (typeof u !== 'string' || !u.trim()) return null;
   try {
-    const stat = await fsp.stat(local);
-    if (stat.size > 10_000) return fsp.readFile(local, 'utf8');
-  } catch { /* not cached yet */ }
-
-  let lastErr;
-  for (const src of SATJS_SOURCES) {
-    try {
-      const js = await grab(src, {}, { as: 'text', label: 'satellite.js CDN', timeoutMs: 20000 });
-      if (!/satellite/i.test(js) || js.length < 10_000) throw new Error('unexpected bundle');
-      await fsp.mkdir(VENDOR_DIR, { recursive: true });
-      await fsp.writeFile(local, js, 'utf8');
-      log('info', `cached satellite.js from ${src}`);
-      return js;
-    } catch (e) { lastErr = e; }
-  }
-  throw new UpstreamError(502, 'could not fetch satellite.js from any CDN', lastErr?.message);
+    const p = new URL(u.trim());
+    if (p.protocol === 'https:' || (!httpsOnly && p.protocol === 'http:')) return p.href;
+  } catch { /* not an absolute URL */ }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -3529,6 +3635,7 @@ const MIME = {
 function sendJson(res, status, obj) {
   const body = JSON.stringify(obj);
   res.writeHead(status, {
+    ...SECURITY_HEADERS,
     'Content-Type': 'application/json; charset=utf-8',
     'Content-Length': Buffer.byteLength(body),
     'Cache-Control': 'no-store',
@@ -3877,8 +3984,6 @@ async function basemap({ provider, bbox, from, to, maxCloud, limit }) {
 const ROUTES = {
   '/api/health': async () => ({
     ok: true,
-    version: '1.0.1',
-    node: process.version,
     sources: {
       shodan: CFG.shodanKey ? 'configured' : 'missing SHODAN_API_KEY',
       opensky: CFG.openSkyId ? 'authenticated' : 'anonymous (400 credits/day)',
@@ -3903,7 +4008,6 @@ const ROUTES = {
       wigle: CFG.wigleName ? 'configured' : 'missing WIGLE_API_NAME / WIGLE_API_TOKEN',
       sensorCommunity: 'open (IoT air + noise sensors)',
       greynoise: CFG.greyNoiseKey ? 'configured' : 'unauthenticated (10 lookups/day)',
-      censys: CFG.censysId ? 'configured' : 'missing CENSYS_API_ID / CENSYS_API_SECRET',
       abusech: 'open (botnet C2 list)',
       ioda: 'open (internet outages)',
       eia: CFG.eiaKey ? 'configured' : 'missing EIA_API_KEY',
@@ -3942,6 +4046,7 @@ const ROUTES = {
     // Only whether labels can be drawn; the CARTO key itself stays here.
     cartoLabels: !!CFG.cartoKey,
   }),
+  // A free-form query (q=) is accepted only by POST — see apiAllowed().
   '/api/shodan': (q) => shodanSearch({ bbox: q.get('bbox'), preset: q.get('preset'), custom: q.get('q') }),
   '/api/shodan/credits': () => shodanCredits(),
   '/api/flights': (q) => flights({ bbox: q.get('bbox') }),
@@ -3953,7 +4058,6 @@ const ROUTES = {
     limit: q.get('limit'),
   }),
   '/api/webcams': (q) => webcams({ bbox: q.get('bbox') }),
-  '/api/openwebcamdb/probe': () => owcdbProbe(),
   '/api/events': (q) => events({
     bbox: q.get('bbox'), sources: q.get('sources'), minSeverity: q.get('minSeverity'),
   }),
@@ -3971,10 +4075,11 @@ const ROUTES = {
   '/api/imagery': (q) => imagery({ layer: q.get('layer'), date: q.get('date') }),
   '/api/flush': async () => {
     // FLUSH has to reach the disk tier too, otherwise "drop everything and
-    // refetch" quietly serves the same six-hour-old answer straight back.
+    // refetch" quietly serves the same days-old answer straight back.
     const files = await clearDiskCache();
     const entries = cache.size;
     cache.clear();
+    shodanIdx = null;
     return { ok: true, memoryEntries: entries, diskEntries: files };
   },
   '/api/basemap': (q) => basemap({
@@ -4012,14 +4117,17 @@ async function serveCartoTile(req, res, m) {
     const sub = 'abcd'[(Number(x) + Number(y)) % 4];
     const upstream = `https://${sub}.basemaps.cartocdn.com/${key}.png`
       + `?key=${encodeURIComponent(CFG.cartoKey)}`;
-    // A key with website restrictions checks Referer; pass on the browser's
-    // so a key restricted to this host (e.g. 127.0.0.1) still works.
-    const headers = req.headers.referer ? { Referer: req.headers.referer } : {};
+    // A key with website restrictions checks Referer. Send this server's own
+    // origin (the Host header has already been checked against ALLOWED_HOSTS)
+    // so a key restricted to it still works, without forwarding the browser's
+    // full page URL upstream.
+    const headers = { Referer: `http://${req.headers.host}/` };
     buf = await grab(upstream, { headers }, { as: 'buffer', label: 'CARTO', timeoutMs: 15000 });
     cartoCache.set(key, buf);
     if (cartoCache.size > CARTO_CACHE_MAX) cartoCache.delete(cartoCache.keys().next().value);
   }
   res.writeHead(200, {
+    ...SECURITY_HEADERS,
     'Content-Type': 'image/png',
     'Content-Length': buf.length,
     'Cache-Control': 'public, max-age=86400',
@@ -4030,32 +4138,36 @@ async function serveCartoTile(req, res, m) {
 async function serveStatic(req, res, pathname) {
   let rel = pathname === '/' ? '/index.html' : pathname;
   const target = path.join(PUBLIC_DIR, path.normalize(rel).replace(/^(\.\.[/\\])+/, ''));
-  if (!target.startsWith(PUBLIC_DIR)) {
-    res.writeHead(403).end('Forbidden');
+  if (target !== PUBLIC_DIR && !target.startsWith(PUBLIC_DIR + path.sep)) {
+    res.writeHead(403, SECURITY_HEADERS).end('Forbidden');
     return;
   }
   try {
     const data = await fsp.readFile(target);
+    const ext = path.extname(target);
     res.writeHead(200, {
-      'Content-Type': MIME[path.extname(target)] || 'application/octet-stream',
+      ...SECURITY_HEADERS,
+      ...(ext === '.html' ? { 'Content-Security-Policy-Report-Only': CSP } : {}),
+      'Content-Type': MIME[ext] || 'application/octet-stream',
       'Content-Length': data.length,
       'Cache-Control': 'no-cache',
     });
     res.end(data);
   } catch {
-    res.writeHead(404, { 'Content-Type': 'text/plain' }).end('404 Not Found');
+    res.writeHead(404, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain' }).end('404 Not Found');
   }
 }
 
 const server = http.createServer(async (req, res) => {
   const started = Date.now();
-  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  if (!gate(req, res)) return;
+  const url = new URL(req.url, `http://${req.headers.host}`);
   const pathname = url.pathname;
+  if (pathname.startsWith('/api/') && !apiAllowed(req, res, pathname, url.searchParams)) return;
 
-  // A request only used to appear in the log once it finished, so a slow
-  // upstream looked identical to a request that never arrived — the browser
-  // reported a timeout and the terminal showed nothing at all. Announce
-  // anything still running, and say so when the browser gives up first.
+  // Logged only on completion, a slow upstream would look identical to a
+  // request that never arrived. So announce anything still running after
+  // 5s, and say so when the browser gives up first.
   let settled = false;
   let slowTimer = null;
   if (pathname.startsWith('/api/')) {
@@ -4074,16 +4186,6 @@ const server = http.createServer(async (req, res) => {
   const done = () => { settled = true; clearTimeout(slowTimer); };
 
   try {
-    if (pathname === '/vendor/satellite.min.js') {
-      const js = await satelliteJs();
-      res.writeHead(200, {
-        'Content-Type': 'text/javascript; charset=utf-8',
-        'Cache-Control': 'public, max-age=86400',
-      });
-      res.end(js);
-      return;
-    }
-
     const cartoTile = CARTO_TILE_RE.exec(pathname);
     if (cartoTile) {
       await serveCartoTile(req, res, cartoTile);
@@ -4127,6 +4229,8 @@ const server = http.createServer(async (req, res) => {
 const C = { dim: '\x1b[2m', grn: '\x1b[32m', yel: '\x1b[33m', red: '\x1b[31m', cyn: '\x1b[36m', rst: '\x1b[0m' };
 
 function log(kind, msg) {
+  // The test suite sets this so request logs don't drown the test output.
+  if (process.env.OPENPANOPTICON_QUIET === '1') return;
   const t = new Date().toISOString().slice(11, 19);
   const tag = kind === 'err' ? `${C.red}ERR${C.rst}`
     : kind === 'warn' ? `${C.yel}WRN${C.rst}`
@@ -4135,16 +4239,22 @@ function log(kind, msg) {
   console.log(`${C.dim}${t}${C.rst} ${tag} ${msg}`);
 }
 
+// Listening, the banner and the signal handlers only happen when this file is
+// run directly. Required from the test suite it is a plain module: nothing
+// binds a port, and the tests call server.listen() themselves.
+function start() {
 server.listen(CFG.port, CFG.host, () => {
   const ok = (b) => (b ? `${C.grn}ready${C.rst}` : `${C.yel}not configured${C.rst}`);
   console.log(`
 ${C.cyn}  ╔═╗╔═╗╔═╗╔╗╔╔═╗╔═╗╔╗╔╔═╗╔═╗╔╦╗╦╔═╗╔═╗╔╗╔${C.rst}
 ${C.cyn}  ║ ║╠═╝╠╣ ║║║╠═╝╠═╣║║║║ ║╠═╝ ║ ║║  ║ ║║║║${C.rst}
 ${C.cyn}  ╚═╝╩  ╚═╝╝╚╝╩  ╩ ╩╝╚╝╚═╝╩   ╩ ╩╚═╝╚═╝╝╚╝${C.rst}
-${C.dim}  OSINT data fusion${C.rst}   ${C.dim}ver. 1.0.1${C.rst}
+${C.dim}  OSINT data fusion${C.rst}
 
-  ${C.grn}▸${C.rst} http://${CFG.host}:${CFG.port}
-
+  ${C.grn}▸${C.rst} ${ACCESS_KEY
+    ? `http://${[...ALLOWED_HOSTS].find((h) => !h.startsWith('127.') && !h.startsWith('localhost') && !h.startsWith('[::1]')) || `127.0.0.1:${CFG.port}`}/?key=${ACCESS_KEY}`
+    : `http://${CFG.host}:${CFG.port}`}
+${ACCESS_KEY ? `  ${C.yel}!${C.rst} Listening on ${CFG.host}, beyond this machine. Requests need the access key above.\n` : ''}
   Shodan .............. ${ok(!!CFG.shodanKey)}
   OpenSky ............. ${CFG.openSkyId ? `${C.grn}authenticated${C.rst}` : `${C.yel}anonymous${C.rst} (400 credits/day)`}
   CelesTrak ........... ${C.grn}open${C.rst}
@@ -4163,6 +4273,52 @@ ${C.dim}  OSINT data fusion${C.rst}   ${C.dim}ver. 1.0.1${C.rst}
   ALERTCalifornia ..... ${C.grn}open${C.rst} (wildfire cams)
   Cesium Ion .......... ${CFG.cesiumIonToken ? `${C.grn}terrain + buildings${C.rst}` : `${C.yel}OSM basemap only${C.rst}`}
 `);
+
+  // START.bat sets this so the browser opens only once the server is
+  // listening. start.sh polls /api/health itself and does not set it.
+  if (process.env.OPENPANOPTICON_OPEN_BROWSER === '1') {
+    const host = CFG.host === '0.0.0.0' || CFG.host === '::' ? '127.0.0.1' : CFG.host;
+    const openUrl = `http://${host}:${CFG.port}/${ACCESS_KEY ? `?key=${ACCESS_KEY}` : ''}`;
+    const { spawn } = require('node:child_process');
+    const [cmd, args] = process.platform === 'win32' ? ['cmd', ['/c', `start "" "${openUrl}"`]]
+      : process.platform === 'darwin' ? ['open', [openUrl]] : ['xdg-open', [openUrl]];
+    try {
+      spawn(cmd, args, { stdio: 'ignore', detached: true, windowsVerbatimArguments: true })
+        .on('error', () => {}).unref();
+    } catch { /* no browser to open */ }
+  }
 });
 
-process.on('SIGINT', () => { console.log('\n  shutting down'); server.close(() => process.exit(0)); });
+// Keep-alive sockets and the AIS websocket would otherwise hold server.close()
+// open indefinitely, so close them and give up after a few seconds.
+function shutdown(signal) {
+  console.log(`\n  shutting down (${signal})`);
+  try { ais.socket?.close(); } catch { /* already closed */ }
+  server.close(() => process.exit(0));
+  server.closeAllConnections?.();
+  setTimeout(() => process.exit(0), 3000).unref();
+}
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+}
+
+if (require.main === module) start();
+
+// For the test suite. Nothing in the app imports these.
+module.exports = {
+  server, start, CFG, TTL, ROUTES, PROVIDERS_DIR, DISK_CACHE_DIR, TLE_DIR,
+  cache, inflight, cached, cachedPersistent, readDiskCache, writeDiskCache, clearDiskCache,
+  reqCtx, wantsFresh, isCached,
+  parse511, loadDotEnv, clip, htmlText, refusalReason, UpstreamError, grab, USER_AGENT,
+  parseBbox, clamp, bboxCenter, bboxRadiusKm, snapFixed, viewCell, VIEW_CELL_DEG, VIEW_MAX_DEG,
+  boxContains, shodanIndex, findBoughtShodanBox, rememberShodanBox, serviceCategory, SHODAN_PRESETS, SHODAN_CELL_DEG,
+  openSky, openSkyPollSec, openSkyRefillSec, noteOpenSkyHeaders, assertOpenSkyCredit, OPENSKY_FLOOR,
+  SAT_GROUPS, fetchTle, readCachedTle, writeCachedTle, tleCachePath,
+  overpassGate, overpassQuery, mirrorFailure, OVERPASS_PRESETS, OVERPASS_ENDPOINTS,
+  ais, aisIngest, aisConnect, aisBoxesFor, boxMovedEnough, shipTypeName,
+  parseDirections, vendorOf, ALPR_VENDORS, airQualityBand, parseCsv,
+  feodoSet, greyNoiseLookup, enrich, normaliseOwcdb, cloudSource, gibsTemplate, gibsDefaultDate,
+  GIBS_LAYERS, COUNTRY_CENTROIDS, FIVE_ELEVEN_HOSTS, basemapProviders, sentinelTileTemplate,
+  safeUrl, sameSecret, cookieValue, gate, apiAllowed, ALLOWED_HOSTS, ACCESS_KEY,
+  SECURITY_HEADERS, CSP, MIME, cartoCache, log,
+};

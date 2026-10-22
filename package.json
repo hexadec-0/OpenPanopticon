@@ -1,0 +1,36 @@
+{
+  "name": "openpanopticon",
+  "description": "Self-hosted OSINT data fusion on a 3D globe. Zero dependencies.",
+  "license": "GPL-3.0-or-later",
+  "author": "hexadec",
+  "homepage": "https://github.com/hexadec-0/OpenPanopticon",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hexadec-0/OpenPanopticon.git"
+  },
+  "bugs": {
+    "url": "https://github.com/hexadec-0/OpenPanopticon/issues"
+  },
+  "private": true,
+  "main": "server.js",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "check": "node --check server.js",
+    "test": "node --test \"test/unit/**/*.test.*\" \"test/functional/**/*.test.*\"",
+    "test:unit": "node --test \"test/unit/**/*.test.*\"",
+    "test:functional": "node --test \"test/functional/**/*.test.*\"",
+    "test:e2e": "node --test --test-concurrency=1 \"test/e2e/**/*.test.mjs\"",
+    "test:all": "npm run check && npm test && npm run test:e2e",
+    "demo:capture": "node demo/capture.mjs",
+    "demo:capture:maps": "node demo/capture.mjs --maps-only",
+    "demo:build": "node demo/build.mjs",
+    "demo:serve": "node demo/serve.mjs --open",
+    "test:coverage": "node --test --experimental-test-coverage --test-coverage-exclude=\"test/**\" --test-coverage-exclude=\"public/providers/**\" --test-coverage-exclude=\"node_modules/**\" \"test/unit/**/*.test.*\" \"test/functional/**/*.test.*\""
+  },
+  "devDependencies": {
+    "puppeteer-core": "25.13.0"
+  }
+}

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 hexadec
 /**
  * optics.js — sensor emulation via Cesium PostProcessStage.
  *

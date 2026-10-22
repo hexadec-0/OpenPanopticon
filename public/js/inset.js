@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 hexadec
 /**
  * inset.js — a close-up map in the detail panel.
  *

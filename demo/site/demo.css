@@ -1,0 +1,53 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (C) 2026 hexadec */
+/* Only for the static demo: the snapshot banner and switched-off controls. */
+
+#demo-banner {
+  position: fixed;
+  left: 50%;
+  bottom: calc(var(--hud-h, 42px) + 10px);
+  transform: translateX(-50%);
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: calc(100vw - 32px);
+  padding: 6px 8px 6px 12px;
+  background: var(--panel-solid, #0a0e14);
+  border: 1px solid var(--hud, #39ff88);
+  border-radius: 2px;
+  color: var(--text, #cdd9d4);
+  font: 400 11.5px/1.4 var(--mono, monospace);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, .5);
+}
+#demo-banner.hidden { display: none; }
+#demo-banner strong {
+  color: var(--bg, #05070a);
+  background: var(--hud, #39ff88);
+  padding: 1px 6px;
+  border-radius: 2px;
+  letter-spacing: .12em;
+  font-weight: 700;
+}
+#demo-banner .demo-x {
+  background: none;
+  border: 0;
+  color: var(--dim, #6b7d78);
+  font: inherit;
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 2px 4px;
+}
+#demo-banner .demo-x:hover { color: var(--text, #cdd9d4); }
+
+.demo-hidden { display: none !important; }
+
+.demo-off {
+  opacity: .38 !important;
+  cursor: not-allowed !important;
+}
+
+@media (max-width: 640px) {
+  #demo-banner { font-size: 10.5px; bottom: calc(var(--hud-h, 42px) + 6px); }
+}

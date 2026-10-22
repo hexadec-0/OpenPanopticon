@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 hexadec
 /**
  * mvt.js — a minimal Mapbox Vector Tile reader.
  *
@@ -180,7 +182,11 @@ function readLayer(r, end, wantTags) {
       } else if (field === 3 && wt === 0) feature.type = GEOM_TYPE[fr.varint()] || 'unknown';
       else if (field === 4 && wt === 2) {
         const len = fr.varint();
-        feature.rings = readGeometry(fr, fr.pos + len);
+        const gEnd = fr.pos + len;
+        feature.rings = readGeometry(fr, gEnd);
+        // readGeometry stops early on a malformed command. Resume after the
+        // field regardless, so the rest of the feature (and tile) still parses.
+        fr.pos = gEnd;
       } else fr.skip(wt);
     }
 

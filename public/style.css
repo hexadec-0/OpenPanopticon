@@ -52,12 +52,6 @@ html, body {
   color: var(--hud); font-size: 10.5px; letter-spacing: .12em;
   text-transform: uppercase; white-space: nowrap; opacity: .85;
 }
-.brand .ver {
-  color: var(--dim); font-size: 9.5px; letter-spacing: .08em; white-space: nowrap;
-  border: 1px solid var(--line); border-radius: 2px; padding: 1px 5px;
-  align-self: center;
-}
-
 /* search ---------------------------------------------------------- */
 
 .search-wrap { position: relative; flex: 0 1 260px; }

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 hexadec
 /**
  * app.js — viewer bootstrap, HUD, and the refresh loop that keeps every
  * layer pointed at whatever the camera is currently looking at.
@@ -8,6 +10,7 @@ import * as Settings from './settings.js';
 import { SelectionMarker } from './selection.js';
 import { AutoCycle, CYCLE_STEPS_S } from './autocycle.js';
 import { LocationInset } from './inset.js';
+import { ShortbreadImageryProvider } from './shortbread.js';
 import {
   ShodanLayer, FlightLayer, SatelliteLayer, OverpassLayer, WebcamLayer,
   EventLayer, AlprLayer, VesselLayer, NetInfraLayer, IotLayer, TrafficLayer,
@@ -30,8 +33,8 @@ const el = (tag, cls, text) => {
  * well before the point where a query would actually be wasteful — a normal
  * "look at the whole city" view sits above it and holds everything.
  *
- * That is the default because it was asked for, but it is a dial, not a
- * constant: the FETCH cell in the HUD cycles it, and the choice persists.
+ * It is a dial, not a constant: the FETCH cell in the HUD cycles it, and the
+ * choice persists.
  *
  * Orbital assets are exempt regardless — they come from a TLE set rather than
  * a view box, and are the one thing you are looking at from up there.
@@ -106,9 +109,19 @@ class OpenPanopticon {
       vessels: !String(src.ais || '').startsWith('configured') && 'AISSTREAM_API_KEY',
       traffic: String(src.fiveEleven || '').startsWith('no states') && 'FIVE_ELEVEN_KEYS',
     };
+    const reasons = {};
     for (const [id, envVar] of Object.entries(needs)) {
-      if (!envVar || !this.layers[id]) continue;
-      this.locked[id] = `Needs ${envVar} in .env — add it and restart the server.`;
+      if (envVar) reasons[id] = `Needs ${envVar} in .env — add it and restart the server.`;
+    }
+    // The static demo leaves some layers out altogether, the same way.
+    this.lockedTag = {};
+    for (const [id, why] of Object.entries(globalThis.OP_DEMO?.lockedLayers || {})) {
+      reasons[id] = why;
+      this.lockedTag[id] = 'OFF';
+    }
+    for (const [id, why] of Object.entries(reasons)) {
+      if (!this.layers[id]) continue;
+      this.locked[id] = why;
       const layer = this.layers[id];
       const setEnabled = layer.setEnabled.bind(layer);
       layer.setEnabled = () => setEnabled(false);
@@ -123,11 +136,15 @@ class OpenPanopticon {
     this.basemap = new BasemapOverlay(this.viewer);
     this.basemap.adopt();
     // Name what the globe actually booted with, so the menu and the map agree.
-    this.basemap.builtinKey = this.hasIon ? 'cesium' : 'osm';
+    this.basemap.builtinKey = this.hasIon ? 'cesium' : globalThis.OP_DEMO?.baseLayer ? 'shortbread' : 'osm';
     this.basemap.provider = this.basemap.builtinKey;
     this.layers.overpass.available = this.health.presets.overpass;
     this.layers.overpass.labels = Object.fromEntries(
       Object.entries(this.health.presets.overpass).map(([k, v]) => [k, v.label]));
+    // The demo starts with every infrastructure class showing.
+    if (globalThis.OP_DEMO?.overpassAllClasses) {
+      this.layers.overpass.presets = new Set(Object.keys(this.health.presets.overpass));
+    }
 
     this.optics = new OpticsController(this.viewer);
     this.selection = new SelectionMarker(this.viewer);
@@ -151,6 +168,7 @@ class OpenPanopticon {
 
     // Layers the session had on, else a sensible first-run set.
     const wanted = this.saved?.enabled
+      || globalThis.OP_DEMO?.defaultLayers
       || { flights: true, satellites: true, events: true };
     for (const [id, on] of Object.entries(wanted)) {
       if (this.layers[id]) this.layers[id].setEnabled(!!on);
@@ -187,7 +205,7 @@ class OpenPanopticon {
   persist() {
     clearTimeout(this._persistTimer);
     this._persistTimer = setTimeout(() => {
-      if (this.restoring) return;
+      if (this.restoring || this.resetting) return;
       Settings.save(Settings.collect(this));
     }, 350);
   }
@@ -196,7 +214,9 @@ class OpenPanopticon {
 
   fatal(msg) {
     const b = $('#boot');
-    if (b) { b.innerHTML = `<div class="fatal"><h1>OFFLINE</h1><p>${msg}</p></div>`; }
+    if (!b) return;
+    b.innerHTML = '<div class="fatal"><h1>OFFLINE</h1><p></p></div>';
+    b.querySelector('p').textContent = msg;
   }
 
   /* ---------------------------------------------------------------- */
@@ -227,11 +247,18 @@ class OpenPanopticon {
     // something else entirely was drawing. Whatever is on screen is now a
     // named choice.
     this.hasIon = !!ionToken;
+    // The static demo brings its own ground: vector tiles captured with the
+    // rest of the snapshot, so nothing on screen is fetched live.
+    const demoBase = globalThis.OP_DEMO?.baseLayer;
     opts.baseLayer = ionToken
       ? Cesium.ImageryLayer.fromWorldImagery({})
-      : new Cesium.ImageryLayer(
-        new Cesium.OpenStreetMapImageryProvider({ url: 'https://tile.openstreetmap.org/' }),
-      );
+      : demoBase
+        ? new Cesium.ImageryLayer(new ShortbreadImageryProvider({
+          url: demoBase.url, maximumLevel: demoBase.maxLevel, credit: demoBase.credit,
+        }))
+        : new Cesium.ImageryLayer(
+          new Cesium.OpenStreetMapImageryProvider({ url: 'https://tile.openstreetmap.org/' }),
+        );
     if (!ionToken) opts.terrainProvider = new Cesium.EllipsoidTerrainProvider();
 
     this.viewer = new Cesium.Viewer('globe', opts);
@@ -273,7 +300,9 @@ class OpenPanopticon {
   async loadSatelliteJs() {
     return new Promise((resolve) => {
       const s = document.createElement('script');
-      s.src = '/vendor/satellite.min.js';
+      // Relative to this module, so the page also works under a sub-path
+      // (the GitHub Pages demo is served from /<repo>/).
+      s.src = new URL('../providers/satellite.min.js', import.meta.url).href;
       s.onload = () => resolve(true);
       s.onerror = () => { console.warn('satellite.js unavailable'); resolve(false); };
       document.head.appendChild(s);
@@ -596,9 +625,9 @@ class OpenPanopticon {
     // Aircraft move; everything else is effectively static between pans.
     //
     // The interval tracks the feed's own resolution, which the server
-    // reports. Polling faster than that only returns the cached answer — the
-    // old fixed 10s against a 12s cache meant roughly every other poll was a
-    // no-op, which is why aircraft seemed to crawl.
+    // reports. Polling faster than that only returns the cached answer, so
+    // a fixed interval shorter than the feed's would make every other poll a
+    // no-op.
     const schedule = () => {
       clearInterval(this.refreshTimer);
       // The server's figure, which is the feed resolution widened to whatever
@@ -809,10 +838,9 @@ class OpenPanopticon {
   /**
    * Close-up map at the top of the detail panel, for every pick.
    *
-   * It used to appear only above 10 km, on the theory that lower down the
-   * globe already shows the surroundings. In practice that made the panel
-   * inconsistent — the same camera had a map or not depending on zoom — and
-   * the inset's street labels and aerial view add detail the globe lacks.
+   * Shown at every altitude, so the same pick always gets the same panel,
+   * and because the inset's street labels and aerial view add detail the
+   * globe lacks even close in.
    * It reads the selection ring's position, so it follows a moving contact.
    */
   showInset(accent, layer, record) {
@@ -909,6 +937,11 @@ class OpenPanopticon {
       this.toast('Refreshing from source…');
     };
     $('#reset-settings').onclick = () => {
+      // From here until the reload nothing may save again — not a pending
+      // debounce, and not the beforeunload handler, which would otherwise
+      // write back exactly what was just cleared.
+      this.resetting = true;
+      clearTimeout(this._persistTimer);
       Settings.clear();
       this.toast('Saved settings cleared — reloading with defaults.');
       setTimeout(() => location.reload(), 700);
@@ -923,7 +956,7 @@ class OpenPanopticon {
       // The server now keeps results for hours, and on disk. Clearing only
       // the browser's copy would refetch straight back out of that.
       let server = null;
-      try { server = await api('/api/flush'); } catch { /* local flush still counts */ }
+      try { server = await api('/api/flush', null, { method: 'POST' }); } catch { /* local flush still counts */ }
       this.toast(`Cache flushed — ${dropped.toLocaleString()} features dropped`
         + (server ? `, ${server.diskEntries} stored responses cleared.` : '.'));
       this.refreshAll({ force: true });
@@ -1103,7 +1136,7 @@ class OpenPanopticon {
         sw.disabled = true;
         sw.title = lockMsg;
         name.title = lockMsg;
-        cnt.textContent = 'NO KEY';
+        cnt.textContent = this.lockedTag?.[id] || 'NO KEY';
         cnt.title = lockMsg;
         // The layer body only shows when a layer is on, so the reason needs
         // a line of its own under the name.
@@ -1115,7 +1148,13 @@ class OpenPanopticon {
         const on = !this.layers[id].enabled;
         this.layers[id].setEnabled(on);
         box.classList.toggle('on', on);
-        if (on) this.refreshOne(id); else this.renderLayerStatus();
+        if (on) {
+          // Shodan's credit count is otherwise read only at boot and after a
+          // full refresh, so switching it on mid-session would show none.
+          Promise.resolve(this.refreshOne(id)).then(() => {
+            if (id === 'shodan') return this.refreshShodanCredits();
+          }).catch(() => {});
+        } else this.renderLayerStatus();
         this.persist();
       };
       return box;
@@ -1564,7 +1603,8 @@ class OpenPanopticon {
       if (this.tooHigh()) { panel.innerHTML = ''; return; }
       d = await api('/api/signals', { bbox: this.currentBbox() || undefined });
     } catch (e) {
-      panel.innerHTML = `<p class="note">Signals unavailable: ${e.message}</p>`;
+      panel.innerHTML = '<p class="note"></p>';
+      panel.firstChild.textContent = `Signals unavailable: ${e.message}`;
       return;
     }
     this.signals = d;
@@ -1787,7 +1827,8 @@ class OpenPanopticon {
     bm.onUpdate = () => {
       const satellite = bm.provider !== 'osm';
       btn.classList.toggle('active', satellite);
-      $('#bm-window').style.display = satellite ? '' : 'none';
+      // Dates and cloud cover only mean something for the scene searches.
+      $('#bm-window').style.display = bm.active ? '' : 'none';
       $('#bm-scene-row').style.display = bm.provider === 'sentinel2' ? '' : 'none';
 
       scene.innerHTML = '';
@@ -1802,9 +1843,11 @@ class OpenPanopticon {
       note.classList.toggle('bad', bm.status === 'error' || bm.status === 'empty');
       if (bm.status === 'loading') note.textContent = 'Searching for imagery over this view…';
       else if (bm.error) note.textContent = bm.error;
-      else if (satellite && bm.meta) {
+      else if (satellite && bm.meta?.matched != null) {
         note.textContent = `${bm.meta.returned} of ${bm.meta.matched} scenes in `
           + `${bm.from} – ${bm.to}. ${bm.meta.attribution}.`;
+      } else if (satellite && bm.meta?.provider === bm.provider) {
+        note.textContent = [bm.meta.note, bm.meta.attribution].filter(Boolean).join(' ');
       } else {
         note.textContent = 'Street map. Switch to Sentinel-2 for recent satellite imagery.';
       }
@@ -1817,7 +1860,10 @@ class OpenPanopticon {
     // last satellite source used; the menu is for choosing precisely.
     btn.onclick = async () => {
       const last = this.basemapAvailable(this.lastSatSource) ? this.lastSatSource : null;
-      const next = bm.provider === 'osm' ? (last || 'sentinel2') : 'osm';
+      // Sentinel-2 by default, else the first imagery source that is available.
+      const firstSat = ['sentinel2', ...(this.health?.presets?.basemaps || []).map((b) => b.key)]
+        .find((k) => k !== 'osm' && this.basemapAvailable(k) && k !== bm.builtinKey) || 'sentinel2';
+      const next = bm.provider === 'osm' ? (last || firstSat) : 'osm';
       if (next !== 'osm') this.lastSatSource = next;
       sel.value = next;
       await bm.setProvider(next, ctx());
@@ -1947,7 +1993,8 @@ class OpenPanopticon {
         }
         results.classList.toggle('open', hits.length > 0);
       } catch (e) {
-        results.innerHTML = `<div class="hit err">${e.message}</div>`;
+        results.innerHTML = '';
+        results.append(el('div', 'hit err', e.message));
         results.classList.add('open');
       }
     };
@@ -1965,7 +2012,7 @@ class OpenPanopticon {
       const box = document.querySelector(`.layer[data-layer="${id}"]`);
       if (!box) continue;
       const cnt = box.querySelector('.layer-count');
-      if (this.locked?.[id]) { box.classList.remove('on'); cnt.textContent = 'NO KEY'; continue; }
+      if (this.locked?.[id]) { box.classList.remove('on'); cnt.textContent = this.lockedTag?.[id] || 'NO KEY'; continue; }
       box.classList.toggle('on', layer.enabled);
       box.classList.toggle('loading', layer.status === 'loading');
       box.classList.toggle('failed', layer.status === 'error');
@@ -2008,12 +2055,39 @@ class OpenPanopticon {
           if (layer.fromCache) bits.push('this view served from cache');
           cnt.title = bits.join('\n');
         }
-        if (id === 'flights') {
+        box.classList.remove('waiting');
+        // Checked first: under HOLD a live feed's count is true but not
+        // current, and saying how old it is matters more than anything else.
+        if (!this.autoRefresh && (id === 'flights' || id === 'vessels')) {
+          // The count is still true, but it is not *current*, and for a live
+          // feed that distinction is the whole point. Show how old it is.
+          const anchor = id === 'flights'
+            ? [...(layer.dr?.values() || [])].map((a) => a.atMs).sort().pop()
+            : layer.lastFetchAt;
+          const ageS = anchor ? Math.round((Date.now() - anchor) / 1000) : null;
+          cnt.textContent = ageS == null ? 'PAUSED' : `${shortWait(ageS)} old`;
+          cnt.title = `${layer.count.toLocaleString()} contacts, last fetched `
+            + `${ageS == null ? 'at load' : `${longWait(ageS)} ago`}.\n`
+            + 'Auto-refresh is off (AUTO reads HOLD), so this will not update. '
+            + 'Press AUTO to resume, or SYNC once.';
+          box.classList.add('waiting');
+        } else if (id === 'flights') {
+          // A map that quietly polls more slowly looks like a map that has
+          // stopped working, so the budget is part of the readout.
           const bits = [`${layer.count.toLocaleString()} contacts`];
           bits.push(`feed updates every ${layer.resolutionSec}s`);
           if (layer.dropped) {
             bits.push(`${layer.dropped} dropped — not heard from in over 2 min, `
               + 'so their last position is stale rather than live');
+          }
+          if (layer.pollSec) bits.push(`Polling every ${layer.pollSec}s`);
+          if (layer.credits != null) {
+            bits.push(`${layer.credits.toLocaleString()} OpenSky credits left today`
+              + (layer.creditFloor ? ` (${layer.creditFloor} held in reserve)` : ''));
+          }
+          if (layer.pollSec && layer.resolutionSec && layer.pollSec > layer.resolutionSec + 1) {
+            bits.push('Slowed to spread the remaining credits over the rest of the '
+              + 'UTC day — SYNC still forces an update.');
           }
           cnt.title = bits.join('\n');
         } else if (id === 'satellites' && layer.elementsAt) {
@@ -2035,34 +2109,6 @@ class OpenPanopticon {
           }
           if (this.shodanCredits != null) {
             bits.push(`${this.shodanCredits.toLocaleString()} query credits left`);
-          }
-          cnt.title = bits.join('\n');
-        } else if (!this.autoRefresh && (id === 'flights' || id === 'vessels')) {
-          // The count is still true, but it is not *current*, and for a live
-          // feed that distinction is the whole point. Show how old it is.
-          const anchor = id === 'flights'
-            ? [...(layer.dr?.values() || [])].map((a) => a.atMs).sort().pop()
-            : layer.lastFetchAt;
-          const ageS = anchor ? Math.round((Date.now() - anchor) / 1000) : null;
-          cnt.textContent = ageS == null ? 'PAUSED' : `${shortWait(ageS)} old`;
-          cnt.title = `${layer.count.toLocaleString()} contacts, last fetched `
-            + `${ageS == null ? 'at load' : `${longWait(ageS)} ago`}.\n`
-            + 'Auto-refresh is off (AUTO reads HOLD), so this will not update. '
-            + 'Press AUTO to resume, or SYNC once.';
-          box.classList.add('waiting');
-        } else if (id === 'flights') {
-          // A map that quietly polls more slowly looks like a map that has
-          // stopped working, so the budget is part of the readout.
-          const bits = [`${layer.count.toLocaleString()} contacts`];
-          if (layer.dropped) bits.push(`${layer.dropped} stale contacts hidden`);
-          if (layer.pollSec) bits.push(`Polling every ${layer.pollSec}s`);
-          if (layer.credits != null) {
-            bits.push(`${layer.credits.toLocaleString()} OpenSky credits left today`
-              + (layer.creditFloor ? ` (${layer.creditFloor} held in reserve)` : ''));
-          }
-          if (layer.pollSec && layer.resolutionSec && layer.pollSec > layer.resolutionSec + 1) {
-            bits.push('Slowed to spread the remaining credits over the rest of the '
-              + 'UTC day — SYNC still forces an update.');
           }
           cnt.title = bits.join('\n');
         } else if (layer.bySource) {
@@ -2176,11 +2222,14 @@ class OpenPanopticon {
       .reduce((n, l) => n + l.count, 0);
     $('#hud-tracks').textContent = total.toLocaleString();
 
+    // Layer errors are redrawn from state each time; toasts share the bar but
+    // manage their own lifetime, so only the error rows are replaced.
     const errs = Object.values(this.layers).filter((l) => l.status === 'error');
     const bar = $('#alerts');
-    bar.innerHTML = '';
+    bar.querySelectorAll('.alert.layer-err').forEach((n) => n.remove());
+    const first = bar.firstChild;
     for (const l of errs) {
-      bar.append(el('div', 'alert', `${l.label}: ${l.error}`));
+      bar.insertBefore(el('div', 'alert layer-err', `${l.label}: ${l.error}`), first);
     }
   }
 
@@ -2193,11 +2242,9 @@ class OpenPanopticon {
     if (gate) {
       const high = this.tooHigh();
       const km = Math.round(this.queryCeilingM / 1000);
-      // Auto-refresh being off is also a reason nothing is being fetched, and
-      // it used to go unsaid: with AUTO toggled to HOLD this cell still read
-      // "ON", while the live poll returned at its first line and every
-      // aircraft sat frozen. A cell claiming the terminal is querying when it
-      // is not is worse than no cell at all.
+      // Auto-refresh being off is also a reason nothing is being fetched, so
+      // it is shown here too. A cell claiming the terminal is querying when
+      // it is not is worse than no cell at all.
       gate.textContent = !this.autoRefresh ? 'PAUSED'
         : high ? `HOLD ▲${km}km` : `ON <${km}km`;
       gate.classList.toggle('holding', high || !this.autoRefresh);
@@ -2269,7 +2316,7 @@ const fmtLon = (v) => `${Math.abs(v).toFixed(4)}°${v >= 0 ? 'E' : 'W'}`;
 
 window.addEventListener('beforeunload', () => {
   // The debounce could still be pending when the tab closes.
-  if (window.WV?.layers && !window.WV.restoring) {
+  if (window.WV?.layers && !window.WV.restoring && !window.WV.resetting) {
     try { Settings.save(Settings.collect(window.WV)); } catch { /* storage blocked */ }
   }
 });

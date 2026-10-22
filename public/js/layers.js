@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 hexadec
 /**
  * layers.js — one class per intelligence source.
  *
@@ -66,7 +68,7 @@ const BULK_LIMIT = MAX_INFLIGHT - 1;
 // Short lookups behind a click.
 const INTERACTIVE = new Set([
   '/api/route', '/api/aircraft', '/api/enrich', '/api/geocode',
-  '/api/openwebcamdb/probe', '/api/health', '/api/config', '/api/geoip',
+  '/api/health', '/api/config', '/api/geoip',
 ]);
 // Time-critical polls. These are worthless late: an aircraft position that
 // arrives a minute after it was asked for is not a live track.
@@ -125,15 +127,31 @@ export function apiQueueDepth() {
 }
 
 /**
- * How long the browser treats an area as already fetched.
+ * How far a reported aircraft fix is carried forward, in seconds.
  *
- * Paired with the server's retention policy: INVENTORY_COVERAGE_MS matches
- * TTL.static there, so a layer that cannot have changed is not even asked
- * about again, and CURRENT_COVERAGE_MS matches TTL.hazard for the ones whose
- * answer is a statement about now. Setting only the server side would still
- * leave the browser re-asking on its own clock and getting a cached reply —
- * harmless, but a round trip for nothing.
+ * Long enough to cover any poll interval the credit budget will produce,
+ * short enough that a contact which has genuinely dropped out stops moving
+ * instead of gliding on as a ghost.
  */
+const DR_MAX_SEC = 45;
+
+/**
+ * How long a trail segment stays on screen, in milliseconds.
+ *
+ * Capped by age rather than point count: at a 7-second poll, 40 points is most
+ * of ten minutes of history, and with the aircraft box snapped to a whole
+ * degree the globe carries a few hundred contacts. Two minutes of track is
+ * enough to read a heading and a turn, and it bounds the line to the distance
+ * an aircraft covers in that time rather than to a number of fixes.
+ */
+const TRAIL_MAX_AGE_MS = 120_000;
+
+/** A hard ceiling on points per contact, whatever the poll rate does. */
+const TRAIL_MAX_POINTS = 40;
+
+/** Shared empty positions array, so a contact with no history allocates none. */
+const EMPTY_TRAIL = Object.freeze([]);
+
 /**
  * How long to wait after a failure, by consecutive failure count.
  *
@@ -146,40 +164,26 @@ export function apiQueueDepth() {
  * The last step repeats, so a persistent failure settles at one attempt an
  * hour — often enough to notice a recovery, rare enough to cost nothing.
  */
-/**
- * How far a reported aircraft fix is carried forward, in seconds.
- *
- * Long enough to cover any poll interval the credit budget will produce,
- * short enough that a contact which has genuinely dropped out stops moving
- * instead of gliding on as a ghost.
- */
-const DR_MAX_SEC = 45;
-
-/**
- * How long a trail segment stays on screen, in milliseconds.
- *
- * The cap used to be a point count — 40 of them — which at a 7-second poll is
- * most of ten minutes of history. With the aircraft box snapped to a whole
- * degree the globe carries a few hundred contacts, most of them outside the
- * view, each dragging ten minutes of line behind it. Two minutes of track is
- * enough to read a heading and a turn, and it bounds the line to the distance
- * an aircraft covers in that time rather than to a number of fixes.
- */
-const TRAIL_MAX_AGE_MS = 120_000;
-
-/** A hard ceiling on points per contact, whatever the poll rate does. */
-const TRAIL_MAX_POINTS = 40;
-
-/** Shared empty positions array, so a contact with no history allocates none. */
-const EMPTY_TRAIL = Object.freeze([]);
-
 const RETRY_LADDER_SEC = [30, 60, 90, 120, 300, 3600];
 
+/**
+ * How long the browser treats an area as already fetched.
+ *
+ * Paired with the server's retention policy: INVENTORY_COVERAGE_MS matches
+ * TTL.static there, so a layer that cannot have changed is not even asked
+ * about again, and CURRENT_COVERAGE_MS matches TTL.hazard for the ones whose
+ * answer is a statement about now. Setting only the server side would still
+ * leave the browser re-asking on its own clock and getting a cached reply —
+ * harmless, but a round trip for nothing.
+ */
 const INVENTORY_COVERAGE_MS = 72 * 60 * 60_000;
 const CURRENT_COVERAGE_MS = 60 * 60_000;
 
 /** Every call to the local proxy goes through here. */
-const api = async (path, params, { timeoutMs = API_TIMEOUTS[path] ?? DEFAULT_API_TIMEOUT } = {}) => {
+const api = async (path, params, {
+  timeoutMs = API_TIMEOUTS[path] ?? DEFAULT_API_TIMEOUT,
+  method = 'GET',
+} = {}) => {
   const url = new URL(path, location.origin);
   for (const [k, v] of Object.entries(params || {})) {
     if (v != null && v !== '') url.searchParams.set(k, v);
@@ -195,7 +199,10 @@ const api = async (path, params, { timeoutMs = API_TIMEOUTS[path] ?? DEFAULT_API
   try {
     let res;
     try {
-      res = await fetch(url, { signal: ac.signal });
+      // The server refuses /api/* without this header. A page on another
+      // origin cannot add a custom header without a CORS preflight, which
+      // the server never approves, so blind cross-site requests are blocked.
+      res = await fetch(url, { method, signal: ac.signal, headers: { 'X-Panopticon': '1' } });
     } catch (e) {
       if (ac.signal.aborted) {
         const err = new Error(`no response after ${Math.round(timeoutMs / 1000)}s`);
@@ -223,6 +230,23 @@ const api = async (path, params, { timeoutMs = API_TIMEOUTS[path] ?? DEFAULT_API
 
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g,
   (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+/**
+ * An upstream URL, or null if its scheme is not http(s).
+ *
+ * esc() makes a value safe inside an attribute but does nothing about a
+ * `javascript:` or `data:` scheme, so every upstream URL that becomes an
+ * href or src passes through here as well. The server already filters these;
+ * this is the second line. `httpsOnly` is for iframes, which run scripts.
+ */
+const safeUrl = (u, { httpsOnly = false } = {}) => {
+  if (!u) return null;
+  try {
+    const p = new URL(String(u), location.origin);
+    if (p.protocol === 'https:' || (!httpsOnly && p.protocol === 'http:')) return p.href;
+  } catch { /* not a URL */ }
+  return null;
+};
 
 const rows = (pairs) => pairs
   .filter(([, v]) => v != null && v !== '' && !(Array.isArray(v) && !v.length))
@@ -427,10 +451,9 @@ class Layer {
     //
     // The camera-settled handler and the poll timer can both fire within a
     // few hundred milliseconds of each other, and a slow layer's previous
-    // refresh may still be in flight when the next is due. Each of those
-    // used to start its own request for near-identical data, and whichever
-    // landed last won. Joining the one already running instead means the
-    // duplicate never reaches the queue, let alone the network.
+    // refresh may still be in flight when the next is due. Joining the one
+    // already running means the duplicate never reaches the queue, let alone
+    // the network, and two near-identical answers never race.
     if (this._inFlight && !force) return this._inFlight;
 
     const run = this._doRefresh(ctx, { isRetry, force });
@@ -441,7 +464,7 @@ class Layer {
   /**
    * Fetch for this layer, carrying the manual-refresh flag.
    *
-   * Now that the server holds most things for a day, a forced refresh has to
+   * The server holds most things for days, so a forced refresh has to
    * say so: clearing only the browser's copy would refetch straight back out
    * of the server's. Layer state rather than a parameter, because refresh()
    * already guarantees one load() at a time per layer.
@@ -561,7 +584,7 @@ class Layer {
 export class ShodanLayer extends Layer {
   constructor(viewer) {
     super(viewer, 'shodan', 'Shodan exposure');
-    // Every miss spends a query credit. Held for a day, refreshed on demand.
+    // Every miss spends a query credit. Held for 72 hours (TTL.static), refreshed on demand.
     this.coverageTtlMs = INVENTORY_COVERAGE_MS;
     this.padFactor = 0.6;
     this.accumulate = true;
@@ -679,7 +702,7 @@ export class ShodanLayer extends Layer {
     };
   }
 
-  /** Cross-reference the host against GreyNoise, abuse.ch and Censys. */
+  /** Cross-reference the host against GreyNoise and abuse.ch. */
   async enrich(rec, root) {
     // Re-query rather than reuse a captured node: see FlightLayer.enrich.
     const seq = ++this.enrichSeq;
@@ -1059,7 +1082,7 @@ export class FlightLayer extends Layer {
       // table, so it is the first thing seen on a pick.
       const ps = photoSlot();
       if (ac.photo && ps) {
-        ps.innerHTML = `<img class="cam" src="${esc(ac.photo)}" alt="aircraft"
+        ps.innerHTML = `<img class="cam" src="${esc(safeUrl(ac.photo) || '')}" alt="aircraft"
                          onerror="this.style.display='none'">`;
       }
     }
@@ -1118,11 +1141,9 @@ export class FlightLayer extends Layer {
    *
    * Endpoints only — no line between them.
    *
-   * Both legs used to be drawn, origin → aircraft solid and aircraft →
-   * destination dashed. On anything longer than a short hop that is a pair of
-   * lines across half the globe, and with a schedule arc on screen a flight's
-   * own track can no longer be told apart from where it is merely supposed to
-   * be going. Marking the two airports says the same thing without drawing
+   * On anything longer than a short hop, route lines would cross half the
+   * globe, and a flight's own track could not be told apart from where it is
+   * merely supposed to be going. Marking the two airports says the same thing without drawing
    * over everything else, and the panel gives the great-circle distance as a
    * number.
    */
@@ -1399,7 +1420,7 @@ function orbitColor(s) {
 export class OverpassLayer extends Layer {
   constructor(viewer) {
     super(viewer, 'overpass', 'OSM infrastructure');
-    // Mapped infrastructure changes over weeks. Held for a day, refreshed on demand.
+    // Mapped infrastructure changes over weeks. Held for 72 hours, refreshed on demand.
     this.coverageTtlMs = INVENTORY_COVERAGE_MS;
     // Modest, unlike Shodan's: the server snaps this outward onto a fixed
     // grid anyway, so the slack that keeps small pans inside coverage comes
@@ -1540,7 +1561,7 @@ function coneRing(lat, lon, bearing, rangeM = 55, halfAngle = 20, steps = 10) {
 export class AlprLayer extends Layer {
   constructor(viewer) {
     super(viewer, 'alpr', 'ALPR / Flock');
-    // OSM-sourced, and changes over weeks. Held for a day, refreshed on demand.
+    // OSM-sourced, and changes over weeks. Held for 72 hours, refreshed on demand.
     this.coverageTtlMs = INVENTORY_COVERAGE_MS;
     // Modest, unlike Shodan's: the server snaps this outward onto a fixed
     // grid anyway, so the slack that keeps small pans inside coverage comes
@@ -1658,7 +1679,7 @@ export class AlprLayer extends Layer {
       title: rec.operator || rec.manufacturer || vendorLabel,
       accent,
       html: `
-        ${rec.image ? `<img class="cam" src="${esc(rec.image)}" alt="camera"
+        ${safeUrl(rec.image) ? `<img class="cam" src="${esc(safeUrl(rec.image))}" alt="camera"
                             onerror="this.style.display='none'">` : ''}
         <table>${rows([
           ['Vendor', vendorLabel],
@@ -1846,7 +1867,7 @@ export class EventLayer extends Layer {
         ])}</table>
         ${rec.description ? `<h4>Detail</h4><p class="body">${esc(rec.description)}</p>` : ''}
         ${rec.instruction ? `<h4>Instruction</h4><p class="body">${esc(rec.instruction)}</p>` : ''}
-        ${rec.url ? `<a class="ext" href="${esc(rec.url)}" target="_blank" rel="noopener">Open source report ↗</a>` : ''}`,
+        ${safeUrl(rec.url) ? `<a class="ext" href="${esc(safeUrl(rec.url))}" target="_blank" rel="noopener noreferrer">Open source report ↗</a>` : ''}`,
     };
   }
 }
@@ -1868,7 +1889,7 @@ function relTime(iso) {
 export class WebcamLayer extends Layer {
   constructor(viewer) {
     super(viewer, 'webcams', 'Public cameras');
-    // Slow-moving: held for a day, refreshed on demand.
+    // Slow-moving: held for 72 hours, refreshed on demand.
     this.coverageTtlMs = INVENTORY_COVERAGE_MS;
     this.accumulate = true;
     this.windyConfigured = false;
@@ -1922,10 +1943,12 @@ export class WebcamLayer extends Layer {
     if (!stage) return;
     this.stopLive();
 
-    if (rec.embed) {
+    const embed = safeUrl(rec.embed, { httpsOnly: true });
+    const still = safeUrl(rec.image);
+    if (embed) {
       const frame = document.createElement('iframe');
       frame.className = 'cam-frame';
-      frame.src = rec.embed;
+      frame.src = embed;
       frame.loading = 'lazy';
       // sandbox is a DOMTokenList and referrerPolicy reflects an attribute —
       // setting these through setAttribute is the form every browser honours.
@@ -1940,7 +1963,7 @@ export class WebcamLayer extends Layer {
       return;
     }
 
-    if (!rec.image) {
+    if (!still) {
       stage.innerHTML = '<p class="hint">This camera publishes no still frame or player.</p>';
       return;
     }
@@ -1949,13 +1972,23 @@ export class WebcamLayer extends Layer {
     img.className = 'cam-live';
     img.alt = `${rec.title} live view`;
     img.referrerPolicy = 'no-referrer';
+
+    // The demo holds one frame per camera, captured with the snapshot.
+    if (globalThis.OP_DEMO) {
+      img.alt = `${rec.title} snapshot`;
+      img.onerror = () => { img.replaceWith(Object.assign(document.createElement('p'),
+        { className: 'hint', textContent: 'No frame was captured for this camera.' })); };
+      img.src = still;
+      stage.append(img, liveBadge('snapshot'));
+      return;
+    }
     const stamp = liveBadge('updating\u2026');
     stage.append(img, stamp);
 
     let fails = 0;
     const tick = () => {
-      const sep = rec.image.includes('?') ? '&' : '?';
-      img.src = `${rec.image}${sep}_wv=${Date.now()}`;
+      const sep = still.includes('?') ? '&' : '?';
+      img.src = `${still}${sep}_t=${Date.now()}`;
     };
     img.onload = () => {
       fails = 0;
@@ -1996,7 +2029,7 @@ export class WebcamLayer extends Layer {
           ['Status', rec.status],
           ['Updated', rec.updated],
         ])}</table>
-        ${rec.link ? `<a class="ext" href="${esc(rec.link)}" target="_blank" rel="noopener">Open source page ↗</a>` : ''}
+        ${safeUrl(rec.link) ? `<a class="ext" href="${esc(safeUrl(rec.link))}" target="_blank" rel="noopener noreferrer">Open source page ↗</a>` : ''}
         <p class="hint">Cameras published for public viewing by their operators.</p>`,
     };
   }
@@ -2154,7 +2187,7 @@ function vesselSprite(color, moving) {
 export class NetInfraLayer extends Layer {
   constructor(viewer) {
     super(viewer, 'netinfra', 'Network infrastructure');
-    // Slow-moving: held for a day, refreshed on demand.
+    // Slow-moving: held for 72 hours, refreshed on demand.
     this.coverageTtlMs = INVENTORY_COVERAGE_MS;
     this.accumulate = true;
     this.sources = new Set(['atlas']);
@@ -2257,7 +2290,7 @@ export class NetInfraLayer extends Layer {
 export class IotLayer extends Layer {
   constructor(viewer) {
     super(viewer, 'iot', 'IoT sensors');
-    // Slow-moving: held for a day, refreshed on demand.
+    // Slow-moving: held for 72 hours, refreshed on demand.
     this.coverageTtlMs = INVENTORY_COVERAGE_MS;
     // Readings go stale faster than positions, but the position is the point.
     this.accumulate = true;
@@ -2431,7 +2464,7 @@ export class TrafficLayer extends Layer {
         title: rec.title,
         accent: '#ffd166',
         html: `
-          ${rec.image ? `<img class="cam" src="${esc(rec.image)}" alt="camera view"
+          ${safeUrl(rec.image) ? `<img class="cam" src="${esc(safeUrl(rec.image))}" alt="camera view"
                               onerror="this.style.display='none'">` : ''}
           <table>${rows([
             ['Roadway', rec.roadway],
@@ -2709,16 +2742,19 @@ export class LabelsOverlay {
 
   url() {
     const set = this.style === 'light' ? 'light_only_labels' : 'dark_only_labels';
-    // @2x keeps lettering legible on high-DPI displays.
-    const retina = (window.devicePixelRatio || 1) > 1.25 ? '@2x' : '';
-    // Same-origin proxy; the server adds the CARTO key.
-    return `/tiles/carto/${set}/{z}/{x}/{y}${retina}.png`;
+    // @2x keeps lettering legible on high-DPI displays. The demo snapshot
+    // holds the standard tiles only.
+    const retina = !globalThis.OP_DEMO && (window.devicePixelRatio || 1) > 1.25 ? '@2x' : '';
+    // Same-origin proxy; the server adds the CARTO key. Relative, so it
+    // resolves under a sub-path too.
+    return `tiles/carto/${set}/{z}/{x}/{y}${retina}.png`;
   }
 
   apply() {
+    const maximumLevel = globalThis.OP_DEMO?.labelsMaxLevel ?? 18;
     const provider = new Cesium.UrlTemplateImageryProvider({
       url: this.url(),
-      maximumLevel: 18,
+      maximumLevel,
       credit: '\u00a9 OpenStreetMap contributors, \u00a9 CARTO',
     });
     const next = this.tune(new Cesium.ImageryLayer(provider));
@@ -2729,7 +2765,7 @@ export class LabelsOverlay {
     if (this.boost) {
       boostNext = this.tune(new Cesium.ImageryLayer(
         new Cesium.UrlTemplateImageryProvider({
-          url: this.url(), maximumLevel: 18, credit: '',
+          url: this.url(), maximumLevel, credit: '',
         })));
       boostNext.alpha = this.alpha * 0.85;
       this.viewer.imageryLayers.add(boostNext);
@@ -2853,21 +2889,6 @@ export async function enrichHost(ip, slot) {
       + '<div class="verdict ok">Not on the abuse.ch botnet C2 list</div>');
   }
 
-  const cs = d.censys;
-  if (d.censysConfigured && cs && !cs.error) {
-    parts.push(`<h4>Censys second opinion</h4>
-      <table>${rows([
-        ['Network', cs.asName ? `AS${cs.asn} ${cs.asName}` : null],
-        ['Location', cs.location],
-        ['OS', cs.os],
-        ['Open services', cs.services?.length
-          ? cs.services.map((s) => `${s.port}/${s.protocol}`).join(', ') : null],
-        ['Last scanned', cs.lastUpdated?.slice(0, 10)],
-      ])}</table>`);
-  } else if (cs?.error && d.censysConfigured) {
-    parts.push(`<h4>Censys second opinion</h4><p class="hint">${esc(cs.error)}</p>`);
-  }
-
   const s = target();
   if (s) s.innerHTML = parts.join('');
 }
@@ -2967,8 +2988,11 @@ export class BasemapOverlay {
       // layer rather than a provider, so it skips applyProvider.
       this.applyLayer(Cesium.ImageryLayer.fromWorldImagery({}));
     } else {
+      // The static demo carries its own copy of these tiles.
+      const demo = globalThis.OP_DEMO?.osmTiles;
       this.applyProvider(new Cesium.OpenStreetMapImageryProvider({
-        url: 'https://tile.openstreetmap.org/',
+        url: demo?.url || 'https://tile.openstreetmap.org/',
+        ...(demo?.maxLevel ? { maximumLevel: demo.maxLevel } : {}),
         credit: '© OpenStreetMap contributors',
       }));
     }
@@ -3019,7 +3043,12 @@ export class BasemapOverlay {
         this.onUpdate?.();
         return;
       }
-      if (this.provider === 'gee' && d.composite) {
+      if (d.tiles && d.url) {
+        // A ready-made tile set with nothing to choose (the demo's satellite
+        // mosaic): apply it as is.
+        this.sceneId = null;
+        this.applyTiles(d.url, d.maxLevel, d.attribution);
+      } else if (this.provider === 'gee' && d.composite) {
         this.sceneId = d.composite.id;
         this.applyTiles(d.composite.url, d.maxLevel, d.attribution);
       } else if (this.scenes.length) {

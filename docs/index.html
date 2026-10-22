@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenPanopticon - OSINT Data Fusion (demo)</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='12' fill='none' stroke='%2339ff88' stroke-width='2'/><path d='M4 16h24M16 4c5 5 5 19 0 24M16 4c-5 5-5 19 0 24' fill='none' stroke='%2339ff88' stroke-width='1.5'/></svg>">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/cesium/1.145.0/Widgets/widgets.css"
+      integrity="sha384-ghEeMdcWWzRv/BPeUcX835vcKDGrxvROXisl/Btpv3GeekBUXTSPVcFJpI1Tcrgp" crossorigin="anonymous">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap">
+<link rel="stylesheet" href="style.css">
+<script src="demo/manifest.js"></script>
+<script src="demo/demo.js"></script>
+<link rel="stylesheet" href="demo/demo.css">
+<script src="js/cesium-base.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/cesium/1.145.0/Cesium.js"
+        integrity="sha384-D1oR8FyBDsJWkPeydGJTh8nJg5/++9sqchzJuu+oGQPmgbwu3aJmoVj3BTowr6t6" crossorigin="anonymous"></script>
+</head>
+<body data-mode="eo">
+
+<div id="globe"></div>
+
+<!-- top bar -->
+<header id="topbar">
+  <div class="brand">
+    <span class="mark">◉</span>
+    <span class="wordmark">OPENPANOPTICON</span>
+    <span class="tagline">OSINT Data Fusion</span>
+  </div>
+
+  <div class="search-wrap">
+    <input id="search" placeholder="search a place…" autocomplete="off" spellcheck="false">
+    <div id="search-results"></div>
+  </div>
+
+  <div id="optics"></div>
+
+  <div class="toggles">
+    <button id="wx-radar" class="tgl" title="Precipitation radar (RainViewer)"><span>RADAR</span></button>
+    <button id="wx-sat" class="tgl" title="Infrared cloud imagery (RainViewer)"><span>CLOUD</span></button>
+    <button id="wx-imagery" class="tgl" title="Daily satellite imagery (NASA GIBS)"><span>IMAGERY</span></button>
+    <div class="hover-wrap" id="basemap-wrap">
+      <button id="wx-basemap" class="tgl" title="Ground imagery: street map or recent satellite"><span>BASEMAP</span></button>
+      <!-- revealed on hover or keyboard focus, like the label controls -->
+      <div id="basemapbar" class="hover-menu available">
+        <div class="hm-row">
+          <label>Source
+            <select id="bm-provider" aria-label="base map source"></select>
+          </label>
+        </div>
+        <div class="hm-row" id="bm-window">
+          <label>From <input id="bm-from" type="date"></label>
+          <label>To <input id="bm-to" type="date"></label>
+          <label>Max cloud <input id="bm-cloud" type="range" min="0" max="100" step="5" value="40">
+            <b id="bm-cloud-val">40%</b>
+          </label>
+        </div>
+        <div class="hm-row" id="bm-scene-row">
+          <label>Scene
+            <select id="bm-scene" aria-label="imagery scene"></select>
+          </label>
+          <button id="bm-clearest" class="hm-btn" type="button" title="Jump to the least cloudy scene in this window">Clearest</button>
+        </div>
+        <p class="hm-note" id="bm-note"></p>
+      </div>
+    </div>
+    <div class="hover-wrap labels-wrap">
+      <button id="wx-labels" class="tgl" title="Place and road name labels (CARTO / OpenStreetMap)"><span>LABELS</span></button>
+      <!-- label styling: revealed on hover or keyboard focus, only while labels are on -->
+      <div id="labelbar" class="hover-menu">
+        <select id="lb-style" aria-label="label style">
+          <option value="dark">Light text</option>
+          <option value="light">Dark text</option>
+        </select>
+        <label>Contrast <input id="lb-contrast" type="range" min="100" max="400" value="220"></label>
+        <label class="lb-boost"><input id="lb-boost" type="checkbox" checked> Bold</label>
+      </div>
+    </div>
+    <div class="hover-wrap" id="cycle-wrap">
+      <button id="cycle-toggle" class="tgl" title="Auto-select a random item in view on a timer (C)"><span>CYCLE</span><b id="cycle-count">15s</b></button>
+      <!-- interval picker, revealed on hover or keyboard focus -->
+      <div id="cyclebar" class="hover-menu available">
+        <div class="hm-row">
+          <label>Switch every</label>
+          <button class="hm-btn cycle-step" type="button" data-s="15">15s</button>
+          <button class="hm-btn cycle-step" type="button" data-s="30">30s</button>
+          <button class="hm-btn cycle-step" type="button" data-s="60">60s</button>
+        </div>
+        <div class="hm-row cycle-types-head">
+          <label>Include</label>
+          <button id="cycle-all" class="hm-btn" type="button">All</button>
+          <button id="cycle-none" class="hm-btn" type="button">None</button>
+        </div>
+        <div id="cycle-types"></div>
+        <p class="hm-note">Picks a random item of the ticked types currently on screen. Types whose layer is switched off are greyed out until you turn the layer on.</p>
+      </div>
+    </div>
+    <button id="auto-toggle" class="tgl active" title="Auto-refresh layers when the camera settles"><span>AUTO</span></button>
+    <button id="refresh-now" class="tgl" title="Refresh all layers now (R)"><span>SYNC</span></button>
+    <button id="flush-cache" class="tgl" title="Drop every cached feature and refetch"><span>FLUSH</span></button>
+  </div>
+</header>
+
+<!-- radar frame scrubber, shown only while radar is on -->
+<div id="weather">
+  <button id="wx-play" title="Animate radar frames">▶</button>
+  <input id="wx-frame" type="range" min="0" max="0" value="0" aria-label="radar frame">
+  <span id="wx-time">—</span>
+</div>
+
+<!-- satellite imagery controls, shown only while imagery is on -->
+<div id="imagery">
+  <select id="im-layer" aria-label="imagery layer"></select>
+  <button id="im-prev" title="Previous day">◀</button>
+  <input id="im-date" type="date" aria-label="imagery date">
+  <button id="im-next" title="Next day">▶</button>
+  <input id="im-alpha" type="range" min="10" max="100" value="85" aria-label="imagery opacity"
+         title="Opacity">
+</div>
+
+<button id="sidebar-toggle" aria-expanded="true" title="Collapse the sensor panel">
+  <span class="chev"></span>
+</button>
+
+<!-- left panel -->
+<aside id="sidebar">
+  <section class="panel">
+    <h2>Sensor package</h2>
+    <div id="layers"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Regional signals</h2>
+    <div id="signals-body"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Saved targets</h2>
+    <div id="targets"></div>
+
+    <!-- Home editor: a disclosure rather than a hover menu, because it holds
+         text fields. A hover menu that closes when the pointer drifts off is
+         fine for a slider and hostile for typing coordinates. -->
+    <div id="home-editor" hidden>
+      <p class="he-current" id="he-current">—</p>
+      <button id="he-geolocate" class="hm-btn he-wide" type="button"
+              title="Look up where this machine is on the network and pin it as home">
+        Geolocate host and save as home
+      </button>
+      <button id="he-here" class="hm-btn he-wide" type="button"
+              title="Pin the camera’s current position and altitude as home">
+        Use current view
+      </button>
+      <div class="he-grid">
+        <label><span>Name</span> <input id="he-name" type="text" maxlength="48" placeholder="optional"></label>
+        <label><span>Lat</span> <input id="he-lat" type="text" inputmode="decimal" placeholder="30.2672"></label>
+        <label><span>Lon</span> <input id="he-lon" type="text" inputmode="decimal" placeholder="-97.7431"></label>
+      </div>
+      <div class="he-actions">
+        <button id="he-save" class="hm-btn" type="button">Save as home</button>
+        <button id="he-clear" class="hm-btn" type="button"
+                title="Forget the pinned home and go back to resolving the host each session">Clear</button>
+      </div>
+      <p class="hm-note" id="he-note">
+        Fly anywhere — search, or drag the globe — then <b>Use current view</b> to pin it.
+        A pinned home stays in this browser and is not sent anywhere.
+      </p>
+    </div>
+  </section>
+
+  <div class="panel-actions">
+    <button id="reset-settings" class="ghost-btn">Reset saved settings</button>
+  </div>
+
+  <footer class="legal">
+    Aggregates public data only: Shodan, OpenSky, CelesTrak, OpenStreetMap, and
+    cameras their operators publish for public viewing. Nothing here is a
+    substitute for authorisation — check the law and the terms of service
+    before you act on any of it.
+  </footer>
+</aside>
+
+<!-- bottom HUD -->
+<footer id="hud">
+  <div class="cell"><label>MODE</label><b id="hud-mode">EO</b></div>
+  <div class="cell"><label>HOME</label><b id="hud-home">—</b></div>
+  <div class="cell"><label>EYE</label><b id="hud-eye">—</b></div>
+  <div class="cell"><label>CURSOR</label><b id="hud-cursor">—</b></div>
+  <div class="cell"><label>ALT</label><b id="hud-alt">—</b></div>
+  <div class="cell"><label>HDG</label><b id="hud-hdg">—</b></div>
+  <div class="cell"><label>TRACKS</label><b id="hud-tracks">0</b></div>
+  <div class="cell"><label>UTC</label><b id="hud-time">—</b></div>
+  <div class="cell"><label>FETCH</label><b id="hud-gate">QUERYING</b></div>
+  <!-- Whether the globe is still being drawn, so a stalled renderer can be
+       told apart from stale data. -->
+  <div class="cell"><label>RENDER</label><b id="hud-fps">—</b></div>
+  <div class="cell keys"><label>KEYS</label><b>1–5 optics · R sync · H hide UI · [ panel</b></div>
+</footer>
+
+<div id="alerts"></div>
+
+<!-- detail panel -->
+<aside id="detail">
+  <button id="detail-close" aria-label="close">×</button>
+  <div class="detail-kind" id="detail-kind">—</div>
+  <h3 id="detail-title">—</h3>
+  <div id="detail-body"></div>
+</aside>
+<div id="detail-resize" role="separator" aria-orientation="vertical" aria-label="Resize detail panel" title="Drag to resize · double-click to reset"></div>
+
+<!-- boot screen -->
+<div id="boot">
+  <div class="boot-inner">
+    <pre class="ascii">╔═╗╔═╗╔═╗╔╗╔╔═╗╔═╗╔╗╔╔═╗╔═╗╔╦╗╦╔═╗╔═╗╔╗╔
+║ ║╠═╝╠╣ ║║║╠═╝╠═╣║║║║ ║╠═╝ ║ ║║  ║ ║║║║
+╚═╝╩  ╚═╝╝╚╝╩  ╩ ╩╝╚╝╚═╝╩   ╩ ╩╚═╝╚═╝╝╚╝</pre>
+    <div class="boot-sub">OSINT Data Fusion</div>
+    <div class="boot-line"><span class="blip">▮</span> <span id="boot-msg">initialising…</span></div>
+  </div>
+</div>
+
+<script type="module" src="js/app.js"></script>
+</body>
+</html>

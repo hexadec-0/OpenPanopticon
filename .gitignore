@@ -1,5 +1,10 @@
 # Secrets
 .env
 
-# Cached upstream API responses (OSM data under ODbL, etc.)
-vendor/cache/
+# Runtime data: cached upstream responses (OSM data under ODbL, etc.), the host's geoIP answer, downloaded TLEs and diagnostics. Never commit any of it.
+# Anchored to the root: the bundled satellite.js in public/providers/ IS committed.
+/providers/*
+!/providers/README.md
+
+# Test tooling (puppeteer-core, a dev dependency only)
+node_modules/

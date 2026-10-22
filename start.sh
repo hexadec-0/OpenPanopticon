@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 hexadec
 #
-# OPENPANOPTICON — OSINT Data Fusion  (ver. 1.0.1)
+# OPENPANOPTICON — OSINT Data Fusion
 # Launcher for Linux, macOS and Chromebook Linux. Windows: run START.bat instead.
 # First time on a Chromebook? Run   bash chromebook.sh   once.
 #
@@ -41,21 +43,22 @@ fi
 command -v node >/dev/null 2>&1 || die "
   Node.js was not found on PATH.
 
-  Install Node 18 or newer:
+  Install Node 22 or newer:
     macOS         brew install node
-    Debian/Ubuntu sudo apt install nodejs
+    Debian/Ubuntu https://github.com/nodesource/distributions
+                  (the distro's own nodejs package is often older than 22)
     Fedora        sudo dnf install nodejs
     Arch          sudo pacman -S nodejs
     any           https://nodejs.org
 "
 
 NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
-if [ "$NODE_MAJOR" -lt 18 ]; then
+if [ "$NODE_MAJOR" -lt 22 ]; then
   if is_crostini; then
-    die "  Node $(node -v) is too old — OpenPanopticon needs 18 or newer.
+    die "  Node $(node -v) is too old — OpenPanopticon needs 22 or newer.
   Run   bash chromebook.sh   to install a current version."
   fi
-  die "  Node $(node -v) is too old — OpenPanopticon needs 18 or newer for built-in fetch."
+  die "  Node $(node -v) is too old — OpenPanopticon needs 22 or newer (built-in fetch and WebSocket)."
 fi
 
 # --- .env -------------------------------------------------------------------
@@ -93,9 +96,26 @@ if is_crostini; then
   ENV_HOST="$(sed -n 's/^[[:space:]]*HOST[[:space:]]*=[[:space:]]*//p' .env | tail -n1 | tr -d '\r"'"'"' ')"
   if [ -z "${HOST:-}" ] && { [ -z "$ENV_HOST" ] || [ "$ENV_HOST" = "127.0.0.1" ] || [ "$ENV_HOST" = "localhost" ]; }; then
     export HOST=0.0.0.0
+    say "  ${DIM}Chromebook detected: listening on all container interfaces (HOST=0.0.0.0).${RST}"
   fi
-  URL="http://$(hostname).linux.test:${PORT}"
+  CROS_HOST="$(hostname).linux.test:${PORT}"
+  URL="http://${CROS_HOST}"
+  # The server only answers to host names it expects (DNS-rebinding defence).
+  export ALLOWED_HOSTS="${ALLOWED_HOSTS:+${ALLOWED_HOSTS},}${CROS_HOST}"
 fi
+
+# Bound beyond loopback, anything on the network that can reach the port could
+# use your API keys, and it can forge the Host header. The server then requires
+# an access key, exchanged once for a cookie via the URL the browser opens.
+EFFECTIVE_HOST="${HOST:-$(sed -n 's/^[[:space:]]*HOST[[:space:]]*=[[:space:]]*//p' .env 2>/dev/null | tail -n1 | tr -d '\r"'"'"' ')}"
+case "${EFFECTIVE_HOST:-127.0.0.1}" in
+  127.0.0.1|localhost|::1) ;;
+  *)
+    export ACCESS_KEY="${ACCESS_KEY:-$(node -e 'process.stdout.write(require("crypto").randomBytes(18).toString("base64url"))')}"
+    warn "  Note: listening on ${EFFECTIVE_HOST}, not just this machine. Requests need an access key;"
+    warn "  the browser is opened with it. Set HOST=127.0.0.1 in .env to stay local."
+    ;;
+esac
 
 port_busy() {
   if command -v lsof >/dev/null 2>&1; then
@@ -118,19 +138,21 @@ fi
 open_browser() {
   for _ in $(seq 1 40); do
     if command -v curl >/dev/null 2>&1; then
-      curl -sf -o /dev/null "${LOCAL_URL}/api/health" && break
+      curl -sf -o /dev/null -H 'X-Panopticon: 1' ${ACCESS_KEY:+-b "op_access=${ACCESS_KEY}"} \
+        "${LOCAL_URL}/api/health" && break
     else
       sleep 0.25
     fi
     sleep 0.25
   done
-  if command -v xdg-open >/dev/null 2>&1; then xdg-open "$URL" >/dev/null 2>&1 || true
-  elif command -v open  >/dev/null 2>&1; then open "$URL" >/dev/null 2>&1 || true
-  else say "  Open ${CYN}${URL}${RST} in your browser."
+  local open_url="$URL${ACCESS_KEY:+/?key=${ACCESS_KEY}}"
+  if command -v xdg-open >/dev/null 2>&1; then xdg-open "$open_url" >/dev/null 2>&1 || true
+  elif command -v open  >/dev/null 2>&1; then open "$open_url" >/dev/null 2>&1 || true
+  else say "  Open ${CYN}${open_url}${RST} in your browser."
   fi
 }
 
-if [ "${OPENPANOPTICON_NO_BROWSER:-${WORLDVIEW_NO_BROWSER:-0}}" != "1" ]; then
+if [ "${OPENPANOPTICON_NO_BROWSER:-0}" != "1" ]; then
   open_browser &
 fi
 

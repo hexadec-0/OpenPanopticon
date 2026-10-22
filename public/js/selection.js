@@ -1,10 +1,11 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 hexadec
 /**
  * selection.js — the "this is the one you clicked" ring.
  *
- * Opening the detail panel used to be the only feedback that a pick had
- * landed, which left you hunting the globe for which of several hundred
- * near-identical pins the panel was describing. This draws a large glowing
- * ring around it instead.
+ * The detail panel alone does not show which of several hundred
+ * near-identical pins it is describing, so this draws a large glowing ring
+ * around the pick.
  *
  * Two things make it work everywhere rather than only for ground features:
  *
