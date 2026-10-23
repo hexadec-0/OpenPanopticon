@@ -28,6 +28,12 @@ PRs that add Shodan presets, or layers that map people, devices or
 surveillance hardware, get extra review in line with the README's
 *Using this responsibly* section. Explain the legitimate use in the PR.
 
+## Before you open an Issue
+
+- Suggest fixes or provide reproduction steps or evidence of an issue.
+- Do *NOT* fire automated systems, bots, or other AI tools at the repo to create mass issues for minor code smells.
+- Read closed and other open issues to make sure your issue has not been documented, resolved, or mitigated.
+
 ## Before you open a PR
 
 - `npm test` (unit + functional, seconds) and, for UI changes,
