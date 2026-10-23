@@ -24,7 +24,7 @@ so please read these before opening a PR.
 
 ## Extra review
 
-PRs that add Shodan presets, or layers that map people, devices or
+PRs that add Shodan presets, or layers that map people, devices, or
 surveillance hardware, get extra review in line with the README's
 *Using this responsibly* section. Explain the legitimate use in the PR.
 

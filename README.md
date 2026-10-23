@@ -81,7 +81,7 @@ by geoIP (or your pinned home; see [Home](#home)); the `⌂ Home` button returns
 there, and the HUD bottom bar shows the resolved city.
 
 **Nothing loading?** Layers only fetch below the altitude ceiling (45 km by
-default). Click **FETCH** in the HUD to raise it to 100, 250 or 500 km; higher
+default). Click **FETCH** in the HUD to raise it to 100, 250, or 500 km; higher
 ceilings use more API credits. See [Altitude gate](#altitude-gate).
 
 > [!IMPORTANT]
@@ -137,18 +137,18 @@ ceilings use more API credits. See [Altitude gate](#altitude-gate).
 | Layer | Source | Notes |
 |---|---|---|
 | **Shodan exposure** | Shodan `host/search` | Every host Shodan has indexed in view, with no filter. Colour by service category (web, remote, database, ICS, camera, network…) or by known CVEs, with a live legend. |
-| **Live aircraft** | OpenSky + adsbdb | Positions, callsigns, altitude, heading, vertical rate, motion trails, emergency squawk flagging (7500/7600/7700). Click one to resolve its **departure and destination airports**, airline and airframe. Trails are trimmed to the last two minutes. |
+| **Live aircraft** | OpenSky + adsbdb | Positions, callsigns, altitude, heading, vertical rate, motion trails, emergency squawk flagging (7500/7600/7700). Click one to resolve its **departure and destination airports**, airline, and airframe. Trails are trimmed to the last two minutes. |
 | **Weather** | RainViewer + NASA GIBS | Precipitation radar (RainViewer) and cloud imagery as toggleable globe overlays, with a frame scrubber and animation across the last ~2 hours plus nowcast. Cloud imagery is GOES-East GeoColor from NASA GIBS, which covers the Americas and the Atlantic; see [Overlay resolution limits](#overlay-resolution-limits). |
 | **Orbital assets** | CelesTrak | 24 catalogue groups. Real SGP4 propagation in the browser via satellite.js. Click a satellite to draw its ground track for one full revolution. |
 | **OSM infrastructure** | Overpass API | 10 toggleable feature classes: surveillance cameras, military sites, comms towers, power plants and substations, airfields, ports, government and diplomatic, emergency services, data centres, fuel storage. |
 | **ALPR / Flock** | DeFlock via OpenStreetMap | License-plate readers, coloured by vendor, each drawn with a field-of-view cone from its tagged bearing. Filter by vendor, or to only cameras whose facing is known. |
 | **Situational awareness** | GDACS, NASA EONET, USGS, NWS, NASA FIRMS | Live hazard and disaster events for the current view, normalised into one record shape and colour-graded by severity. Red-level events pulse on the globe; events that carry an affected area are drawn as polygons. |
 | **Public cameras** | NYC DOT + ALERTCalifornia + Windy + OpenWebcamDB | Click one to watch it live in the side panel: an embedded player where the operator provides one, otherwise the still frame refreshed on a timer. ALERTCalifornia adds ~1,290 wildfire-detection PTZ cameras, keyless. |
-| **Vessels (AIS)** | AISStream | Live ship positions, heading, speed, navigation status, destination and dimensions. The server holds the WebSocket; the browser never sees the key. |
+| **Vessels (AIS)** | AISStream | Live ship positions, heading, speed, navigation status, destination, and dimensions. The server holds the WebSocket; the browser never sees the key. |
 | **Network infrastructure** | RIPE Atlas, OpenCelliD, WiGLE, Onionoo | Geolocated network and wireless hardware: measurement probes with ASN, cell towers drawn at their estimated range, WiFi/Bluetooth survey points, and Tor relay capacity by country. |
 | **IoT sensors** | Sensor.Community | Citizen-run air-quality and noise hardware with live readings, coloured by WHO PM2.5 bands or measured dB(A). |
 | **Traffic (511)** | State DOT 511 feeds | Cameras, incidents, lane closures. Add states to `FIVE_ELEVEN_KEYS`; 24 state hosts are pre-wired. |
-| **Satellite imagery** | NASA GIBS | Daily global true-colour, night lights, land-surface temperature and thermal anomalies, scrubbable by date. |
+| **Satellite imagery** | NASA GIBS | Daily global true-colour, night lights, land-surface temperature, and thermal anomalies, scrubbable by date. |
 | **Regional signals** | IODA, EIA, Cloudflare Radar, Raspberry Shake | Country- and grid-scale telemetry in the sidebar: internet outages, US electricity demand, Cloudflare outage annotations, citizen seismographs in view. |
 
 ### Situational-awareness sources
@@ -157,8 +157,8 @@ ceilings use more API credits. See [Altitude gate](#altitude-gate).
 |---|---|---|
 | **GDACS** (EU JRC / UN) | no | Global multi-hazard alerts (earthquake, cyclone, flood, volcano, drought, wildfire), graded Green / Orange / Red, 30-day window. |
 | **NASA EONET v3** | no | Open natural events: severe storms, wildfires, volcanoes, sea and lake ice. Point *and* polygon geometry. |
-| **USGS** | no | Every earthquake reported in the last 24 hours, with depth, felt reports and tsunami flags. Severity from magnitude (≥6 red, ≥4.5 orange). |
-| **NWS** | no | US watches, warnings and advisories. Only alerts that carry a polygon are drawn (see [Rate limits](#rate-limits-worth-knowing)). |
+| **USGS** | no | Every earthquake reported in the last 24 hours, with depth, felt reports, and tsunami flags. Severity from magnitude (≥6 red, ≥4.5 orange). |
+| **NWS** | no | US watches, warnings, and advisories. Only alerts that carry a polygon are drawn (see [Rate limits](#rate-limits-worth-knowing)). |
 | **NASA FIRMS** | free key | VIIRS active-fire detections from the last 48 hours, graded by detection confidence and fire radiative power. |
 | **RSOE EDIS** | enterprise | Licensed EDIS feeds are supported via `EDIS_API_URL` / `EDIS_API_KEY`. |
 
@@ -198,7 +198,7 @@ detail panel: a hands-off way to tour what the current view contains.
 ### Settings persistence
 
 Which layers were on, how each was filtered, the optical mode, the overlays,
-the label styling and the sidebar's state are saved to `localStorage` and
+the label styling, and the sidebar's state are saved to `localStorage` and
 restored on the next load, across a refresh and across a server restart.
 
 It holds UI state only: no credentials, no query results, no positions.
@@ -212,7 +212,7 @@ the bottom of the sidebar clears it.
 
 No view-scoped layer is queried above **45 km** by default (the ceiling is
 configurable), so panning around from altitude costs no API calls, Overpass
-slots or Shodan credits. Map tiles and imagery overlays still load as normal.
+slots, or Shodan credits. Map tiles and imagery overlays still load as normal.
 
 Worth knowing how low that is: at 45 km the view spans only about 40 km, so a
 normal "look at the whole city" view sits *above* the ceiling and fetches
@@ -539,7 +539,7 @@ flowchart LR
 ```
 
 Every keyed upstream request goes through the server, which attaches the
-credential on the way out; the credentials for Shodan, OpenSky, WiGLE, CARTO
+credential on the way out; the credentials for Shodan, OpenSky, WiGLE, CARTO,
 and the rest never reach the browser. The one exception is the **Cesium Ion token**: Cesium
 streams terrain and imagery from the browser by design, so `/api/config` hands
 it over. Treat it as public and scope it in your Cesium Ion account to
@@ -603,7 +603,7 @@ is not anonymous:
 - **`/api/geoip`** sends this machine's public IP to `ipwho.is` to find the
   home location. The answer is held in memory for 30 minutes (the geolocate
   button bypasses that) and is never written to disk.
-- **Keyed queries are tied to your accounts.** Shodan, WiGLE, GreyNoise and
+- **Keyed queries are tied to your accounts.** Shodan, WiGLE, GreyNoise, and
   the other keyed services log what your key searched for.
 - **Cached answers on disk show where you looked.** `providers/cache/` holds
   upstream responses for the areas you viewed, for up to 72 hours. The server

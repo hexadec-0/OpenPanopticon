@@ -30,7 +30,7 @@ on a Cesium globe. `npm start` runs it on http://127.0.0.1:8420.
 - Nothing the operator types (searches, custom queries) is written to disk in
   clear: disk cache records carry only a hash of their key.
 - The app carries no version number anywhere: not in `package.json`, the page,
-  the startup banner, the API or the User-Agent.
+  the startup banner, the API, or the User-Agent.
 - Write comments as present-tense rationale, not debugging history.
 
 ## Trust boundaries
@@ -40,7 +40,7 @@ Changes in these areas need a security review before they count as done:
 - **Credential handling**: `CFG`, `grab()`, and any upstream URL that embeds a key.
 - **Upstream data rendered in the browser**: the `detail()` and `enrich()`
   methods in `public/js/layers.js`, and anything that sets `innerHTML`,
-  `href` or iframe `src`.
+  `href`, or iframe `src`.
 - **Browser policy**: the `CSP` and `SECURITY_HEADERS` in `server.js`.
 - **Network exposure**: the `HOST` binding, `ALLOWED_HOSTS`, the access key,
   the `X-Panopticon` header check, and `/api/shodan`.

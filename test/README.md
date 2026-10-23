@@ -3,7 +3,7 @@
 Three suites, all on Node's built-in test runner. None of them touch a real
 upstream or need an API key: every external API is answered by canned
 fixtures (`helpers/fixtures.cjs`), so the suite runs offline, spends no
-credits and gives the same answer every time.
+credits, and gives the same answer every time.
 
 ## Run them
 
@@ -17,16 +17,16 @@ npm run test:coverage  # unit + functional with a coverage table
 
 Or use `test/run-tests.sh` (Windows: `test\run-tests.bat`). It checks Node,
 installs `puppeteer-core` if the browser tests need it, and takes a suite name:
-`all` (the default), `quick`, `unit`, `functional`, `e2e` or `coverage`.
-Its options are `--chrome PATH`, `--cesium DIR`, `--headful` and
+`all` (the default), `quick`, `unit`, `functional`, `e2e`, or `coverage`.
+Its options are `--chrome PATH`, `--cesium DIR`, `--headful`, and
 `--required`; `--help` lists them.
 
 ## What's where
 
 | Suite | Folder | What it covers |
 |---|---|---|
-| Unit | `unit/server`, `unit/client`, `unit/demo` | Server helpers: grid snapping, caching, the fetch wrapper, normalisers, the OpenSky budget, AIS, TLE fallback and the Overpass queue. Browser modules against a Cesium stand-in: settings, the vector-tile decoder, auto-cycle, layers and overlays. The demo's capture and build helpers. |
-| Functional | `functional` | Every `/api` route over real HTTP: the Host, header and access-key gate, response headers, static files, caching and persistence, error handling, and `node server.js` itself. Also the static demo: capture, build, its local server, and its API stand-in. |
+| Unit | `unit/server`, `unit/client`, `unit/demo` | Server helpers: grid snapping, caching, the fetch wrapper, normalisers, the OpenSky budget, AIS, TLE fallback, and the Overpass queue. Browser modules against a Cesium stand-in: settings, the vector-tile decoder, auto-cycle, layers, and overlays. The demo's capture and build helpers. |
+| Functional | `functional` | Every `/api` route over real HTTP: the Host, header, and access-key gate, response headers, static files, caching and persistence, error handling, and `node server.js` itself. Also the static demo: capture, build, its local server, and its API stand-in. |
 | End-to-end | `e2e` | The app in Chrome with real Cesium: boot, the HUD, every layer and its detail panel, overlays, the base-map menu, search, home, auto-cycle, keyboard shortcuts, saved settings, and that hostile upstream data cannot run script. Also the built demo, served like GitHub Pages. |
 
 `helpers/` holds the shared plumbing:
@@ -38,7 +38,7 @@ Its options are `--chrome PATH`, `--cesium DIR`, `--headful` and
 
 ## Browser tests
 
-They use an installed Chrome, Chromium or Edge instead of downloading one.
+They use an installed Chrome, Chromium, or Edge instead of downloading one.
 These environment variables change how they run:
 
 | Variable | Effect |

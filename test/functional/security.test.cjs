@@ -281,3 +281,110 @@ describe('server bound beyond loopback (access key)', () => {
     } finally { await t.close(); }
   });
 });
+
+describe('the CARTO tile proxy only serves this app', () => {
+  let s;
+  before(async () => { s = await startServer({ env: TEST_KEYS }); });
+  after(() => s.close());
+  const tile = '/tiles/carto/dark_only_labels/5/10/12.png';
+
+  for (const site of ['cross-site', 'same-site']) {
+    test(`a ${site} request is refused before CARTO is asked`, async () => {
+      s.mock.calls.length = 0;
+      const r = await s.request(tile, { headers: { 'Sec-Fetch-Site': site } });
+      assert.equal(r.status, 403);
+      assert.equal(r.headers['x-content-type-options'], 'nosniff');
+      assert.equal(s.mock.callsTo('basemaps.cartocdn.com').length, 0);
+    });
+  }
+
+  for (const site of ['same-origin', 'none', undefined]) {
+    test(`Sec-Fetch-Site ${site ?? '(absent)'} is served`, async () => {
+      const r = await s.request(tile, { headers: site ? { 'Sec-Fetch-Site': site } : {} });
+      assert.equal(r.status, 200);
+      assert.equal(r.headers['content-type'], 'image/png');
+    });
+  }
+
+  test('every response forbids cross-origin embedding', async () => {
+    for (const p of ['/', '/js/app.js', tile]) {
+      assert.equal((await s.request(p)).headers['cross-origin-resource-policy'], 'same-origin', p);
+    }
+    assert.equal((await s.api('/api/health')).headers['cross-origin-resource-policy'], 'same-origin');
+  });
+});
+
+describe('the request log never holds what the operator typed', () => {
+  let s;
+  before(async () => { s = await startServer({ env: TEST_KEYS }); });
+  after(() => s.close());
+
+  test('loggable() drops typed values and keeps everything else as sent', () => {
+    const L = (u) => s.mod.loggable(new URL(u, 'http://x'));
+    assert.equal(L('/api/health'), '/api/health');
+    assert.equal(L('/api/geocode?q=123+Secret+Street'), '/api/geocode?q=<redacted>');
+    assert.equal(L('/api/geocode?%71=Secret&fresh=1'), '/api/geocode?%71=<redacted>&fresh=1');
+    assert.equal(L('/api/shodan?bbox=1,2,3,4&q=port:22'), '/api/shodan?bbox=1,2,3,4&q=<redacted>');
+    assert.equal(L('/api/x?%zz=1&q'), '/api/x?%zz=1&q=<redacted>');
+  });
+
+  test('a geocode search reaches the log redacted', async () => {
+    const lines = [];
+    const quiet = process.env.OPENPANOPTICON_QUIET;
+    const realLog = console.log;
+    process.env.OPENPANOPTICON_QUIET = '0';
+    console.log = (...a) => lines.push(a.join(' '));
+    try {
+      await s.api('/api/geocode', { q: '123 Secret Street' });
+    } finally {
+      console.log = realLog;
+      process.env.OPENPANOPTICON_QUIET = quiet;
+    }
+    assert.ok(lines.some((l) => l.includes('/api/geocode?q=<redacted>')), lines.join('\n'));
+    assert.ok(!lines.some((l) => /secret/i.test(l)), lines.join('\n'));
+  });
+});
+
+describe('lookup tables answer only for their own keys', () => {
+  let s;
+  before(async () => { s = await startServer({ env: TEST_KEYS }); });
+  after(() => s.close());
+  const bbox = '34.95,-100.05,35.05,-99.95';
+
+  test('a Shodan preset of "constructor" is the default preset, not "undefined"', async () => {
+    const r = await s.api('/api/shodan', { bbox, preset: 'constructor' });
+    assert.equal(r.status, 200);
+    assert.match(r.json().query, /^geo:"/);
+  });
+
+  for (const [p, q] of [
+    ['/api/overpass', { bbox, presets: 'constructor' }],
+    ['/api/overpass', { bbox, presets: '__proto__' }],
+    ['/api/events', { bbox, sources: 'toString' }],
+    ['/api/netinfra', { bbox, sources: 'constructor' }],
+  ]) {
+    test(`${p} refuses ${JSON.stringify(q.presets || q.sources)} as unknown (400, not 500)`, async () => {
+      assert.equal((await s.api(p, q)).status, 400);
+    });
+  }
+
+  test('a satellite group of "constructor" falls back to the default group', async () => {
+    const r = await s.api('/api/satellites', { group: 'constructor' });
+    assert.equal(r.status, 200);
+    assert.equal(r.json().group, 'stations');
+  });
+
+  test('a minSeverity of "constructor" filters nothing out', async () => {
+    const all = (await s.api('/api/events', { bbox })).json().count;
+    const r = await s.api('/api/events', { bbox, minSeverity: 'constructor' });
+    assert.equal(r.status, 200);
+    assert.equal(r.json().count, all);
+  });
+
+  test('tables built from upstream values have no prototype', () => {
+    for (const t of ['SHODAN_PRESETS', 'OVERPASS_PRESETS', 'SAT_GROUPS', 'FIVE_ELEVEN_HOSTS',
+      'COUNTRY_CENTROIDS', 'MIME']) {
+      assert.equal(Object.getPrototypeOf(s.mod[t]), null, t);
+    }
+  });
+});

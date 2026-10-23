@@ -23,13 +23,13 @@ or switch itself off cleanly when its key is missing.
 3. **Fetch and cache.** Write `async function foo({ bbox })`:
    - `parseBbox()` the input and return a 400 `UpstreamError` if it is bad.
    - Fetch with `grab(url, opts, { label: 'Foo', timeoutMs })`. It sets the
-     User-Agent, applies timeouts and turns failures into `UpstreamError`s.
+     User-Agent, applies timeouts, and turns failures into `UpstreamError`s.
    - Wrap it in ``cachedPersistent(`foo:${q.key}`, TTL.x, ...)``. Use
      `TTL.static` for where fixed things are, and `TTL.hazard` for anything
      present-tense (alerts, readings, outages). Cache only JSON-safe values
      (no `Map`/`Set`).
    - If the payload is unexpected, throw a 502 `UpstreamError`.
-4. **Normalise** to an array of records, each with a stable `id`, `lat` and
+4. **Normalise** to an array of records, each with a stable `id`, `lat`, and
    `lon` plus whatever the detail panel needs. Run every upstream URL you
    pass on through `safeUrl()` (`{ httpsOnly: true }` if it ends up in an
    iframe).
@@ -72,5 +72,5 @@ or switch itself off cleanly when its key is missing.
 - If the static demo should show it, add a `'/api/foo'` entry to
   `demo/site/demo.js` (see `demo/README.md`).
 
-> Layers that map people, devices or surveillance hardware get extra review.
+> Layers that map people, devices, or surveillance hardware get extra review.
 > Explain the legitimate use in the PR.

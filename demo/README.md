@@ -20,7 +20,7 @@ resumes if interrupted; delete `docs/data` for a fresh snapshot.
   running app spends credits and makes Overpass rate-limit the capture.
 - **Maps only:** `npm run demo:capture:maps` (or `run-demo maps`) fetches just
   the base maps and labels and leaves the layer data and its capture time
-  alone. No Overpass, Shodan or other API queries. Use it to add or refresh
+  alone. No Overpass, Shodan, or other API queries. Use it to add or refresh
   map tiles without re-capturing everything.
 
 ## Try it locally
@@ -103,15 +103,15 @@ returned. Read the main README's *Terms of service* before publishing. Also:
 - three base maps, picked in the BASEMAP menu: the dark vector map (the
   default), the standard OpenStreetMap street map, and EOX's Sentinel-2
   cloudless satellite mosaic
-- labels, radar, clouds and NASA imagery tiles
+- labels, radar, clouds, and NASA imagery tiles
 - OpenStreetMap buildings for Manhattan and the waterfront
 - place names, for the search box
 
 **Layers at start:** Shodan, aircraft, OSM infrastructure (every class), ALPR,
-webcams, hazards and network infrastructure. Visitors can switch layers off
+webcams, hazards, and network infrastructure. Visitors can switch layers off
 and on, except Orbital assets, which is not part of the demo.
 
-**Switched off:** FLUSH, SYNC, other imagery dates and other base maps. The
+**Switched off:** FLUSH, SYNC, other imagery dates, and other base maps. The
 Saved targets section and the "Reset saved settings" button are hidden, and
 settings are not kept between visits.
 

@@ -103,8 +103,31 @@ function loadDotEnv(file) {
 // TTL cache + in-flight de-duplication
 // ---------------------------------------------------------------------------
 
-const cache = new Map();     // key -> { expires, value }
+const cache = new Map();     // key -> { expires, value }, insertion order = LRU
 const inflight = new Map();  // key -> Promise
+
+// Most keys name a place (a snapped view cell) or something typed, so a long
+// session keeps minting keys that are never asked for again. Expired entries
+// are swept on a timer (see start()), and this caps what is live at once.
+// Evicting a persistent entry costs a disk read, not an upstream call.
+const CACHE_MAX_ENTRIES = 1000;
+
+/** Drop every expired entry. Returns how many went. */
+function sweepCache(now = Date.now()) {
+  let removed = 0;
+  for (const [k, e] of cache) {
+    if (!(e.expires > now)) { cache.delete(k); removed++; }
+  }
+  return removed;
+}
+
+function remember(key, entry) {
+  cache.delete(key);
+  cache.set(key, entry);
+  if (cache.size <= CACHE_MAX_ENTRIES) return;
+  sweepCache();
+  while (cache.size > CACHE_MAX_ENTRIES) cache.delete(cache.keys().next().value);
+}
 
 async function cached(key, ttlMs, producer) {
   // A manual refresh means the operator has decided the stored answer is not
@@ -113,14 +136,18 @@ async function cached(key, ttlMs, producer) {
   const fresh = wantsFresh();
   if (!fresh) {
     const hit = cache.get(key);
-    if (hit && hit.expires > Date.now()) return hit.value;
+    if (hit && hit.expires > Date.now()) {
+      remember(key, hit);   // most recently used goes to the back
+      return hit.value;
+    }
+    if (hit) cache.delete(key);
     if (inflight.has(key)) return inflight.get(key);
   }
 
   const p = (async () => {
     try {
       const value = await producer();
-      cache.set(key, { expires: Date.now() + ttlMs, value });
+      remember(key, { expires: Date.now() + ttlMs, value });
       return value;
     } finally {
       inflight.delete(key);
@@ -649,6 +676,7 @@ const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
  * not geometry, and the UI says so.
  */
 const COUNTRY_CENTROIDS = {
+  __proto__: null,
   AD: [42.5, 1.5], AE: [24.0, 54.0], AF: [33.0, 65.0], AL: [41.0, 20.0], AM: [40.0, 45.0],
   AO: [-12.5, 18.5], AR: [-34.0, -64.0], AT: [47.3, 13.3], AU: [-25.0, 133.0], AZ: [40.5, 47.5],
   BA: [44.0, 18.0], BD: [24.0, 90.0], BE: [50.8, 4.0], BF: [13.0, -2.0], BG: [43.0, 25.0],
@@ -701,7 +729,13 @@ function bboxRadiusKm(b) {
 // SHODAN
 // ---------------------------------------------------------------------------
 
+// Lookup tables keyed by request parameters or upstream values are built with
+// `__proto__: null`, so only their own keys answer. On an ordinary object a key
+// such as "constructor" or "toString" finds an inherited value instead: a
+// preset of "constructor" would send Shodan the query "undefined geo:…" and
+// spend a credit on it.
 const SHODAN_PRESETS = {
+  __proto__: null,
   all: {
     label: 'Everything in view',
     query: '',
@@ -851,6 +885,7 @@ async function shodanSearch({ bbox, preset, custom, minGeo = true }) {
  * known-vulnerable. Port first, then product name.
  */
 const PORT_CATEGORY = {
+  __proto__: null,
   21: 'file', 22: 'remote', 23: 'remote', 25: 'mail', 53: 'infra',
   80: 'web', 110: 'mail', 143: 'mail', 443: 'web', 445: 'file',
   465: 'mail', 587: 'mail', 993: 'mail', 995: 'mail',
@@ -1026,7 +1061,7 @@ async function openSkyAuthHeader() {
 }
 
 // Squawk codes worth flagging on the HUD.
-const SQUAWK_ALERTS = { '7500': 'HIJACK', '7600': 'RADIO FAIL', '7700': 'EMERGENCY' };
+const SQUAWK_ALERTS = { __proto__: null, '7500': 'HIJACK', '7600': 'RADIO FAIL', '7700': 'EMERGENCY' };
 
 /**
  * OpenSky's credit budget, as the API reports it.
@@ -1219,6 +1254,7 @@ async function flights({ bbox }) {
 // ---------------------------------------------------------------------------
 
 const SAT_GROUPS = {
+  __proto__: null,
   'stations': 'Space stations',
   'visual': 'Brightest / naked-eye',
   'last-30-days': 'Recent launches',
@@ -1524,6 +1560,7 @@ function mirrorFailure(endpoint, e) {
 // returned tags. The clauses are unioned into a single query; the predicate
 // is what assigns each returned element back to the class it came from.
 const OVERPASS_PRESETS = {
+  __proto__: null,
   surveillance: {
     label: 'Surveillance cameras',
     color: '#ff4d6d',
@@ -1911,6 +1948,7 @@ const ALPR_VENDORS = [
 ];
 
 const COMPASS = {
+  __proto__: null,
   N: 0, NNE: 22.5, NE: 45, ENE: 67.5, E: 90, ESE: 112.5, SE: 135, SSE: 157.5,
   S: 180, SSW: 202.5, SW: 225, WSW: 247.5, W: 270, WNW: 292.5, NW: 315, NNW: 337.5,
 };
@@ -2087,7 +2125,7 @@ async function atlasProbes(raw_b) {
 }
 
 /* --- OpenCelliD ------------------------------------------------------ */
-const RADIO_LABEL = { GSM: '2G GSM', UMTS: '3G UMTS', LTE: '4G LTE', NR: '5G NR', CDMA: 'CDMA' };
+const RADIO_LABEL = { __proto__: null, GSM: '2G GSM', UMTS: '3G UMTS', LTE: '4G LTE', NR: '5G NR', CDMA: 'CDMA' };
 
 async function cellTowers(raw_b) {
   if (!CFG.openCellIdKey) return [];
@@ -2221,6 +2259,7 @@ async function torRelays(b) {
 }
 
 const NETINFRA_FETCHERS = {
+  __proto__: null,
   atlas: atlasProbes, cell: cellTowers, wigle: wigleNetworks, tor: torRelays,
 };
 
@@ -2576,6 +2615,7 @@ async function signals({ bbox }) {
 // ---------------------------------------------------------------------------
 
 const FIVE_ELEVEN_HOSTS = {
+  __proto__: null,
   GA: 'https://511ga.org', LA: 'https://www.511la.org', AZ: 'https://www.az511.com',
   NY: 'https://511ny.org', FL: 'https://fl511.com', IA: 'https://511ia.org',
   NE: 'https://511.nebraska.gov', KY: 'https://goky.ky.gov', MA: 'https://mass511.com',
@@ -3165,7 +3205,7 @@ async function webcams({ bbox }) {
 // source below will fetch and normalise it alongside the rest.
 // ---------------------------------------------------------------------------
 
-const SEVERITY_RANK = { red: 3, orange: 2, green: 1, info: 0 };
+const SEVERITY_RANK = { __proto__: null, red: 3, orange: 2, green: 1, info: 0 };
 
 const EVENT_SOURCES = {
   gdacs: { label: 'GDACS alerts', color: '#ff2d55', note: 'Global Disaster Alert & Coordination System — EU JRC / UN.' },
@@ -3178,6 +3218,7 @@ const EVENT_SOURCES = {
 
 /** GDACS event-type codes → readable names. */
 const GDACS_TYPES = {
+  __proto__: null,
   EQ: 'Earthquake', TC: 'Tropical cyclone', FL: 'Flood',
   VO: 'Volcano', DR: 'Drought', WF: 'Wildfire', TS: 'Tsunami',
 };
@@ -3308,7 +3349,7 @@ async function usgsEvents(b) {
 }
 
 /* --- NWS ------------------------------------------------------------- */
-const NWS_SEVERITY = { Extreme: 'red', Severe: 'red', Moderate: 'orange', Minor: 'green', Unknown: 'info' };
+const NWS_SEVERITY = { __proto__: null, Extreme: 'red', Severe: 'red', Moderate: 'orange', Minor: 'green', Unknown: 'info' };
 
 async function nwsEvents(b) {
   const url = new URL('https://api.weather.gov/alerts/active');
@@ -3463,6 +3504,7 @@ async function edisEvents(b) {
 
 /* --- unified endpoint ------------------------------------------------ */
 const EVENT_FETCHERS = {
+  __proto__: null,
   gdacs: gdacsEvents, eonet: eonetEvents, usgs: usgsEvents,
   nws: nwsEvents, firms: firmsEvents, edis: edisEvents,
 };
@@ -3652,6 +3694,9 @@ const SECURITY_HEADERS = {
   // which OSM's tile policy requires.
   'Referrer-Policy': 'strict-origin-when-cross-origin',
   'X-Frame-Options': 'DENY',
+  // Pages on other sites cannot embed anything this server answers, so they
+  // cannot use an image load to learn that OpenPanopticon is running here.
+  'Cross-Origin-Resource-Policy': 'same-origin',
 };
 
 // Enforced. What each directive allows, and why:
@@ -3715,6 +3760,7 @@ function safeUrl(u, { httpsOnly = false } = {}) {
 // ---------------------------------------------------------------------------
 
 const MIME = {
+  __proto__: null,
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
@@ -4194,9 +4240,30 @@ const CARTO_TILE_RE = /^\/tiles\/carto\/(dark_only_labels|light_only_labels)\/(\
 const CARTO_CACHE_MAX = 3000;
 const cartoCache = new Map();   // path -> Buffer, insertion order = LRU
 
+/**
+ * Whether a request came from this app's own page, or from no page at all.
+ *
+ * The tile proxy spends the CARTO key, and an <img> on any other site can point
+ * at it. An image request cannot carry the X-Panopticon header, so the check
+ * that guards /api/* cannot guard tiles. Browsers label every request with
+ * Sec-Fetch-Site instead: "same-origin" is this app, "none" is a URL typed into
+ * the address bar, and a missing header is a client that is not a browser
+ * (curl, the test suite), which no web page can make requests through.
+ * "same-site" and "cross-site" mean another page asked.
+ */
+function fromOwnPage(req) {
+  const site = req.headers['sec-fetch-site'];
+  return site === undefined || site === 'same-origin' || site === 'none';
+}
+
 async function serveCartoTile(req, res, m) {
+  if (!fromOwnPage(req)) {
+    res.writeHead(403, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain' })
+      .end('Tiles are served to this app\'s own page only');
+    return;
+  }
   if (!CFG.cartoKey) {
-    res.writeHead(503, { 'Content-Type': 'text/plain' })
+    res.writeHead(503, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain' })
       .end('CARTO_API_KEY is not set — see .env.example');
     return;
   }
@@ -4250,6 +4317,24 @@ async function serveStatic(req, res, pathname) {
   }
 }
 
+// Query parameters whose values the operator typed. The request log keeps
+// their names and drops their values: stdout is often redirected to a file
+// (chromebook.sh keeps one), and a file of typed searches is a search history.
+const TYPED_PARAMS = new Set(['q']);
+
+/** The request path and query as the log may show them. */
+function loggable(url) {
+  if (!url.search) return url.pathname;
+  const pairs = url.search.slice(1).split('&').map((pair) => {
+    const i = pair.indexOf('=');
+    const raw = i < 0 ? pair : pair.slice(0, i);
+    let name;
+    try { name = decodeURIComponent(raw.replace(/\+/g, ' ')); } catch { name = raw; }
+    return TYPED_PARAMS.has(name) ? `${raw}=<redacted>` : pair;
+  });
+  return `${url.pathname}?${pairs.join('&')}`;
+}
+
 const server = http.createServer(async (req, res) => {
   const started = Date.now();
   if (!gate(req, res)) return;
@@ -4264,7 +4349,7 @@ const server = http.createServer(async (req, res) => {
   let slowTimer = null;
   if (pathname.startsWith('/api/')) {
     slowTimer = setTimeout(() => {
-      if (!settled) log('req', `${pathname}${url.search} still running after 5s…`);
+      if (!settled) log('req', `${loggable(url)} still running after 5s…`);
     }, 5000);
     res.on('close', () => {
       if (settled) return;
@@ -4290,7 +4375,7 @@ const server = http.createServer(async (req, res) => {
       const payload = await reqCtx.run({ fresh }, () => handler(url.searchParams));
       done();
       sendJson(res, 200, payload);
-      log('req', `${pathname}${url.search} -> 200 (${Date.now() - started}ms)`);
+      log('req', `${loggable(url)} -> 200 (${Date.now() - started}ms)`);
       return;
     }
 
@@ -4341,6 +4426,8 @@ const prune = () => pruneDiskCache().then(({ removed, rewritten }) => {
 }).catch(() => {});
 prune();
 setInterval(prune, 6 * 60 * 60_000).unref();
+// The shortest TTL is minutes, so the memory tier is swept far more often.
+setInterval(sweepCache, 10 * 60_000).unref();
 
 server.listen(CFG.port, CFG.host, () => {
   const ok = (b) => (b ? `${C.grn}ready${C.rst}` : `${C.yel}not configured${C.rst}`);
@@ -4406,7 +4493,7 @@ if (require.main === module) start();
 // For the test suite. Nothing in the app imports these.
 module.exports = {
   server, start, CFG, TTL, ROUTES, PROVIDERS_DIR, DISK_CACHE_DIR, TLE_DIR,
-  cache, inflight, cached, cachedPersistent, readDiskCache, writeDiskCache, clearDiskCache,
+  cache, inflight, cached, sweepCache, CACHE_MAX_ENTRIES, cachedPersistent, readDiskCache, writeDiskCache, clearDiskCache,
   pruneDiskCache, diskName, diskKeyHash, DISK_MAX_AGE,
   reqCtx, wantsFresh, isCached,
   parse511, loadDotEnv, clip, htmlText, refusalReason, UpstreamError, grab, USER_AGENT,
@@ -4419,6 +4506,6 @@ module.exports = {
   parseDirections, vendorOf, ALPR_VENDORS, airQualityBand, parseCsv,
   feodoSet, greyNoiseLookup, enrich, normaliseOwcdb, cloudSource, gibsTemplate, gibsDefaultDate,
   GIBS_LAYERS, COUNTRY_CENTROIDS, FIVE_ELEVEN_HOSTS, basemapProviders, sentinelTileTemplate,
-  safeUrl, sameSecret, cookieValue, gate, apiAllowed, ALLOWED_HOSTS, ACCESS_KEY,
+  safeUrl, sameSecret, cookieValue, gate, apiAllowed, ALLOWED_HOSTS, ACCESS_KEY, fromOwnPage, loggable,
   SECURITY_HEADERS, CSP, MIME, cartoCache, log,
 };
