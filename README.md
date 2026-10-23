@@ -9,6 +9,7 @@
 [![Runtime dependencies: 0](https://img.shields.io/badge/runtime%20deps-0-brightgreen)](package.json)
 [![Built on CesiumJS](https://img.shields.io/badge/globe-CesiumJS-6CADDF)](https://cesium.com/platform/cesiumjs/)
 [![Demo video](https://img.shields.io/badge/demo-YouTube-FF0000?logo=youtube&logoColor=white)](https://www.youtube.com/watch?v=AVqyvgPxVO8)
+[![Test Status](https://github.com/hexadec-0/OpenPanopticon/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/hexadec-0/OpenPanopticon/actions/workflows/test.yml)
 
 [Run it](#run-it) · [Live demo](https://hexadec-0.github.io/OpenPanopticon/) · [Screenshots](#screenshots-and-demo-video) · [Layers](#whats-on-the-globe) · [Caching](#caching) · [Architecture](#how-its-put-together) · [Responsible use](#using-this-responsibly)
 
