@@ -51,8 +51,15 @@ e2e('boot', () => {
       assert.equal(await hasClass(page, row(id), 'on'), true, id);
       assert.notEqual(await text$(page, `${row(id)} .layer-count`), '—', id);
     }
-    assert.equal(await text$(page, `${row('flights')} .layer-count`), '3');
-    assert.equal(await text$(page, `${row('satellites')} .layer-count`), '2');
+    // Flights repolls every few seconds and refetches when the boot fly-in
+    // settles, so by the time the slower layers are ready its count may be
+    // showing a fetch in progress (···). Wait for it to settle on the number.
+    for (const [id, want] of [['flights', '3'], ['satellites', '2']]) {
+      const sel = `${row(id)} .layer-count`;
+      await page.waitForFunction((s, w) => document.querySelector(s)?.textContent === w,
+        { timeout: 15_000, polling: 100 }, sel, want).catch(() => {});
+      assert.equal(await text$(page, sel), want, id);
+    }
     for (const id of ['shodan', 'overpass', 'alpr', 'webcams', 'netinfra', 'iot', 'traffic', 'vessels']) {
       assert.equal(await hasClass(page, row(id), 'on'), false, id);
     }
