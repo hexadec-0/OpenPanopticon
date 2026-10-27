@@ -1,0 +1,7 @@
+# Only package.json, server.js, public/ and docker/ go into the image.
+# Everything else stays out: secrets, the runtime cache, the 200MB static demo.
+*
+!package.json
+!server.js
+!public/
+!docker/

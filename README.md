@@ -77,6 +77,34 @@ no dependencies to install to run it.
    The scripts check your Node version and open the browser once the server
    answers. Otherwise, open <http://127.0.0.1:8420>.
 
+**Docker / Portainer.** A container image takes every `.env` setting as an
+environment variable, so you can manage it from Portainer's Env tab or a stack:
+
+```bash
+docker run -d -p 8420:8420 -v openpanopticon-data:/data \
+  -e ACCESS_KEY=your-long-random-string -e ALLOWED_HOSTS=192.168.1.50:8420 \
+  -e SHODAN_API_KEY=... YOUR_DOCKERHUB_USER/openpanopticon
+```
+
+See [DOCKER.md](DOCKER.md) for the Portainer stack, every variable, and how
+the image is published.
+
+> [!WARNING]
+> **A container lets several people use one server, but each browser is its
+> own user.** Anyone with the address and the access key can open it at the same
+> time, and nothing on the globe is shared between them. Each browser keeps its
+> own layers, filters, optical mode, label style, pinned home, and the
+> features it has already fetched (see [Settings persistence](#settings-persistence)
+> and [In the browser](#in-the-browser)). Two people looking at the "same" map
+> are really two separate sessions: one person's changes never show up on the
+> other's screen. To share a view, send the coordinates or a screenshot. A link
+> to the server won't carry it over.
+>
+> These things **are** shared: the API keys and their credit budgets (Shodan,
+> OpenSky and the rest are spent by everyone together), the server's response
+> cache, and **FLUSH**, which empties that cache for everyone. With no home
+> pinned, every user also starts over the *server's* location, not their own.
+
 The globe opens over wherever the machine running it appears to be, resolved
 by geoIP (or your pinned home; see [Home](#home)); the `⌂ Home` button returns
 there, and the HUD bottom bar shows the resolved city.

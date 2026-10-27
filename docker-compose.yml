@@ -1,0 +1,59 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# OpenPanopticon as a Docker Compose / Portainer stack.
+#
+# Portainer: Stacks > Add stack > Web editor, paste this file, then add the
+# settings you want under "Environment variables" (or "Load variables from
+# .env file"). Anything left unset stays off, exactly as with .env.
+#
+# The two you must set to reach it from another machine:
+#   ACCESS_KEY     a long random string; open http://<host>:8420/?key=<it> once
+#   ALLOWED_HOSTS  the address you type in the browser, with port,
+#                  e.g. 192.168.1.50:8420,panopticon.lan:8420
+# See DOCKER.md for the full list.
+
+services:
+  openpanopticon:
+    image: ${IMAGE:-YOUR_DOCKERHUB_USER/openpanopticon:latest}
+    container_name: openpanopticon
+    restart: unless-stopped
+    ports:
+      - "${PUBLISH_PORT:-8420}:8420"
+    volumes:
+      - openpanopticon-data:/data
+    environment:
+      # --- access -----------------------------------------------------------
+      ACCESS_KEY: ${ACCESS_KEY:-}
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS:-}
+      # --- data sources (all optional except Shodan for its own layer) -----
+      SHODAN_API_KEY: ${SHODAN_API_KEY:-}
+      WINDY_API_KEY: ${WINDY_API_KEY:-}
+      OPENWEBCAMDB_API_KEY: ${OPENWEBCAMDB_API_KEY:-}
+      FIRMS_MAP_KEY: ${FIRMS_MAP_KEY:-}
+      EDIS_API_URL: ${EDIS_API_URL:-}
+      EDIS_API_KEY: ${EDIS_API_KEY:-}
+      CARTO_API_KEY: ${CARTO_API_KEY:-}
+      CESIUM_ION_TOKEN: ${CESIUM_ION_TOKEN:-}
+      OPENSKY_CLIENT_ID: ${OPENSKY_CLIENT_ID:-}
+      OPENSKY_CLIENT_SECRET: ${OPENSKY_CLIENT_SECRET:-}
+      AISSTREAM_API_KEY: ${AISSTREAM_API_KEY:-}
+      OPENCELLID_API_KEY: ${OPENCELLID_API_KEY:-}
+      WIGLE_API_NAME: ${WIGLE_API_NAME:-}
+      WIGLE_API_TOKEN: ${WIGLE_API_TOKEN:-}
+      GREYNOISE_API_KEY: ${GREYNOISE_API_KEY:-}
+      EIA_API_KEY: ${EIA_API_KEY:-}
+      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
+      FIVE_ELEVEN_KEYS: ${FIVE_ELEVEN_KEYS:-}
+      # --- base map (empty = built-in default) --------------------------------
+      TITILER_URL: ${TITILER_URL:-}
+      SHORTBREAD_URL: ${SHORTBREAD_URL:-}
+      GEE_PROJECT: ${GEE_PROJECT:-}
+      GEE_CLIENT_EMAIL: ${GEE_CLIENT_EMAIL:-}
+      GEE_PRIVATE_KEY: ${GEE_PRIVATE_KEY:-}
+      # --- budgets (empty = 0.25 / 10 / 60) ------------------------------------
+      SHODAN_CELL_DEG: ${SHODAN_CELL_DEG:-}
+      SHODAN_CREDIT_FLOOR: ${SHODAN_CREDIT_FLOOR:-}
+      OPENSKY_CREDIT_FLOOR: ${OPENSKY_CREDIT_FLOOR:-}
+
+volumes:
+  openpanopticon-data:
