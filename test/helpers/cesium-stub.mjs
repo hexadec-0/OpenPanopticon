@@ -19,6 +19,10 @@ class Cartesian3 {
     return c;
   }
 
+  static fromRadians(lon, lat, h = 0) {
+    return Cartesian3.fromDegrees((lon * 180) / Math.PI, (lat * 180) / Math.PI, h);
+  }
+
   static fromDegreesArray(flat) {
     const out = [];
     for (let i = 0; i < flat.length; i += 2) out.push(Cartesian3.fromDegrees(flat[i], flat[i + 1]));
@@ -83,6 +87,8 @@ class EntityCollection {
   }
 
   getById(id) { return this._map.get(id); }
+
+  contains(e) { return this._map.get(e?.id) === e; }
 
   remove(e) { return this._map.delete(e?.id ?? e); }
 
@@ -159,6 +165,7 @@ export function makeCesium() {
     Cartesian3,
     Cartesian2: class Cartesian2 { constructor(x, y) { this.x = x; this.y = y; } },
     Cartographic: {
+      fromRadians: (longitude, latitude, height = 0) => ({ longitude, latitude, height }),
       fromCartesian: (c) => (c ? { latitude: CesiumMath.toRadians(c.lat ?? 0), longitude: CesiumMath.toRadians(c.lon ?? 0), height: c.h ?? 0 } : undefined),
     },
     Color,
@@ -186,6 +193,7 @@ export function makeCesium() {
     HeightReference: { NONE: 0, CLAMP_TO_GROUND: 1, RELATIVE_TO_GROUND: 2 },
     LabelStyle: { FILL: 0, OUTLINE: 1, FILL_AND_OUTLINE: 2 },
     HorizontalOrigin: { CENTER: 0, LEFT: 1, RIGHT: -1 },
+    VerticalOrigin: { CENTER: 0, BOTTOM: 1, BASELINE: 2, TOP: -1 },
     ArcType: { NONE: 0, GEODESIC: 1, RHUMB: 2 },
     ClassificationType: { TERRAIN: 0, CESIUM_3D_TILE: 1, BOTH: 2 },
     SceneMode: { MORPHING: 0, COLUMBUS_VIEW: 1, SCENE2D: 2, SCENE3D: 3 },

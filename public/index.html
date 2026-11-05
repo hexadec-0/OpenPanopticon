@@ -60,6 +60,11 @@
           </label>
           <button id="bm-clearest" class="hm-btn" type="button" title="Jump to the least cloudy scene in this window">Clearest</button>
         </div>
+        <div class="hm-row" id="bm-uniform-row">
+          <label title="Draw the whole screen from one imagery survey at a time instead of a patchwork: low detail above 20 km camera height, high detail below, switching all at once">
+            <input id="bm-uniform" type="checkbox" checked> One survey at a time (high detail below 20 km)
+          </label>
+        </div>
         <p class="hm-note" id="bm-note"></p>
       </div>
     </div>
@@ -73,6 +78,23 @@
         </select>
         <label>Contrast <input id="lb-contrast" type="range" min="100" max="400" value="220"></label>
         <label class="lb-boost"><input id="lb-boost" type="checkbox" checked> Bold</label>
+      </div>
+    </div>
+    <div class="hover-wrap" id="night-wrap">
+      <button id="wx-night" class="tgl" title="Shade the night side of the globe, following sunrise and sunset"><span>NIGHT</span></button>
+      <!-- darkness control, revealed on hover or keyboard focus -->
+      <div id="nightbar" class="hover-menu available">
+        <div class="hm-row">
+          <label>Darkness <input id="nt-dark" type="range" min="0" max="100" step="5" value="70" aria-label="night darkness">
+            <b id="nt-dark-val">70%</b>
+          </label>
+        </div>
+        <div class="hm-row">
+          <label title="Glow from built-up areas, whole cities from high up, and lit windows on 3D buildings">City lights <input id="nt-lights" type="range" min="0" max="100" step="5" value="70" aria-label="city lights">
+            <b id="nt-lights-val">70%</b>
+          </label>
+        </div>
+        <p class="hm-note" id="nt-note"></p>
       </div>
     </div>
     <div class="hover-wrap" id="cycle-wrap">

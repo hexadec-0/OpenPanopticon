@@ -51,11 +51,17 @@ describe('/api/health', () => {
 });
 
 describe('/api/config', () => {
-  test('only what the browser needs: the Ion token and whether labels can be drawn', async () => {
-    assert.deepEqual((await s.api('/api/config')).json(), { cesiumIonToken: null, cartoLabels: true });
+  test('only what the browser needs: the Ion token, whether labels can be drawn, which tile hosts are cached', async () => {
+    const strip = (c) => {
+      const { tileCache, retention, ...rest } = c;
+      assert.ok(Array.isArray(tileCache.hosts));
+      assert.equal(retention.shodan, 3 * 86400_000);
+      return rest;
+    };
+    assert.deepEqual(strip((await s.api('/api/config')).json()), { cesiumIonToken: null, cartoLabels: true });
     const t = await startServer();
     try {
-      assert.deepEqual((await t.api('/api/config')).json(), { cesiumIonToken: null, cartoLabels: false });
+      assert.deepEqual(strip((await t.api('/api/config')).json()), { cesiumIonToken: null, cartoLabels: false });
     } finally { await t.close(); }
   });
 });
@@ -318,8 +324,17 @@ describe('/tiles/carto (label tiles proxy)', () => {
   });
 
   test('keeps an in-memory LRU, so repeat tiles cost nothing', async () => {
-    await s.request('/tiles/carto/dark_only_labels/5/7/12.png');
-    await s.request('/tiles/carto/dark_only_labels/5/7/12.png');
+    // A tile no earlier test asked for: those are on disk already.
+    await s.request('/tiles/carto/dark_only_labels/6/17/25.png');
+    await s.request('/tiles/carto/dark_only_labels/6/17/25.png');
+    assert.equal(s.mock.callsTo('basemaps.cartocdn.com').length, 1);
+  });
+
+  test('keeps label tiles on disk, so they outlast the memory copy', async () => {
+    await s.request('/tiles/carto/dark_only_labels/6/18/25.png');
+    s.mod.cartoCache.clear();
+    const r = await s.request('/tiles/carto/dark_only_labels/6/18/25.png');
+    assert.equal(r.status, 200);
     assert.equal(s.mock.callsTo('basemaps.cartocdn.com').length, 1);
   });
 
@@ -377,6 +392,10 @@ describe('persistence across a restart', () => {
       for (const f of fs.readdirSync(s.mod.DISK_CACHE_DIR)) fs.copyFileSync(`${s.mod.DISK_CACHE_DIR}/${f}`, `${t.mod.DISK_CACHE_DIR}/${f}`);
       const d = (await t.api('/api/overpass', { bbox: BBOX, presets: 'power' })).json();
       assert.equal(d.count, 1);
+      assert.equal(t.mock.callsTo('overpass').length, 0);
+      // A different view over the same ground: still nothing to fetch.
+      const z = (await t.api('/api/overpass', { bbox: '34.9,-100.1,34.99,-99.9', presets: 'power' })).json();
+      assert.equal(z.count, 1);
       assert.equal(t.mock.callsTo('overpass').length, 0);
     } finally { await t.close(); }
   });

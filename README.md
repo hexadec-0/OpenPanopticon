@@ -263,11 +263,36 @@ than queried for a view box, and altitude is where you look at them from.
 
 ## Caching
 
-Retention periods are set in one table near the top of `server.js`. Cached
-responses are kept in memory and on disk (`providers/cache/`), so they survive
-a restart. Geocoding results are the exception and stay in memory only (see
+Retention is set in **`cache.conf`** in the project folder, written with the
+defaults (and a line explaining each one) the first time the server starts.
+It has one setting per kind of data, grouped as `[maps]`, `[shodan]`,
+`[overpass]`, `[network]`, `[cameras]`, `[satellites]`, `[aircraft]`,
+`[places]`, `[current]` and `[memory]`:
+
+```ini
+[maps]
+tiles = 30d            # map tiles on disk
+tiles_max_size = 4096MB
+
+[shodan]
+hosts = 3d             # every miss spends a query credit
+
+[overpass]
+infrastructure = 3d
+alpr = 3d
+```
+
+Durations take a unit (`90s`, `30m`, `6h`, `3d`, `2w`; `0` keeps nothing),
+sizes `MB` or `GB`. Save the file and the server picks the change up within a
+few seconds; reload the page so the browser follows. A line it cannot use
+keeps its default and is named in the console. `OPENPANOPTICON_CACHE_CONF`
+points it at another file.
+
+Cached responses are kept in memory and on disk (`providers/cache/`), so they
+survive a restart; map tiles have their own store (`providers/tiles/`).
+Geocoding results are the exception and stay in memory only (see
 [Privacy](#privacy)). Files on disk are pruned once they are older than the
-longest retention period (72 hours), at startup and every six hours.
+longest retention in force, at startup and every six hours.
 
 Every view-scoped source goes through `viewCell()`, which snaps the requested
 box outward onto a fixed grid and hands back both the box to query and the key

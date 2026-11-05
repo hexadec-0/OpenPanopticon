@@ -17,6 +17,7 @@
  * unauthenticated, CORS-open, to zoom 14.
  */
 
+import { viaCache } from './tilecache.js';
 import { decodeMvt } from './mvt.js';
 
 /** Only these are drawn. The rest of a city tile is labels, POIs and
@@ -114,7 +115,7 @@ export class ShortbreadImageryProvider {
 
     let buf;
     try {
-      const res = await fetch(url, { mode: 'cors' });
+      const res = await fetch(viaCache(url), { mode: 'cors' });
       // 204/404 is how a tile server says "nothing here", which is ordinary
       // over ocean. Draw the empty tile rather than leaving a hole.
       if (res.status === 204 || res.status === 404) return this._blank();

@@ -18,10 +18,35 @@ beforeEach(async () => {
   s.mock.reset();
   s.mod.cache.clear();
   await s.mod.clearDiskCache();
-  Object.assign(s.mod.overpassGate, { chain: Promise.resolve(), lastStartedAt: 0, minGapMs: 0, cooldownUntil: 0, consecutive429: 0 });
+  Object.assign(s.mod.overpassGate, { chain: Promise.resolve(), lastStartedAt: 0, minGapMs: 0, cooldownUntil: 0, consecutive429: 0, mirrors: new Map(), coolFactor: 0 });
+  s.mod.overpassDense.clear();
 });
 
 const overpassQl = () => new URLSearchParams(s.mock.callsTo('overpass-api.de').at(-1).body).get('data');
+
+describe('/api/overpass request sizing', () => {
+  test('a wide view with every class is asked in small boxes, not one huge one', async () => {
+    // 0.5 x 0.5 degrees = 16 cells; ten classes allow 4 cells per query.
+    const all = Object.keys(s.mod.OVERPASS_PRESETS).join(',');
+    await s.api('/api/overpass', { bbox: '34.76,-100.24,35.24,-99.76', presets: all });
+    assert.equal(s.mock.callsTo('overpass').length, 4);
+    assert.match(overpassQl(), /^\[out:json\]\[timeout:30\]\[maxsize:\d+\];/);
+  });
+
+  test('cells that overflowed the cap are asked one at a time next time, with no doomed group query', async () => {
+    s.mod.overpassLimits.queryCap = 4;
+    try {
+      await s.api('/api/overpass', { bbox: BBOX, presets: 'surveillance,military,power,comms,aviation,emergency' });
+      s.mod.cache.clear();
+      await s.mod.clearDiskCache();
+      const before = s.mock.callsTo('overpass').length;
+      await s.api('/api/overpass', { bbox: BBOX, presets: 'surveillance,military,power,comms,aviation,emergency' });
+      assert.equal(s.mock.callsTo('overpass').length - before, 4, 'four single-cell queries only');
+    } finally {
+      s.mod.overpassLimits.queryCap = 4000;
+    }
+  });
+});
 
 describe('/api/overpass', () => {
   test('one unioned query for every selected class, partitioned on the way back', async () => {
@@ -45,7 +70,7 @@ describe('/api/overpass', () => {
   test('the query is over the snapped cell, in canonical order, so the cache key is stable', async () => {
     await s.api('/api/overpass', { bbox: BBOX, presets: 'power,surveillance' });
     const ql = overpassQl();
-    assert.match(ql, /^\[out:json\]\[timeout:40\];\(/);
+    assert.match(ql, /^\[out:json\]\[timeout:30\]\[maxsize:\d+\];\(/);
     assert.ok(ql.indexOf('surveillance') < ql.indexOf('power'), 'canonical order, not request order');
     assert.match(ql, /\(34\.875,-100\.125,35\.125,-99\.875\)/);
     // Same classes in another order: served from cache.
@@ -54,11 +79,73 @@ describe('/api/overpass', () => {
   });
 
   test('reports the covered cell and whether the cap truncated the answer', async () => {
-    const d = (await s.api('/api/overpass', { bbox: BBOX, presets: 'power', limit: '3' })).json();
+    const d = (await s.api('/api/overpass', { bbox: BBOX, presets: 'surveillance,military,power,comms,aviation,emergency', limit: '3' })).json();
     assert.equal(d.covered, '34.875,-100.125,35.125,-99.875');
     assert.equal(d.truncated, true);
     assert.equal(d.trimmed, false);
-    assert.match(overpassQl(), /out center 3;$/);
+    // The query asks for far more than the view draws, so the cache can
+    // hold the area complete; the answer is cut to the limit afterwards.
+    assert.match(overpassQl(), /out center 4000;$/);
+    assert.equal(d.count, 3);
+  });
+
+  test('cached per cell: a smaller view inside one already fetched needs no query', async () => {
+    await s.api('/api/overpass', { bbox: BBOX, presets: 'power' });
+    s.mod.cache.clear();   // as after a restart: only the disk copy is left
+    const d = (await s.api('/api/overpass', { bbox: '34.88,-100.12,34.99,-100.01', presets: 'power' })).json();
+    assert.equal(s.mock.callsTo('overpass').length, 1, 'served from the cells on disk');
+    assert.equal(d.covered, '34.875,-100.125,35,-100');
+  });
+
+  test('a pan only queries the cells it has not seen', async () => {
+    await s.api('/api/overpass', { bbox: BBOX, presets: 'power' });
+    await s.api('/api/overpass', { bbox: '34.95,-99.95,35.05,-99.85', presets: 'power' });
+    assert.equal(s.mock.callsTo('overpass').length, 2);
+    assert.match(overpassQl(), /\(34\.875,-99\.875,35\.125,-99\.75\)/, 'only the new column of cells');
+  });
+
+  test('adding a class only queries that class', async () => {
+    await s.api('/api/overpass', { bbox: BBOX, presets: 'power' });
+    const d = (await s.api('/api/overpass', { bbox: BBOX, presets: 'power,military' })).json();
+    assert.equal(s.mock.callsTo('overpass').length, 2);
+    const ql = overpassQl();
+    assert.ok(ql.includes('military') && !ql.includes('substation'), 'power is not asked for again');
+    assert.equal(d.byPreset.power, 1);
+  });
+
+  test('a small drawing limit still stores the area complete', async () => {
+    await s.api('/api/overpass', { bbox: BBOX, presets: 'power', limit: '3' });
+    s.mod.cache.clear();
+    await s.api('/api/overpass', { bbox: BBOX, presets: 'power', limit: '3' });
+    assert.equal(s.mock.callsTo('overpass').length, 1, 'served from disk the second time');
+  });
+
+  test('an answer over the query cap is split until each part is complete', async () => {
+    s.mod.overpassLimits.queryCap = 4;
+    try {
+      const d = (await s.api('/api/overpass', { bbox: BBOX, presets: 'surveillance,military,power,comms,aviation,emergency' })).json();
+      assert.ok(s.mock.callsTo('overpass').length > 1, 'asked in parts');
+      assert.equal(d.truncated, true, 'single cells still over the cap say so');
+      // What was complete is on disk; what was not is not.
+      s.mod.cache.clear();
+      const before = s.mock.callsTo('overpass').length;
+      await s.api('/api/overpass', { bbox: BBOX, presets: 'surveillance,military,power,comms,aviation,emergency' });
+      assert.ok(s.mock.callsTo('overpass').length > before, 'the incomplete cells are asked again');
+    } finally {
+      s.mod.overpassLimits.queryCap = 4000;
+    }
+  });
+
+  test('a truncated cell is not kept on disk', async () => {
+    s.mod.overpassLimits.queryCap = 1;
+    try {
+      await s.api('/api/overpass', { bbox: '34.88,-100.12,34.99,-100.01', presets: 'power,surveillance' });
+      s.mod.cache.clear();
+      await s.api('/api/overpass', { bbox: '34.88,-100.12,34.99,-100.01', presets: 'power,surveillance' });
+      assert.equal(s.mock.callsTo('overpass').length, 2);
+    } finally {
+      s.mod.overpassLimits.queryCap = 4000;
+    }
   });
 
   test('a view wider than Overpass can answer is trimmed to its centre and says so', async () => {
@@ -94,7 +181,21 @@ describe('/api/overpass', () => {
   });
 });
 
+describe('Overpass cooldown', () => {
+  test('doubles from 15 s and stops at five minutes', () => {
+    assert.deepEqual([1, 2, 3, 4, 5, 6, 9].map((n) => s.mod.overpassBackoffMs(n) / 1000), [15, 30, 60, 120, 240, 300, 300]);
+  });
+});
+
 describe('/api/alpr', () => {
+  test('cached per cell: another view over fetched ground needs no query, even after a restart', async () => {
+    await s.api('/api/alpr', { bbox: BBOX });
+    s.mod.cache.clear();   // as after a restart: only the disk copy is left
+    const d = (await s.api('/api/alpr', { bbox: '34.88,-100.12,35.1,-99.9' })).json();
+    assert.equal(s.mock.callsTo('overpass').length, 1);
+    assert.equal(d.total, 4);
+  });
+
   test('de-duplicates, classifies vendors and parses bearings', async () => {
     const d = (await s.api('/api/alpr', { bbox: BBOX })).json();
     assert.equal(d.count, 4);

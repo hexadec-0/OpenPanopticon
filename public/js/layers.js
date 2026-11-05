@@ -169,6 +169,9 @@ const RETRY_LADDER_SEC = [30, 60, 90, 120, 300, 3600];
 /**
  * How long the browser treats an area as already fetched.
  *
+ * Defaults only: at boot each layer takes its figure from the server's
+ * cache.conf (see app.js, cfg.retention), so the two stay in step.
+ *
  * Paired with the server's retention policy: INVENTORY_COVERAGE_MS matches
  * TTL.static there, so a layer that cannot have changed is not even asked
  * about again, and CURRENT_COVERAGE_MS matches TTL.hazard for the ones whose
@@ -268,6 +271,67 @@ const rows = (pairs) => pairs
 /* Base                                                                */
 /* ================================================================== */
 
+/* ------------------------------------------------------------------ */
+/* Ground heights                                                      */
+/*                                                                     */
+/* Markers used to be drawn with HeightReference.CLAMP_TO_GROUND, which */
+/* clamps to whatever terrain tile happens to be loaded under the point.*/
+/* Two things went wrong with that:                                     */
+/*                                                                     */
+/*  - Away from the camera only coarse tiles are loaded, and Cesium's   */
+/*    height lookup there lands on tile skirts — the curtains that hide */
+/*    seams between tiles, kilometres deep at coarse levels. Markers     */
+/*    sat ~7 km underground and, drawn through terrain on purpose, were */
+/*    seen through the ground below the horizon.                        */
+/*  - Nearer in, the loaded level is often still tens of metres off the */
+/*    real ground. In a tilted view that height error is parallax: the  */
+/*    pin draws away from the field-of-view wedge, which is draped onto */
+/*    the terrain itself and so is always in the right place.           */
+/*                                                                     */
+/* So each marker's ground is asked for once, from the most detailed    */
+/* terrain, and the marker is placed at that absolute height. Heights   */
+/* are kept for the session, so a redraw costs nothing. With no terrain */
+/* (the plain ellipsoid) clamping is exact and is left alone.           */
+/* ------------------------------------------------------------------ */
+
+const groundHeights = new Map();     // "lat,lon" (1e-5 deg) -> metres
+const groundInflight = new Map();    // same key -> Promise
+const GROUND_CACHE_MAX = 50_000;
+const GROUND_LIFT_M = 0.5;           // just clear of the surface, no z-fighting
+
+const groundKey = (c) => `${(c.latitude * 180 / Math.PI).toFixed(5)},${(c.longitude * 180 / Math.PI).toFixed(5)}`;
+
+function realTerrain(viewer) {
+  const tp = viewer?.scene?.terrainProvider;
+  if (!tp || typeof Cesium.sampleTerrainMostDetailed !== 'function') return null;
+  if (Cesium.EllipsoidTerrainProvider && tp instanceof Cesium.EllipsoidTerrainProvider) return null;
+  return tp.availability ? tp : null;
+}
+
+/** Heights for some cartographics, fetched once each and shared by every layer. */
+function groundHeightsFor(tp, items) {
+  const fresh = [];
+  for (const it of items) {
+    if (groundHeights.has(it.key) || groundInflight.has(it.key)) continue;
+    if (fresh.some((f) => f.key === it.key)) continue;
+    fresh.push(it);
+  }
+  if (fresh.length) {
+    const batch = Cesium.sampleTerrainMostDetailed(tp,
+      fresh.map((f) => Cesium.Cartographic.fromRadians(f.c.longitude, f.c.latitude, 0)))
+      .then((out) => {
+        out.forEach((c, i) => {
+          if (Number.isFinite(c?.height)) groundHeights.set(fresh[i].key, c.height);
+        });
+        while (groundHeights.size > GROUND_CACHE_MAX) groundHeights.delete(groundHeights.keys().next().value);
+      })
+      .catch((e) => console.warn('terrain heights unavailable; markers stay clamped', e))
+      .finally(() => { for (const f of fresh) groundInflight.delete(f.key); });
+    for (const f of fresh) groundInflight.set(f.key, batch);
+  }
+  return Promise.all([...new Set(items.map((it) => groundInflight.get(it.key)).filter(Boolean))]);
+}
+
 class Layer {
   constructor(viewer, id, label) {
     this.viewer = viewer;
@@ -321,7 +385,7 @@ class Layer {
     if (!on) {
       this.status = 'idle';
       // Nothing should fire for a layer that has been switched off.
-      clearTimeout(this._retryTimer);
+      clearTimeout(this._retryTimer); this._retryTimer = null;
     } else {
       // Switching a layer back on is a request to try it, not to resume a
       // backoff from an hour ago.
@@ -396,6 +460,47 @@ class Layer {
     if (typeof this.draw !== 'function') return;
     this.clear();
     this.count = this.draw(this.records()) || 0;
+    this.settleOnGround();
+  }
+
+  /**
+   * Move every ground-clamped marker this layer drew onto the true ground
+   * height (see "Ground heights" above). Markers whose height is not known
+   * yet stay clamped until it arrives, then move.
+   */
+  settleOnGround() {
+    const tp = realTerrain(this.viewer);
+    if (!tp) return;
+    const CLAMP = Cesium.HeightReference.CLAMP_TO_GROUND;
+    const t = this.viewer.clock?.currentTime;
+    const pending = [];
+    for (const ent of this.source.entities.values) {
+      const gfx = [ent.billboard, ent.point, ent.label]
+        .filter((g) => g && (g.heightReference?.getValue?.(t) ?? g.heightReference) === CLAMP);
+      if (!gfx.length) continue;
+      const pos = ent.position?.getValue?.(t);
+      if (!pos) continue;
+      const c = Cesium.Cartographic.fromCartesian(pos);
+      if (!c) continue;
+      const key = groundKey(c);
+      if (groundHeights.has(key)) this.placeOnGround(ent, c, groundHeights.get(key), gfx);
+      else pending.push({ ent, c, key, gfx });
+    }
+    if (!pending.length) return;
+    groundHeightsFor(tp, pending).then(() => {
+      let moved = 0;
+      for (const p of pending) {
+        if (!groundHeights.has(p.key) || !this.source.entities.contains(p.ent)) continue;
+        this.placeOnGround(p.ent, p.c, groundHeights.get(p.key), p.gfx);
+        moved++;
+      }
+      if (moved) this.viewer.scene?.requestRender?.();
+    });
+  }
+
+  placeOnGround(ent, c, h, gfx) {
+    ent.position = Cesium.Cartesian3.fromRadians(c.longitude, c.latitude, h + GROUND_LIFT_M);
+    for (const g of gfx) g.heightReference = Cesium.HeightReference.NONE;
   }
 
   /**
@@ -448,15 +553,21 @@ class Layer {
    * alone so descending does not refetch what is already held.
    */
   async holdForAltitude() {
-    clearTimeout(this._retryTimer);
-    if (this.enabled) {
+    clearTimeout(this._retryTimer); this._retryTimer = null;
+    // A request already on its way is not held: it will land and draw, and
+    // calling it "held" left the label stuck on "descend to query" after the
+    // camera had come back down, until that answer arrived.
+    if (this.enabled && !this._inFlight) {
       this.status = 'held';
-      this.error = null;
+      // Keep the reason for a backoff that is still running: coming back
+      // down inside it, that is what the layer will be waiting on.
+      if (!this.retryAt) this.error = null;
     }
   }
 
   async refresh(ctx, { isRetry = false, force = false } = {}) {
     if (!this.enabled) return;
+    this._viewBbox = ctx.bbox;   // where the camera is now, for _doRefresh
 
     // One refresh at a time, per layer.
     //
@@ -465,11 +576,45 @@ class Layer {
     // refresh may still be in flight when the next is due. Joining the one
     // already running means the duplicate never reaches the queue, let alone
     // the network, and two near-identical answers never race.
-    if (this._inFlight && !force) return this._inFlight;
+    //
+    // Joining is only right for the same view, though. Pan away and back
+    // while a slow query for the other place is still running, and the view
+    // you came back to waited on that query — showing "loading" for ground
+    // already in hand — and a new view was never asked for at all once it
+    // finished, until the camera moved again.
+    if (this._inFlight && !force) {
+      // Ground already fetched needs no network: draw it now.
+      if (this.accumulate && ctx.bbox && this.isCovered(ctx.bbox)) {
+        this._next = null;
+        this.skipped = (this.skipped || 0) + 1;
+        this.fromCache = true;
+        this.redraw();
+        this.status = 'ok';
+        this.error = null;
+        ctx.onStatus?.();
+        return undefined;
+      }
+      if (this.status === 'held') {
+        this.status = 'loading';
+        this.error = null;
+        ctx.onStatus?.();
+      }
+      // Somewhere new: ask for it as soon as the running query is done. Only
+      // the latest view is kept; the ones panned through on the way are not.
+      if (ctx.bbox && ctx.bbox !== this._inFlightBbox) this._next = ctx;
+      return this._inFlight;
+    }
 
     const run = this._doRefresh(ctx, { isRetry, force });
     this._inFlight = run;
-    try { return await run; } finally { this._inFlight = null; }
+    this._inFlightBbox = ctx.bbox;
+    try { return await run; } finally {
+      this._inFlight = null;
+      this._inFlightBbox = null;
+      const next = this._next;
+      this._next = null;
+      if (next && this.enabled) this.refresh(next).catch?.(() => {});
+    }
   }
 
   /**
@@ -485,7 +630,7 @@ class Layer {
   }
 
   async _doRefresh(ctx, { isRetry = false, force = false } = {}) {
-    clearTimeout(this._retryTimer);
+    clearTimeout(this._retryTimer); this._retryTimer = null;
     this._forced = !!force;
     // SYNC means "try now": the ladder starts again rather than resuming at
     // the hour-long step it had crawled to.
@@ -508,6 +653,16 @@ class Layer {
     // so being told "too many requests" was answered with more requests.
     if (this.retryAt && Date.now() < this.retryAt && !force && !isRetry) {
       this.skipped = (this.skipped || 0) + 1;
+      // Coming back down from an altitude hold in the middle of a backoff.
+      // The hold cancelled the retry timer and left the status at "held", so
+      // the layer kept saying "descend to query" after you had, and nothing
+      // was booked to bring it back. Say what it is actually waiting for,
+      // and book the retry again.
+      if (this.status === 'held') {
+        this.status = 'error';
+        this.error = this.error || 'Waiting out an earlier refusal from the upstream.';
+      }
+      if (!this._retryTimer) this.armRetry(ctx, this.retryAt - Date.now());
       ctx.onStatus?.();
       return;
     }
@@ -524,6 +679,7 @@ class Layer {
     }
 
     this.status = 'loading';
+    this.loadingSince = Date.now();
     this.error = null;
     ctx.onStatus?.();
     try {
@@ -542,9 +698,18 @@ class Layer {
       this.retryInSec = null;
       this.failures = 0;
     } catch (e) {
-      this.status = 'error';
-      this.error = e.message;
-      this.scheduleRetry(e, ctx);
+      if (this.accumulate && this._viewBbox && this._viewBbox !== ctx.bbox
+          && this.isCovered(this._viewBbox)) {
+        // The camera has since gone back to ground already held. This
+        // failure is about a place nobody is looking at: don't paint the
+        // view in front of you as failed, or book a retry for elsewhere.
+        this.status = 'ok';
+        this.error = null;
+      } else {
+        this.status = 'error';
+        this.error = e.message;
+        this.scheduleRetry(e, ctx);
+      }
     }
     ctx.onStatus?.();
   }
@@ -561,14 +726,21 @@ class Layer {
    * not a retry, it is ignoring the answer.
    */
   scheduleRetry(err, ctx) {
-    clearTimeout(this._retryTimer);
+    clearTimeout(this._retryTimer); this._retryTimer = null;
     const step = RETRY_LADDER_SEC[Math.min(this.failures, RETRY_LADDER_SEC.length - 1)];
     this.failures += 1;
     const wait = Math.max(step, Number(err?.retryAfter) || 0);
     this.retryInSec = wait;
     this.retryAt = Date.now() + wait * 1000;
 
+    this.armRetry(ctx, wait * 1000);
+  }
+
+  /** Book the next attempt `ms` from now, replacing any already booked. */
+  armRetry(ctx, ms) {
+    clearTimeout(this._retryTimer); this._retryTimer = null;
     this._retryTimer = setTimeout(() => {
+      this._retryTimer = null;
       if (!this.enabled) return;
       // Ask the app to refetch rather than replaying the captured context.
       // An hour into a backoff the camera is somewhere else, and the stale
@@ -576,12 +748,12 @@ class Layer {
       // gate, which only the caller knows about.
       if (ctx.retry) ctx.retry();
       else this.refresh(ctx, { isRetry: true });
-    }, wait * 1000 + 500);
+    }, Math.max(0, ms) + 500);
   }
 
   /** A deliberate act starts the ladder over. */
   resetBackoff() {
-    clearTimeout(this._retryTimer);
+    clearTimeout(this._retryTimer); this._retryTimer = null;
     this.failures = 0;
     this.retryAt = null;
     this.retryInSec = null;
@@ -1653,6 +1825,11 @@ export class AlprLayer extends Layer {
           image: alprSprite(css, c.directions.length > 0),
           width: 20,
           height: 20,
+          // The glyph is a camera on a pole: stand the pole's foot on the
+          // camera's position, where the field-of-view wedge starts, rather
+          // than centring the icon over it.
+          verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
+          pixelOffset: new Cesium.Cartesian2(0, 2),
           disableDepthTestDistance: Number.POSITIVE_INFINITY,
           heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
           scaleByDistance: new Cesium.NearFarScalar(500, 1.6, 2.5e5, 0.35),

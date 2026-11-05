@@ -11,6 +11,7 @@
  * Position comes from a callback re-read every couple of seconds, so an
  * aircraft or a ship stays centred as it moves.
  */
+import { viaCache } from './tilecache.js';
 
 const TILE = 256;
 // Used only before the frame has been laid out. The real size comes from
@@ -205,8 +206,21 @@ export class LocationInset {
           img.decoding = 'async';
           img.referrerPolicy = 'no-referrer-when-downgrade';
           img.alt = '';
-          img.src = style.url(z, wx, ty);
-          img.onerror = () => img.classList.add('err');
+          // Through the tile cache first. If that fails or stalls (the server
+          // busy, or not answering), fetch the tile straight from its source,
+          // so the inset never sits there as a black box.
+          const direct = style.url(z, wx, ty);
+          const cachedUrl = viaCache(direct, { sameOrigin: true });
+          let fellBack = cachedUrl === direct;
+          const fallBack = () => {
+            if (fellBack) { img.classList.add('err'); return; }
+            fellBack = true;
+            img.src = direct;
+          };
+          const stall = setTimeout(() => { if (!img.complete || !img.naturalWidth) fallBack(); }, 5000);
+          img.onload = () => clearTimeout(stall);
+          img.onerror = () => { clearTimeout(stall); fallBack(); };
+          img.src = cachedUrl;
           this.tiles.set(key, img);
           this.layer.appendChild(img);
         }

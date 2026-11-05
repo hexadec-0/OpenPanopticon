@@ -484,6 +484,7 @@ select.ctl { cursor: pointer; }
   font-size: 10.5px; color: var(--dim);
 }
 #labelbar input[type="range"] { width: 96px; accent-color: var(--hud); }
+#nt-note { min-width: 260px; }
 .hover-menu input[type="checkbox"] { accent-color: var(--hud); margin: 0; }
 
 /* regional signals ------------------------------------------------ */

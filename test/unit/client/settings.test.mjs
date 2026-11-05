@@ -35,6 +35,7 @@ function fakeApp() {
     weather: { radarOn: true, satOn: false },
     imagery: { on: true, selected: 'VIIRS_SNPP_DayNightBand_At_Sensor_Radiance', date: '2026-10-01', alpha: 0.5 },
     labels: { on: true, style: 'light', contrast: 3, boost: false, setContrast(c) { this.contrast = c; } },
+    night: { on: true, darkness: 0.55, lights: 0.4 },
   };
 }
 
@@ -48,6 +49,7 @@ function blankApp() {
   a.layers.alpr.vendorFilter = new Set();
   a.layers.events.sources = new Set(['gdacs', 'eonet', 'usgs', 'nws']);
   a.home = null;
+  a.night = { on: false, darkness: 0.7, lights: 0.7 };
   a.basemap = { provider: 'osm', from: null, to: null, maxCloud: 40 };
   a.labels = { on: false, style: 'dark', contrast: 2.2, boost: true, setContrast(c) { this.contrast = c; } };
   a.imagery = { on: false, selected: 'VIIRS_SNPP_CorrectedReflectance_TrueColor', date: null, alpha: 0.85 };
@@ -123,10 +125,11 @@ describe('collect', () => {
     assert.deepEqual(s.overpass.presets.sort(), ['military', 'power']);
     assert.deepEqual(s.alpr, { vendorFilter: ['flock'], showCones: false, onlyWithDirection: true });
     assert.deepEqual(s.events, { sources: ['usgs'], minSeverity: 'orange', showPolygons: false });
-    assert.deepEqual(s.basemap, { provider: 'sentinel2', from: '2026-09-01', to: '2026-09-30', maxCloud: 20 });
+    assert.deepEqual(s.basemap, { provider: 'sentinel2', from: '2026-09-01', to: '2026-09-30', maxCloud: 20, uniform: true });
     assert.deepEqual(s.overlays, {
       radar: true, clouds: false, imagery: true, imageryLayer: 'VIIRS_SNPP_DayNightBand_At_Sensor_Radiance',
       imageryDate: '2026-10-01', imageryAlpha: 0.5, labels: true, labelStyle: 'light', labelContrast: 3, labelBoost: false,
+      night: true, nightDarkness: 0.55, nightLights: 0.4,
     });
   });
 
@@ -152,7 +155,7 @@ describe('collect', () => {
     a.basemap = null;
     const s = Settings.collect(a);
     assert.equal(s.cycle, null);
-    assert.deepEqual(s.basemap, { provider: 'osm', from: null, to: null, maxCloud: 40 });
+    assert.deepEqual(s.basemap, { provider: 'osm', from: null, to: null, maxCloud: 40, uniform: true });
   });
 });
 
@@ -178,6 +181,9 @@ describe('apply', () => {
     assert.equal(app.labels.contrast, 3);
     assert.equal(app.labels.boost, false);
     assert.equal(app.imagery.alpha, 0.5);
+    assert.equal(app.night.darkness, 0.55);
+    assert.equal(app.night.lights, 0.4);
+    assert.equal(out.overlays.night, true);
     assert.equal(out.mode, 'flir');
     assert.equal(out.queryCeilingM, 100_000);
     assert.equal(out.autoRefresh, false);

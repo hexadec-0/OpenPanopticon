@@ -11,6 +11,9 @@ import { SelectionMarker } from './selection.js';
 import { AutoCycle, CYCLE_STEPS_S } from './autocycle.js';
 import { LocationInset } from './inset.js';
 import { ShortbreadImageryProvider } from './shortbread.js';
+import { NightOverlay } from './night.js';
+import { UniformDetail } from './uniform.js';
+import { installTileCache } from './tilecache.js';
 import {
   ShodanLayer, FlightLayer, SatelliteLayer, OverpassLayer, WebcamLayer,
   EventLayer, AlprLayer, VesselLayer, NetInfraLayer, IotLayer, TrafficLayer,
@@ -79,6 +82,8 @@ class OpenPanopticon {
     });
 
     const cfg = await api('/api/config').catch(() => ({}));
+    // Before the globe exists, so its very first tiles go through the cache.
+    await installTileCache(cfg.tileCache?.hosts, cfg.tileCache?.ports);
 
     this.setBoot('initialising globe');
     await this.initViewer(cfg.cesiumIonToken);
@@ -128,6 +133,17 @@ class OpenPanopticon {
       setEnabled(false);
     }
 
+    // Follow the server's retention (cache.conf): how long a view counts as
+    // already fetched, so the browser does not re-ask about what the server
+    // is still holding, nor go on trusting what it has let go.
+    const keep = cfg.retention || {};
+    for (const id of ['shodan', 'overpass', 'alpr', 'webcams', 'netinfra']) {
+      if (this.layers[id] && Number.isFinite(keep[id])) this.layers[id].coverageTtlMs = keep[id];
+    }
+    for (const id of ['events', 'iot']) {
+      if (this.layers[id] && Number.isFinite(keep[id])) this.layers[id].cacheTtlMs = keep[id];
+    }
+
     this.weather = new WeatherOverlay(this.viewer);
     this.imagery = new ImageryOverlay(this.viewer);
     this.labels = new LabelsOverlay(this.viewer);
@@ -138,6 +154,22 @@ class OpenPanopticon {
     // Name what the globe actually booted with, so the menu and the map agree.
     this.basemap.builtinKey = this.hasIon ? 'cesium' : globalThis.OP_DEMO?.baseLayer ? 'shortbread' : 'osm';
     this.basemap.provider = this.basemap.builtinKey;
+    this.night = new NightOverlay(this.viewer);
+    // Aerial imagery drawn from one level, chosen at the screen centre.
+    this.uniform = new UniformDetail(this.viewer, () => (this.basemap.provider === 'cesium'
+      ? this.basemap.layer || this.basemap.original : null));
+    // City lights at night: from the 3D buildings, and from the aerial
+    // imagery at the same pinned level as the ground, so they agree.
+    this.night.getBuildings = () => this.buildings || null;
+    this.night.getGlowSource = () => {
+      const u = this.uniform;
+      if (u.layer && u.layer.alpha > 0) {
+        return { provider: u.layer.imageryProvider, key: u.layer, minimumTerrainLevel: u.layer._opMinTerrain };
+      }
+      if (u.source) return { provider: u.source, key: u.source };
+      return null;
+    };
+    this.uniform.onLayer = () => this.night.refreshGlow();
     this.layers.overpass.available = this.health.presets.overpass;
     this.layers.overpass.labels = Object.fromEntries(
       Object.entries(this.health.presets.overpass).map(([k, v]) => [k, v.label]));
@@ -263,6 +295,46 @@ class OpenPanopticon {
 
     this.viewer = new Cesium.Viewer('globe', opts);
     const scene = this.viewer.scene;
+    // A frame budget. Left alone, Cesium draws every display refresh (60 to
+    // 144 a second) even when nothing on the globe moves, and Chrome draws
+    // every tab and window through one shared GPU process, so a globe that
+    // never stops drawing made other windows stutter. Full rate while the
+    // camera is moving, 30 at rest. The same whether or not the window has
+    // focus: a globe on a second screen is still being watched.
+    const FPS_MOVING = 60;
+    const FPS_IDLE = 30;
+    let moving = false;
+    const budget = () => {
+      this.viewer.targetFrameRate = moving ? FPS_MOVING : FPS_IDLE;
+    };
+    this.viewer.camera.moveStart.addEventListener(() => { moving = true; budget(); });
+    this.viewer.camera.moveEnd.addEventListener(() => { moving = false; budget(); });
+    budget();
+
+    // Draw on demand. Cesium redraws by itself for camera moves and for
+    // terrain, imagery and 3D tiles arriving; with nothing changing, the
+    // last frame simply stays on screen and the GPU does nothing. Clock time
+    // alone redraws at most every 30 s of it, which is what moves the night
+    // terminator. Everything else that changes the picture asks for a frame:
+    // see startAnimationFrames() for what moves by itself, and below for
+    // anything done in the interface.
+    scene.requestRenderMode = true;
+    scene.maximumRenderTimeChange = 30;
+    const nudge = () => {
+      scene.requestRender();
+      // Again shortly after, for whatever the action set going (a layer
+      // swapped in, a menu's effect, a fetch kicked off).
+      setTimeout(() => scene.requestRender(), 250);
+      setTimeout(() => scene.requestRender(), 1000);
+    };
+    for (const ev of ['pointerup', 'input', 'change', 'keydown', 'wheel']) {
+      document.addEventListener(ev, nudge, { passive: true, capture: true });
+    }
+
+    // Keep more ground tiles (and the imagery on them) once they scroll off
+    // screen. Cesium's default of 100 is a screenful or so, so panning back
+    // over ground just seen threw it away and loaded it again.
+    scene.globe.tileCacheSize = 400;
 
     if (ionToken) {
       try {
@@ -670,6 +742,11 @@ class OpenPanopticon {
     this._lastFrameAt = performance.now();
     this.viewer.scene.postRender.addEventListener(() => {
       this._frames++;
+    });
+    // The render loop's heartbeat. With on-demand rendering most loop turns
+    // draw nothing, so a frame count of 0 means "idle", not "stopped"; what
+    // shows the loop itself has stopped (a hidden tab) is the heartbeat.
+    this.viewer.scene.preUpdate.addEventListener(() => {
       this._lastFrameAt = performance.now();
     });
     setInterval(() => {
@@ -681,13 +758,14 @@ class OpenPanopticon {
       // Two seconds without a frame is not a slow machine, it is a stopped
       // render loop.
       const stalled = stalledMs > 2000;
-      cell.textContent = stalled ? `STALLED ${Math.round(stalledMs / 1000)}s` : `${fps} fps`;
+      cell.textContent = stalled ? `STALLED ${Math.round(stalledMs / 1000)}s` : fps ? `${fps} fps` : 'idle';
       cell.title = stalled
         ? 'The globe is not being redrawn, so nothing on it can appear to move — '
           + 'the data behind it may still be updating. A browser suspends rendering '
           + 'for a tab that is hidden, occluded or minimised; bringing the window to '
           + 'the front resumes it.'
-        : `${fps} frames in the last second.`;
+        : fps ? `${fps} frames drawn in the last second.`
+          : 'Nothing on the globe changed, so nothing was redrawn.';
       cell.classList.toggle('stalled', stalled);
     }, 1000);
 
@@ -712,10 +790,13 @@ class OpenPanopticon {
     // Regional signals change on the order of minutes, not seconds.
     setInterval(() => { if (this.autoRefresh) this.refreshSignals().catch(() => {}); }, 5 * 60_000);
 
-    // Propagate orbits every frame the clock advances.
-    this.viewer.clock.onTick.addEventListener((clock) => {
-      this.layers.satellites.tick(clock.currentTime);
+    // Propagate orbits for each frame actually drawn. On the clock's tick
+    // they were recomputed every browser frame whether or not anything was
+    // drawn, which with on-demand rendering would be work no one sees.
+    this.viewer.scene.preRender.addEventListener((scene, time) => {
+      this.layers.satellites.tick(time);
     });
+    this.startAnimationFrames();
 
     // Debounced refetch after the camera settles.
     this.viewer.camera.moveEnd.addEventListener(() => {
@@ -913,6 +994,7 @@ class OpenPanopticon {
     this.buildLabelsBar();
     this.buildLabelsToggle();
     this.buildBasemapMenu();
+    this.buildNightMenu();
 
     $('#detail-close').onclick = () => this.closeDetail();
     this.buildDetailResize();
@@ -1742,6 +1824,7 @@ class OpenPanopticon {
     // Labels default on — road names are the point — unless explicitly off.
     this.labels.set(o.labels !== false);
     $('#wx-labels').classList.toggle('active', this.labels.on);
+    if (o.night) this.night.set(true);
 
     const tryOverlay = async (fn, label) => {
       try { await fn(); } catch (e) { this.toast(`${label}: ${e.message}`); }
@@ -1830,6 +1913,9 @@ class OpenPanopticon {
       // Dates and cloud cover only mean something for the scene searches.
       $('#bm-window').style.display = bm.active ? '' : 'none';
       $('#bm-scene-row').style.display = bm.provider === 'sentinel2' ? '' : 'none';
+      $('#bm-uniform-row').style.display = bm.provider === 'cesium' ? '' : 'none';
+      // The base layer may have just changed under the pinned aerial layer.
+      this.uniform?.update();
 
       scene.innerHTML = '';
       for (const sc of bm.scenes) {
@@ -1855,6 +1941,10 @@ class OpenPanopticon {
     };
 
     const ctx = () => ({ bbox: this.currentBbox() });
+
+    const uniform = $('#bm-uniform');
+    uniform.checked = this.uniform.enabled;
+    uniform.onchange = () => { this.uniform.setEnabled(uniform.checked); this.persist(); };
 
     // Clicking the button is a quick toggle between the street map and the
     // last satellite source used; the menu is for choosing precisely.
@@ -1889,6 +1979,51 @@ class OpenPanopticon {
     };
 
     bm.onUpdate();
+  }
+
+  /** NIGHT: shade the dark side of the globe, with a darkness slider. */
+  buildNightMenu() {
+    const nt = this.night;
+    const btn = $('#wx-night');
+    const slider = $('#nt-dark');
+    const val = $('#nt-dark-val');
+    const note = $('#nt-note');
+    const pct = Math.round(nt.darkness * 100);
+    slider.value = String(pct);
+    val.textContent = `${pct}%`;
+    const lights = $('#nt-lights');
+    const lightsVal = $('#nt-lights-val');
+    const lpct = Math.round(nt.lights * 100);
+    lights.value = String(lpct);
+    lightsVal.textContent = `${lpct}%`;
+    lights.oninput = () => {
+      lightsVal.textContent = `${lights.value}%`;
+      nt.setLights(Number(lights.value) / 100);
+      if (!nt.on) nt.set(true);
+    };
+    lights.onchange = () => this.persist();
+
+    // Sun times for wherever the camera is, refreshed whenever the menu
+    // opens; computing them on every frame would be wasted work.
+    const describe = () => {
+      const c = this.viewer.camera.positionCartographic;
+      note.textContent = nt.describe(Cesium.Math.toDegrees(c.latitude), Cesium.Math.toDegrees(c.longitude))
+        + (nt.on ? '' : ' Shading is off.');
+    };
+    nt.onUpdate = () => { btn.classList.toggle('active', nt.on); describe(); };
+
+    btn.onclick = () => { nt.set(!nt.on); this.persist(); };
+    slider.oninput = () => {
+      val.textContent = `${slider.value}%`;
+      nt.setDarkness(Number(slider.value) / 100);
+      // Reaching for the slider means wanting to see it.
+      if (!nt.on) nt.set(true);
+    };
+    slider.onchange = () => this.persist();
+    const wrap = $('#night-wrap');
+    wrap.addEventListener('pointerenter', describe);
+    wrap.addEventListener('focusin', describe);
+    describe();
   }
 
   buildLabelsToggle() {
@@ -2007,7 +2142,32 @@ class OpenPanopticon {
   /* HUD                                                               */
   /* ---------------------------------------------------------------- */
 
+  /**
+   * Frames for what moves by itself. Aircraft dead-reckon between polls,
+   * satellites orbit and the selection ring pulses, none of which Cesium
+   * sees as a change, so while any is on screen this asks for 20 frames a
+   * second, focused or not. With none of them, nothing is drawn until
+   * something changes.
+   */
+  startAnimationFrames() {
+    const scene = this.viewer.scene;
+    const animating = () => {
+      const L = this.layers || {};
+      return (L.flights?.enabled && L.flights.count > 0)
+        || (L.satellites?.enabled && L.satellites.satrecs?.length > 0)
+        || !!this.selection?.target
+        || !!this.autoCycle?.on;
+    };
+    const loop = () => {
+      if (animating() && document.visibilityState === 'visible') scene.requestRender();
+      setTimeout(loop, 50);
+    };
+    loop();
+  }
+
   renderLayerStatus() {
+    // Called after every refresh: new data on the globe needs a frame.
+    this.viewer?.scene?.requestRender();
     for (const [id, layer] of Object.entries(this.layers)) {
       const box = document.querySelector(`.layer[data-layer="${id}"]`);
       if (!box) continue;
@@ -2018,6 +2178,12 @@ class OpenPanopticon {
       box.classList.toggle('failed', layer.status === 'error');
       box.classList.toggle('held', layer.status === 'held');
       if (!layer.enabled) { cnt.textContent = '—'; cnt.title = ''; }
+      else if (layer.status === 'held' && !this.tooHigh()) {
+        // Below the ceiling, so not held whatever the status says: the
+        // refresh that clears it is on its way.
+        cnt.textContent = '···';
+        cnt.title = 'Loading for this view…';
+      }
       else if (layer.status === 'held') {
         // Say why nothing is happening. A layer that is simply quiet looks
         // identical to one that is broken.
@@ -2026,7 +2192,13 @@ class OpenPanopticon {
           + `currently ${Math.round(this.altitude() / 1000).toLocaleString()} km. `
           + 'Descend to query. Anything already found stays drawn.';
       }
-      else if (layer.status === 'loading') cnt.textContent = '···';
+      else if (layer.status === 'loading') {
+        cnt.textContent = '···';
+        const secs = layer.loadingSince ? Math.round((Date.now() - layer.loadingSince) / 1000) : 0;
+        cnt.title = `Loading for this view${secs >= 3 ? ` — ${secs}s so far` : '…'}`
+          + (layer.viewportBound && secs >= 5
+            ? '. Busy areas can take a while; anything already found stays drawn.' : '');
+      }
       else if (layer.status === 'error') {
         // A scheduled retry is a different state from a dead one, and an
         // hourly one is different again — a layer backing off looks exactly

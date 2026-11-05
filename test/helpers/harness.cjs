@@ -32,6 +32,7 @@ const CONFIG_VARS = [
   'SHODAN_CELL_DEG', 'SHODAN_MAX_DEG', 'SHODAN_CREDIT_FLOOR', 'OPENSKY_CREDIT_FLOOR',
   'SHORTBREAD_URL', 'TITILER_URL', 'GEE_PROJECT', 'GEE_CLIENT_EMAIL', 'GEE_PRIVATE_KEY',
   'OPENPANOPTICON_OPEN_BROWSER', 'OPENPANOPTICON_DATA_DIR', 'OPENPANOPTICON_ENV_FILE', 'OPENPANOPTICON_QUIET',
+  'OPENPANOPTICON_CACHE_CONF', 'TILE_CACHE_MAX_MB', 'TILE_PORTS',
 ];
 
 function freePort() {
@@ -58,6 +59,8 @@ function loadServer({ env = {}, mock = null, dataDir = null } = {}) {
     PORT: '8420',
     HOST: '127.0.0.1',
     OPENPANOPTICON_ENV_FILE: path.join(dir, 'missing.env'),
+    // Defaults, never the operator's own cache.conf.
+    OPENPANOPTICON_CACHE_CONF: path.join(dir, 'missing-cache.conf'),
     OPENPANOPTICON_DATA_DIR: dir,
     OPENPANOPTICON_QUIET: '1',
   }, Object.fromEntries(Object.entries(env).map(([k, v]) => [k, String(v)])));

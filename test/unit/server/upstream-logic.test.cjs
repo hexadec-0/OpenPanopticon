@@ -134,6 +134,8 @@ describe('AIS ingest', () => {
 });
 
 describe('AIS websocket lifecycle', () => {
+  beforeEach(() => { S.ais.views.clear(); S.ais.error = null; });
+
   test('connects, subscribes on open, ingests messages, and moves the subscription', () => {
     FakeWebSocket.reset();
     S.ais.socket = null;
@@ -160,6 +162,49 @@ describe('AIS websocket lifecycle', () => {
     assert.equal(ws.sent.length, 1);
     S.aisConnect({ south: 40, west: -75, north: 41, east: -73 });
     assert.equal(ws.sent.length, 2);
+  });
+
+  test('binary frames are read — AISStream sends its JSON as binary, which Node gives as a Blob by default', async () => {
+    FakeWebSocket.reset();
+    S.ais.socket = null;
+    S.ais.vessels.clear();
+    S.aisConnect({ south: 40, west: -75, north: 41, east: -73 });
+    const ws = FakeWebSocket.last.open();
+    assert.equal(ws.binaryType, 'arraybuffer', 'asks for ArrayBuffers');
+    const bytes = (o) => new TextEncoder().encode(JSON.stringify(o));
+    ws.emit('message', { data: bytes(positionReport(111, { lat: 40.6, lon: -74 })).buffer });
+    ws.emit('message', { data: Buffer.from(bytes(positionReport(222, { lat: 40.7, lon: -74 }))) });
+    ws.emit('message', { data: new Blob([bytes(positionReport(333, { lat: 40.8, lon: -74 }))]) });
+    await new Promise((r) => setTimeout(r, 20));
+    assert.ok(S.ais.vessels.has('111'), 'ArrayBuffer');
+    assert.ok(S.ais.vessels.has('222'), 'Buffer');
+    assert.ok(S.ais.vessels.has('333'), 'Blob');
+    S.ais.socket = null;
+  });
+
+  test('a refused subscription is reported, not swallowed', () => {
+    FakeWebSocket.reset();
+    S.ais.socket = null;
+    S.aisConnect({ south: 40, west: -75, north: 41, east: -73 });
+    FakeWebSocket.last.open().message({ error: 'Api Key Is Not Valid' });
+    assert.equal(S.ais.error, 'AISStream: Api Key Is Not Valid');
+    S.ais.socket = null;
+  });
+
+  test('two viewers in different places share one subscription instead of stealing it', () => {
+    FakeWebSocket.reset();
+    S.ais.socket = null;
+    const nyc = { south: 40.4, west: -74.3, north: 40.9, east: -73.7 };
+    const raleigh = { south: 35.7, west: -78.8, north: 35.9, east: -78.5 };
+    S.aisConnect(nyc);
+    const ws = FakeWebSocket.last.open();
+    S.aisConnect(raleigh);
+    assert.equal(ws.sent.length, 2);
+    assert.deepEqual(ws.sent[1].BoundingBoxes, [...S.aisBoxesFor(nyc), ...S.aisBoxesFor(raleigh)]);
+    // Each one polling again changes nothing.
+    S.aisConnect(nyc); S.aisConnect(raleigh); S.aisConnect(nyc);
+    assert.equal(ws.sent.length, 2);
+    S.ais.socket = null;
   });
 
   test('an error is reported, and a close schedules a reconnect with backoff', () => {
@@ -264,14 +309,41 @@ describe('CelesTrak elements and their local copy', () => {
 describe('the shared Overpass queue', () => {
   beforeEach(() => Object.assign(S.overpassGate, {
     chain: Promise.resolve(), lastStartedAt: 0, minGapMs: 0, cooldownUntil: 0, consecutive429: 0,
+    mirrors: new Map(), coolFactor: 0,
   }));
 
+  const interpreterCalls = () => mock.calls.filter((c) => c.method === 'POST')
+    .map((c) => new URL(c.url).hostname);
+
   test('moves to the next mirror when one is rate-limited', async () => {
-    mock.once('overpass-api.de', () => status(429, 'Too Many Requests'));
+    mock.once('overpass-api.de/api/interpreter', () => status(429, 'Too Many Requests'));
     const out = await S.overpassQuery('[out:json];(node(1,2,3,4););out;');
     assert.ok(Array.isArray(out.elements));
-    assert.deepEqual(mock.calls.map((c) => new URL(c.url).hostname), ['overpass-api.de', 'overpass.kumi.systems']);
+    assert.deepEqual(interpreterCalls(), ['overpass-api.de', 'overpass.private.coffee']);
     assert.equal(S.overpassGate.consecutive429, 0);
+  });
+
+  test('a 429 books the wait the mirror\'s /api/status reports, and skips it until then', async () => {
+    mock.once('overpass-api.de/api/interpreter', () => status(429, 'Too Many Requests'));
+    mock.on('overpass-api.de/api/status', () => text(
+      'Connected as: 1\nCurrent time: x\nAnnounced endpoint: none\nRate limit: 2\n'
+      + 'Slot available after: 2026-11-05T20:31:12Z, in 47 seconds.\n'
+      + 'Slot available after: 2026-11-05T20:31:40Z, in 75 seconds.\n'));
+    await S.overpassQuery('q1');
+    const m = S.overpassGate.mirrors.get(S.OVERPASS_ENDPOINTS[0]);
+    const left = (m.freeAt - Date.now()) / 1000;
+    assert.ok(left >= 46 && left <= 52, `booked ${left}s`);
+    // The next query does not knock on the cooling mirror again.
+    mock.calls.length = 0;
+    await S.overpassQuery('q2');
+    assert.deepEqual(interpreterCalls(), ['overpass.private.coffee']);
+  });
+
+  test('reads both shapes of the status page', () => {
+    assert.equal(S.parseOverpassStatus('Rate limit: 2\n2 slots available now.\n'), 0);
+    assert.equal(S.parseOverpassStatus('Rate limit: 2\n0 slots available now.\n'
+      + 'Slot available after: t, in 12 seconds.\nSlot available after: t, in 5 seconds.\n'), 5);
+    assert.equal(S.parseOverpassStatus('<html>not a status page</html>'), null);
   });
 
   test('every mirror rate-limited: a 429 with a cooldown everyone waits out', async () => {
@@ -285,14 +357,24 @@ describe('the shared Overpass queue', () => {
     assert.equal(S.overpassGate.consecutive429, 1);
   });
 
+  test('during a cooldown a request is refused at once, not parked on the connection', async () => {
+    S.overpassGate.cooldownUntil = Date.now() + 90_000;
+    const t0 = Date.now();
+    await assert.rejects(S.overpassQuery('q'), (e) => {
+      assert.equal(e.status, 429);
+      assert.ok(e.retryAfter >= 89 && e.retryAfter <= 90);
+      return true;
+    });
+    assert.ok(Date.now() - t0 < 500, 'answered straight away');
+    assert.equal(mock.calls.length, 0, 'no mirror was asked');
+  });
+
   test('mixed failures: a 502 that names every mirror', async () => {
     mock.fail('overpass-api.de', 500, '<title>500 Internal Server Error</title>');
-    mock.unreachable('overpass.kumi.systems');
     mock.fail('overpass.private.coffee', 429, 'slow down');
     await assert.rejects(S.overpassQuery('q'), (e) => {
       assert.equal(e.status, 502);
       assert.match(e.message, /overpass-api\.de: HTTP 500/);
-      assert.match(e.message, /overpass\.kumi\.systems: unreachable/);
       assert.match(e.message, /overpass\.private\.coffee: HTTP 429 rate-limited/);
       assert.ok(e.retryAfter >= 30);
       return true;
@@ -313,6 +395,7 @@ describe('the shared Overpass queue', () => {
     for (const h of S.OVERPASS_ENDPOINTS) mock.once(new URL(h).hostname, () => status(500, 'x'));
     await assert.rejects(S.overpassQuery('first'));
     S.overpassGate.cooldownUntil = 0;
+    S.overpassGate.mirrors = new Map();
     const ok = await S.overpassQuery('second');
     assert.ok(Array.isArray(ok.elements));
   });

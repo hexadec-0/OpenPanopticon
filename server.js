@@ -100,6 +100,144 @@ function loadDotEnv(file) {
 }
 
 // ---------------------------------------------------------------------------
+// Cache retention: cache.conf
+// ---------------------------------------------------------------------------
+//
+// How long each kind of thing is held, in one file an operator can edit
+// without reading this one: cache.conf in the project folder (or wherever
+// OPENPANOPTICON_CACHE_CONF points). It is written with the defaults and an
+// explanation of every setting the first time the server starts, and read
+// again whenever it changes, so an edit takes effect without a restart. A
+// setting that is missing, misspelt or unreadable keeps its default and is
+// reported in the console.
+//
+// Durations are a number and a unit: 90s, 30m, 6h, 3d, 2w (no unit means
+// seconds). 0 means do not keep it at all. Sizes take MB or GB.
+
+const CACHE_CONF_FILE = process.env.OPENPANOPTICON_CACHE_CONF || path.join(ROOT, 'cache.conf');
+
+// [section, key, default, what it holds]. Order and wording are the file's.
+const CACHE_SCHEMA = [
+  ['maps', 'tiles', '30d', 'Map tiles on disk in providers/tiles: aerial imagery, street and vector\n# maps, place labels, NASA imagery, Sentinel-2 scenes. A tile is fetched again\n# this long after it was downloaded, however often it is used.'],
+  ['maps', 'tiles_max_size', '4096MB', 'Largest the tile folder may grow. Past it, the oldest tiles go first.'],
+  ['maps', 'browser', '1d', 'How long the browser keeps its own copy of a tile, on top of the disk one.'],
+  ['maps', 'scenes', '3d', 'Sentinel-2 scene searches: which scenes cover a view (not the imagery).'],
+  ['shodan', 'hosts', '3d', 'Shodan search results. Every miss spends a query credit, so this is also\n# how long a view is not paid for twice.'],
+  ['shodan', 'credits', '1m', 'The remaining-credit count shown in the sidebar.'],
+  ['overpass', 'infrastructure', '3d', 'OSM infrastructure layer (masts, substations, cameras, military, ...).\n# Overpass is donated capacity and rate-limits hard; mapped things change\n# over weeks.'],
+  ['overpass', 'alpr', '3d', 'ALPR / Flock camera layer.'],
+  ['overpass', 'truncated', '1h', 'An answer that hit the item cap is incomplete, so it is held in memory\n# only, for this long, and never written to disk.'],
+  ['network', 'infrastructure', '3d', 'RIPE Atlas probes, cell towers (OpenCelliD), WiFi (WiGLE), Tor relays.'],
+  ['cameras', 'directories', '3d', 'Webcam directories: NYC DOT, OpenWebcamDB, ALERTCalifornia.'],
+  ['satellites', 'elements', '1d', 'Orbital elements from CelesTrak. Only accurate near their epoch: older\n# elements put low-orbit objects tens of kilometres from where they are.'],
+  ['aircraft', 'airframes', '3d', 'Aircraft type and registration lookups.'],
+  ['aircraft', 'routes', '30m', 'Flight routes by callsign. The same flight number flies different legs\n# on different days.'],
+  ['places', 'geocode', '3d', 'Place-name searches.'],
+  ['places', 'seismic', '3d', 'Seismometer station lists.'],
+  ['current', 'events', '1h', 'Hazards and alerts: GDACS, EONET, USGS, NWS, FIRMS, EDIS. An old alert\n# drawn as live is worse than none.'],
+  ['current', 'traffic', '1h', 'Traffic incidents and cameras from 511 services.'],
+  ['current', 'sensors', '1h', 'Live sensor readings (Sensor.Community).'],
+  ['current', 'threats', '1h', 'Feodo botnet command-and-control list.'],
+  ['current', 'outages', '1h', 'Internet outages (IODA).'],
+  ['current', 'radar', '4m', 'Weather radar frame list.'],
+  ['memory', 'max_entries', '1000', 'Most answers held in memory at once. The disk copies stay; this only\n# bounds memory.'],
+  ['memory', 'label_tiles', '3000', 'Place-label tiles held in memory, on top of the disk copy.'],
+];
+
+const kindOf = (name) => (name === 'maps.tiles_max_size' ? 'size' : name.startsWith('memory.') ? 'count' : 'duration');
+
+function parseDuration(v) {
+  const m = /^(\d+(?:\.\d+)?)\s*(ms|s|m|h|d|w)?$/i.exec(String(v).trim());
+  if (!m) return null;
+  const unit = { ms: 1, s: 1e3, m: 60e3, h: 3600e3, d: 86400e3, w: 604800e3 }[(m[2] || 's').toLowerCase()];
+  return Math.round(Number(m[1]) * unit);
+}
+function parseSize(v) {
+  const m = /^(\d+(?:\.\d+)?)\s*(kb|mb|gb|tb)?$/i.exec(String(v).trim());
+  if (!m) return null;
+  return Math.round(Number(m[1]) * { kb: 2 ** 10, mb: 2 ** 20, gb: 2 ** 30, tb: 2 ** 40 }[(m[2] || 'mb').toLowerCase()]);
+}
+function parseCount(v) {
+  const m = /^\d+$/.exec(String(v).trim());
+  return m ? Number(m[0]) : null;
+}
+function parseSetting(name, v) {
+  const k = kindOf(name);
+  return k === 'size' ? parseSize(v) : k === 'count' ? parseCount(v) : parseDuration(v);
+}
+
+/** Current settings, by "section.key": milliseconds, bytes or a count. */
+const RETAIN = {};
+let cacheConfProblems = [];
+
+/** Read cache.conf over the defaults. Returns what it could not use. */
+function loadCacheConf(file = CACHE_CONF_FILE) {
+  const vals = Object.fromEntries(CACHE_SCHEMA.map(([sec, key, def]) => [`${sec}.${key}`, parseSetting(`${sec}.${key}`, def)]));
+  const problems = [];
+  let text = null;
+  try { text = fs.readFileSync(file, 'utf8'); } catch { /* none yet: defaults */ }
+  const set = new Set();
+  if (text != null) {
+    let sec = '';
+    text.split(/\r?\n/).forEach((raw, i) => {
+      const line = raw.replace(/\s+[#;].*$/, '').trim();
+      if (!line || line.startsWith('#') || line.startsWith(';')) return;
+      const head = /^\[([\w.-]+)\]$/.exec(line);
+      if (head) { sec = head[1].toLowerCase(); return; }
+      const kv = /^([\w.-]+)\s*[=:]\s*(.+)$/.exec(line);
+      if (!kv) { problems.push(`line ${i + 1}: expected "name = value"`); return; }
+      const name = sec ? `${sec}.${kv[1].toLowerCase()}` : kv[1].toLowerCase();
+      if (!(name in vals)) { problems.push(`line ${i + 1}: no setting called "${name}"`); return; }
+      const v = parseSetting(name, kv[2]);
+      if (v == null) { problems.push(`line ${i + 1}: "${kv[2].trim()}" is not a ${kindOf(name)} (${name})`); return; }
+      vals[name] = v;
+      set.add(name);
+    });
+  }
+  // TILE_CACHE_MAX_MB in .env predates this file; honour it unless the file says otherwise.
+  if (!set.has('maps.tiles_max_size') && Number(process.env.TILE_CACHE_MAX_MB) > 0) {
+    vals['maps.tiles_max_size'] = Number(process.env.TILE_CACHE_MAX_MB) * 2 ** 20;
+  }
+  vals['maps.tiles_max_size'] = Math.max(64 * 2 ** 20, vals['maps.tiles_max_size']);
+  Object.assign(RETAIN, vals);
+  cacheConfProblems = problems;
+  return { found: text != null, problems };
+}
+
+/** The file as first written: every setting at its default, explained. */
+function cacheConfText() {
+  const out = [
+    '# OpenPanopticon cache retention',
+    '#',
+    '# How long each kind of data is kept before it is fetched again. Edit and',
+    '# save: the server picks changes up within a few seconds, no restart needed',
+    '# (reload the page too, so the browser follows).',
+    '#',
+    '# Durations: a number and a unit - 90s, 30m, 6h, 3d, 2w. 0 = do not keep.',
+    '# Sizes: MB or GB. Delete a line to go back to its default.',
+  ];
+  let sec = null;
+  for (const [s, key, def, help] of CACHE_SCHEMA) {
+    if (s !== sec) { out.push('', `[${s}]`); sec = s; }
+    out.push('', `# ${help}`, `${key} = ${def}`);
+  }
+  return out.join('\n') + '\n';
+}
+
+/** Longest any answer on disk can be served, so pruning keeps what is live. */
+function diskMaxAge() {
+  let max = 0;
+  for (const [sec, key] of CACHE_SCHEMA) {
+    const name = `${sec}.${key}`;
+    if (sec === 'maps' && key !== 'scenes') continue;   // tiles are their own store
+    if (kindOf(name) === 'duration') max = Math.max(max, RETAIN[name] || 0);
+  }
+  return max;
+}
+
+loadCacheConf();
+
+// ---------------------------------------------------------------------------
 // TTL cache + in-flight de-duplication
 // ---------------------------------------------------------------------------
 
@@ -110,7 +248,8 @@ const inflight = new Map();  // key -> Promise
 // session keeps minting keys that are never asked for again. Expired entries
 // are swept on a timer (see start()), and this caps what is live at once.
 // Evicting a persistent entry costs a disk read, not an upstream call.
-const CACHE_MAX_ENTRIES = 1000;
+// memory.max_entries in cache.conf.
+const cacheMaxEntries = () => Math.max(50, RETAIN['memory.max_entries'] || 1000);
 
 /** Drop every expired entry. Returns how many went. */
 function sweepCache(now = Date.now()) {
@@ -124,9 +263,9 @@ function sweepCache(now = Date.now()) {
 function remember(key, entry) {
   cache.delete(key);
   cache.set(key, entry);
-  if (cache.size <= CACHE_MAX_ENTRIES) return;
+  if (cache.size <= cacheMaxEntries()) return;
   sweepCache();
-  while (cache.size > CACHE_MAX_ENTRIES) cache.delete(cache.keys().next().value);
+  while (cache.size > cacheMaxEntries()) cache.delete(cache.keys().next().value);
 }
 
 async function cached(key, ttlMs, producer) {
@@ -195,6 +334,9 @@ const DAY = 24 * 60 * 60_000;
  * Those do not become stale so much as false, and a false reading presented
  * as current is worse than no reading.
  */
+// The retention classes below are the reasoning, and the defaults
+// cache.conf starts from (see CACHE_SCHEMA); what is actually in force is
+// RETAIN, read from that file.
 const TTL = {
   // Where fixed things are: OSM infrastructure, ALPR and webcam directories,
   // Shodan hosts, cell and WiFi, Tor relays, seismometer stations, geocoding.
@@ -219,6 +361,13 @@ const TTL = {
   // route for today's aircraft.
   schedule: 30 * 60_000,
   live: 4 * 60_000,     // radar frame index; aircraft use the feed's own rate
+
+  // Map tiles: aerial photography, street and vector maps, label sheets,
+  // dated satellite scenes. A tile at a given address is a picture of a
+  // survey that changes over months or years, so a month on disk costs
+  // nothing in truth and saves every re-download. Kept apart from the
+  // answers above, in providers/tiles — see pruneTileCache().
+  tile: 30 * DAY,
   account: 60_000,      // credit balances, shown as a number in the UI
 };
 
@@ -288,7 +437,10 @@ const VIEW_CELL_DEG = {
  */
 const VIEW_MAX_DEG = {
   alpr: 1.0,
-  overpass: 0.75,
+  // 0.5 degrees is 16 cells. Wider than that over a city, ten classes is a
+  // run of heavy queries, each followed by its cool-down, and the browser
+  // gives up long before the last one comes back.
+  overpass: 0.5,
   // 5 x 5 degrees is 25 square degrees: the exact point at which OpenSky's
   // tariff steps from one credit to two. Past it a single wide view would
   // quietly cost double, or quadruple beyond 400.
@@ -395,7 +547,7 @@ const diskKeyHash = (key) => crypto.createHash('sha256').update(`openpanopticon:
 // Nothing reads the disk tier with a TTL longer than this, so a file older
 // than it can never be served again and is only a record of where the map
 // was pointed. pruneDiskCache() removes those.
-const DISK_MAX_AGE = TTL.static;
+// (diskMaxAge(), from cache.conf.)
 
 async function readDiskCache(key, ttlMs) {
   if (wantsFresh()) return undefined;
@@ -407,7 +559,7 @@ async function readDiskCache(key, ttlMs) {
     // pruneDiskCache() has not rewritten yet.
     if (rec.keyHash !== diskKeyHash(key) && rec.key !== key) return undefined;
     if (Date.now() - rec.savedAt > ttlMs) {                   // expired
-      if (Date.now() - rec.savedAt > DISK_MAX_AGE) await fsp.unlink(file).catch(() => {});
+      if (Date.now() - rec.savedAt > diskMaxAge()) await fsp.unlink(file).catch(() => {});
       return undefined;
     }
     return rec.value;
@@ -455,7 +607,7 @@ async function pruneDiskCache({ now = Date.now() } = {}) {
         continue;
       }
       if (!name.endsWith('.json')) continue;
-      if (age > DISK_MAX_AGE) { await fsp.unlink(file); removed++; continue; }
+      if (age > diskMaxAge()) { await fsp.unlink(file); removed++; continue; }
 
       const fh = await fsp.open(file, 'r');
       const head = Buffer.alloc(16);
@@ -463,7 +615,7 @@ async function pruneDiskCache({ now = Date.now() } = {}) {
       if (!head.toString('utf8').startsWith('{"key":')) continue;
 
       const rec = JSON.parse(await fsp.readFile(file, 'utf8'));
-      if (typeof rec.key !== 'string' || !(now - rec.savedAt <= DISK_MAX_AGE)) {
+      if (typeof rec.key !== 'string' || !(now - rec.savedAt <= diskMaxAge())) {
         await fsp.unlink(file); removed++; continue;
       }
       const tmp = `${file}.${process.pid}.tmp`;
@@ -807,7 +959,7 @@ async function shodanSearch({ bbox, preset, custom, minGeo = true }) {
 
   let q = snapFixed(b, SHODAN_CELL_DEG, SHODAN_MAX_DEG);
   if (!wantsFresh()) {
-    const bought = await findBoughtShodanBox(b, base, (box) => isCached(`shodan:${buildQuery(box)}`, TTL.static));
+    const bought = await findBoughtShodanBox(b, base, (box) => isCached(`shodan:${buildQuery(box)}`, RETAIN['shodan.hosts']));
     if (bought) q = bought;
   }
   const query = buildQuery(q);
@@ -822,7 +974,7 @@ async function shodanSearch({ bbox, preset, custom, minGeo = true }) {
   // is the one resource here that cannot be earned back by waiting.
   const key = `shodan:${query}`;
   let fetched = false;
-  const raw = await cachedPersistent(key, TTL.static, async () => {
+  const raw = await cachedPersistent(key, RETAIN['shodan.hosts'], async () => {
     // About to spend a credit. Stop short of the wall rather than through
     // it: running out mid-session leaves the layer dead until the month
     // rolls over, and the reserve is what a deliberate lookup draws on.
@@ -919,7 +1071,7 @@ async function shodanCredits() {
   if (!CFG.shodanKey) throw new UpstreamError(412, 'SHODAN_API_KEY is not set in .env');
   const url = new URL('https://api.shodan.io/api-info');
   url.searchParams.set('key', CFG.shodanKey);
-  return cached('shodan:apiinfo', TTL.account, () => grab(url, {}, { label: 'Shodan' }));
+  return cached('shodan:apiinfo', RETAIN['shodan.credits'], () => grab(url, {}, { label: 'Shodan' }));
 }
 
 
@@ -986,7 +1138,7 @@ let shodanIdx = null;
 
 async function shodanIndex() {
   if (!shodanIdx) {
-    const stored = await readDiskCache(SHODAN_INDEX_KEY, TTL.static);
+    const stored = await readDiskCache(SHODAN_INDEX_KEY, RETAIN['shodan.hosts']);
     // The filter can be a query the operator typed, so the index keeps only
     // a hash of it. Entries saved before that carry it in clear: convert them.
     shodanIdx = (Array.isArray(stored) ? stored : []).map((e) => {
@@ -995,7 +1147,7 @@ async function shodanIndex() {
       return { ...rest, baseHash: diskKeyHash(base) };
     });
   }
-  const cutoff = Date.now() - TTL.static;
+  const cutoff = Date.now() - RETAIN['shodan.hosts'];
   shodanIdx = shodanIdx.filter((e) => e && e.savedAt > cutoff);
   return shodanIdx;
 }
@@ -1382,7 +1534,7 @@ async function satellites({ group, limit }) {
   // providers/tle, which does something cachedPersistent cannot: when CelesTrak
   // refuses a repeat download it serves the stored elements back and says
   // they are stale. A second disk tier on top would shadow that.
-  const { text, stale, savedAt } = await cached(`sat:${g}`, TTL.orbit,
+  const { text, stale, savedAt } = await cached(`sat:${g}`, RETAIN['satellites.elements'],
     () => fetchTle(g));
 
   if (/^\s*(No GP data found|Invalid query)/i.test(text)) {
@@ -1427,19 +1579,38 @@ async function satellites({ group, limit }) {
 // OVERPASS — OpenStreetMap infrastructure
 // ---------------------------------------------------------------------------
 
-const OVERPASS_ENDPOINTS = [
-  'https://overpass-api.de/api/interpreter',
-  'https://overpass.kumi.systems/api/interpreter',
-  'https://overpass.private.coffee/api/interpreter',
-];
+// Public instances, in order of preference. overpass.kumi.systems and
+// overpass.private.coffee are the same operator and the same machines under
+// two names, so listing both only asked one server twice. A self-hosted
+// instance, or one you pay for, goes in OVERPASS_URL (comma-separated, tried
+// in order) and replaces these.
+const OVERPASS_ENDPOINTS = (process.env.OVERPASS_URL || '')
+  .split(',').map((s) => s.trim()).filter(Boolean);
+if (!OVERPASS_ENDPOINTS.length) {
+  OVERPASS_ENDPOINTS.push(
+    'https://overpass-api.de/api/interpreter',
+    'https://overpass.private.coffee/api/interpreter',
+  );
+}
 
 // ---------------------------------------------------------------------------
-// Overpass is a donated, shared service with roughly two execution slots per
-// IP. Every Overpass-backed layer therefore goes through one serial queue
-// with a minimum gap between requests, and a cooldown that all callers
-// observe once a mirror answers 429. Without it, selecting several feature
-// classes would fire one request per class at once and be rate-limited
-// immediately.
+// Overpass is a donated, shared service with a small number of execution
+// slots per IP. How it counts them is what this code is shaped around:
+//
+//   - a query holds its slot for its run time PLUS a cool-down afterwards,
+//     proportional to that run time (a fraction of it when the server is
+//     quiet, a multiple of it when busy);
+//   - a request that finds no free slot waits up to 15 s on the server, then
+//     gets a 429;
+//   - /api/status says exactly when each blocked slot frees up, and asking it
+//     costs no slot.
+//
+// So a fixed 1 s gap between queries was a guaranteed 429 after any heavy
+// one, and rotating every mirror on each retry spent 15 s per mirror and
+// spread the load the operators ask clients not to spread. Instead each
+// mirror carries its own "free at" time: modelled from the run time after a
+// success, and read from /api/status after a refusal. The queue waits for
+// the first free mirror, briefly, or answers 429 with the real wait at once.
 // ---------------------------------------------------------------------------
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -1448,20 +1619,99 @@ const overpassGate = {
   chain: Promise.resolve(),
   lastStartedAt: 0,
   minGapMs: 1100,
-  cooldownUntil: 0,
-  consecutive429: 0,
+  cooldownUntil: 0,        // global: nobody asks any mirror before this
+  consecutive429: 0,       // all mirrors refused, this many times in a row
+  mirrors: new Map(),      // endpoint -> { freeAt, strikes }
+  // Cool-down modelled after a success, as a multiple of the run time.
+  // Overpass's own ratio varies with load; 1.0 matches it under moderate
+  // load, and /api/status corrects us whenever we guess short.
+  coolFactor: 1.0,
+  // Longest a request waits in the queue for a mirror to free up before it
+  // is answered with a 429 instead. Kept short: a parked request holds one
+  // of the browser's six connections to this server.
+  maxInlineWaitMs: 20_000,
 };
+
+function overpassMirror(endpoint) {
+  let m = overpassGate.mirrors.get(endpoint);
+  if (!m) { m = { freeAt: 0, strikes: 0 }; overpassGate.mirrors.set(endpoint, m); }
+  return m;
+}
+
+/** When the first mirror is free, in preference order, as a timestamp. */
+function overpassNextFree() {
+  return Math.min(...OVERPASS_ENDPOINTS.map((e) => overpassMirror(e).freeAt));
+}
+
+/** Cooldown after the nth refusal in a row: 15 s doubling, capped at 5 min. */
+function overpassBackoffMs(n) {
+  return Math.min(300_000, 15_000 * 2 ** Math.max(0, n - 1));
+}
+
+/** A few seconds of spread, so two retries never land on the same instant. */
+const jitterMs = () => Math.floor(Math.random() * 3000);
+
+/**
+ * Seconds until a slot is free, from an /api/status page; null if the page
+ * is not one (some mirrors don't serve it, or serve something else).
+ *
+ *   Rate limit: 2
+ *   2 slots available now.
+ * or
+ *   Rate limit: 2
+ *   Slot available after: 2026-11-05T20:31:12Z, in 23 seconds.
+ */
+function parseOverpassStatus(text) {
+  if (typeof text !== 'string' || !/Rate limit:/i.test(text)) return null;
+  const now = /(\d+)\s+slots?\s+available\s+now/i.exec(text);
+  if (now && Number(now[1]) > 0) return 0;
+  const waits = [...text.matchAll(/Slot available after:[^\n]*?in\s+(-?\d+)\s+seconds?/gi)]
+    .map((m) => Math.max(0, Number(m[1])));
+  return waits.length ? Math.min(...waits) : null;
+}
+
+/** Ask a mirror how long until it has a slot for us. Never throws. */
+async function overpassSlotWait(endpoint) {
+  if (!/\/interpreter$/.test(endpoint)) return null;
+  try {
+    const text = await grab(endpoint.replace(/\/interpreter$/, '/status'), {},
+      { as: 'text', timeoutMs: 8000, label: 'Overpass status' });
+    return parseOverpassStatus(text);
+  } catch {
+    return null;
+  }
+}
 
 /** Run `fn` on the shared Overpass queue, one at a time. */
 function overpassQueued(fn) {
+  // Captured now, while still inside the request's context.
+  const signal = reqCtx.getStore()?.signal;
   const run = overpassGate.chain.then(async () => {
+    // The browser gave up (moved on, timed out) while this waited its turn.
+    // Its answer would go nowhere, and running it would spend a slot that a
+    // view somebody IS looking at needs. Queries already running are left
+    // to finish: their results are cached, so those are not wasted.
+    if (signal?.aborted) {
+      throw new UpstreamError(499, 'Overpass request dropped: the browser stopped waiting for it.');
+    }
     const now = Date.now();
-    const wait = Math.max(
-      overpassGate.cooldownUntil - now,
-      overpassGate.lastStartedAt + overpassGate.minGapMs - now,
-      0,
-    );
+    const freeAt = Math.max(overpassGate.cooldownUntil, overpassNextFree());
+    // Too long to wait here: answer at once with how long is left rather
+    // than parking the request. A request parked for minutes held one of the
+    // browser's six connections to this server the whole time, and map
+    // tiles queued behind it. The layer's own backoff brings it back.
+    if (freeAt - now > overpassGate.maxInlineWaitMs) {
+      const secs = Math.ceil((freeAt - now) / 1000);
+      const err = new UpstreamError(429,
+        `Overpass is cooling down after rate limits — trying again in ${secs}s.`);
+      err.retryAfter = secs;
+      throw err;
+    }
+    const wait = Math.max(freeAt - now, overpassGate.lastStartedAt + overpassGate.minGapMs - now, 0);
     if (wait > 0) await sleep(wait);
+    if (signal?.aborted) {
+      throw new UpstreamError(499, 'Overpass request dropped: the browser stopped waiting for it.');
+    }
     overpassGate.lastStartedAt = Date.now();
     return fn();
   });
@@ -1471,9 +1721,12 @@ function overpassQueued(fn) {
 }
 
 /**
- * POST an Overpass QL query, rotating mirrors on failure. A 429 moves to the
- * next mirror immediately (separate host, separate quota); if every mirror
- * refuses, a cooldown is set so the next caller waits rather than piling on.
+ * POST an Overpass QL query to the first mirror that is free.
+ *
+ * A mirror still cooling down is skipped, not asked. A 429 asks that
+ * mirror's /api/status how long its slots are held and books exactly that,
+ * so the next attempt lands when a slot is actually free instead of on an
+ * exponential guess. Every mirror is asked at most once per call.
  */
 async function overpassQuery(ql, label = 'Overpass') {
   return overpassQueued(async () => {
@@ -1482,6 +1735,16 @@ async function overpassQuery(ql, label = 'Overpass') {
     const failures = [];   // one short line per mirror, for the summary
 
     for (const endpoint of OVERPASS_ENDPOINTS) {
+      const m = overpassMirror(endpoint);
+      const cooling = m.freeAt - Date.now();
+      if (cooling > 1000) {
+        rateLimited++;
+        failures.push(`${hostOf(endpoint)}: cooling down ${Math.ceil(cooling / 1000)}s`);
+        continue;
+      }
+      if (cooling > 0) await sleep(cooling);
+
+      const t0 = Date.now();
       try {
         const out = await grab(endpoint, {
           method: 'POST',
@@ -1492,43 +1755,62 @@ async function overpassQuery(ql, label = 'Overpass') {
           body: new URLSearchParams({ data: ql }),
         }, { label, timeoutMs: 45000 });
 
+        // The slot is held for a cool-down after we are done with it. Book
+        // that, so the next query waits it out here instead of being turned
+        // away there.
+        const ran = Date.now() - t0;
+        m.freeAt = Date.now() + Math.min(60_000, Math.round(ran * overpassGate.coolFactor));
+        m.strikes = 0;
         overpassGate.consecutive429 = 0;
         return out;
       } catch (e) {
         lastErr = e;
         failures.push(mirrorFailure(endpoint, e));
-        if (e.status === 429 || e.status === 504) {
+        if (e.status === 429) {
           rateLimited++;
-          if (e.retryAfter) {
-            overpassGate.cooldownUntil = Math.max(
-              overpassGate.cooldownUntil, Date.now() + e.retryAfter * 1000);
-          }
+          m.strikes++;
+          // How long, according to the mirror itself. Retry-After if it sent
+          // one, else its status page, else the exponential ladder.
+          let secs = e.retryAfter;
+          if (secs == null) secs = await overpassSlotWait(endpoint);
+          const ms = secs != null ? secs * 1000 + 1000 : overpassBackoffMs(m.strikes);
+          m.freeAt = Math.max(m.freeAt, Date.now() + ms + jitterMs());
+        } else if (e.status === 504) {
+          // Overpass's own 504 is "server too busy for a query this size";
+          // ours is a timeout, after which the query still runs there and
+          // still holds the slot. Either way that mirror wants a rest.
+          rateLimited++;
+          m.strikes++;
+          m.freeAt = Math.max(m.freeAt, Date.now() + overpassBackoffMs(m.strikes) + jitterMs());
+        } else {
+          // Down or erroring: try it again later, not on the very next call.
+          m.freeAt = Math.max(m.freeAt, Date.now() + 30_000);
         }
       }
     }
 
+    // Nobody would take it. Report when the first of them is free again.
+    const retryIn = Math.max(1, Math.ceil((overpassNextFree() - Date.now()) / 1000));
+
     if (rateLimited === OVERPASS_ENDPOINTS.length) {
-      // Exponential-ish cooldown so a burst doesn't keep hammering mirrors.
       overpassGate.consecutive429++;
-      const backoff = Math.min(60_000, 4000 * overpassGate.consecutive429);
-      overpassGate.cooldownUntil = Math.max(overpassGate.cooldownUntil, Date.now() + backoff);
+      const backoffMs = retryIn * 1000;
+      overpassGate.cooldownUntil = Math.max(overpassGate.cooldownUntil, Date.now() + backoffMs);
+      const secs = Math.ceil(backoffMs / 1000);
       const err = new UpstreamError(429,
-        `Overpass is rate-limiting every mirror — retrying in ${Math.round(backoff / 1000)}s. `
-        + 'Selecting fewer feature classes, or zooming in, reduces the load.');
-      err.retryAfter = Math.round(backoff / 1000);
+        `Overpass is rate-limiting every mirror — retrying in ${secs}s. `
+        + 'Selecting fewer feature classes, or zooming in, reduces the load.',
+        failures.join('; '));
+      err.retryAfter = secs;
       throw err;
     }
 
     // Mixed or server-side failures. Saying only what the last mirror said
-    // hid the other two and made an outage read like a rate limit; list
-    // each one briefly instead. These are their faults, not ours, so this
-    // is a 502 with a retry rather than a bare 500.
-    if (rateLimited) {
-      overpassGate.consecutive429++;
-      overpassGate.cooldownUntil = Math.max(overpassGate.cooldownUntil,
-        Date.now() + Math.min(60_000, 4000 * overpassGate.consecutive429));
-    }
-    const retry = Math.max(30, lastErr?.retryAfter || 0);
+    // hid the others and made an outage read like a rate limit; list each
+    // one briefly instead. These are their faults, not ours, so this is a
+    // 502 with a retry rather than a bare 500.
+    if (rateLimited) overpassGate.consecutive429++;
+    const retry = Math.max(30, lastErr?.retryAfter || 0, retryIn);
     const err = new UpstreamError(502,
       `No Overpass mirror could answer (${failures.join('; ')}). `
       + `This is on their side — retrying in ${retry}s.`,
@@ -1536,6 +1818,10 @@ async function overpassQuery(ql, label = 'Overpass') {
     err.retryAfter = retry;
     throw err;
   });
+}
+
+function hostOf(endpoint) {
+  try { return new URL(endpoint).hostname; } catch { return endpoint; }
 }
 
 /** "overpass-api.de: HTTP 500 Internal Server Error", kept short. */
@@ -1624,6 +1910,245 @@ const OVERPASS_PRESETS = {
 };
 
 /**
+ * Overpass elements for a snapped box, cached per grid cell and per class.
+ *
+ * Keying the cache on the whole view box meant an answer was only reused for
+ * exactly that box: any other zoom or pan after a restart made a new key,
+ * and ground already fetched (and on disk) was asked for again. Instead the
+ * box is split into its 0.125° cells, and each (class, cell) pair is stored
+ * on its own. A view is assembled from whatever pairs are already held, in
+ * memory or on disk, and only the missing ones are queried: one query, over
+ * the smallest box around the missing cells, for the missing classes. Every
+ * cell inside that box is then complete for those classes and is stored.
+ *
+ * An answer the cap truncated is incomplete, so its cells are kept in memory
+ * for an hour only and never written to disk, where they would stand in for
+ * the full answer for days.
+ */
+function overpassCellsOf(box) {
+  const step = box.step;
+  const r = (v) => Number(v.toFixed(4));
+  const cells = [];
+  for (let s = box.south; s < box.north - 1e-9; s = r(s + step)) {
+    for (let w = box.west; w < box.east - 1e-9; w = r(w + step)) {
+      const c = { south: s, west: w, north: r(s + step), east: r(w + step) };
+      c.key = `${c.south},${c.west},${c.north},${c.east}`;
+      cells.push(c);
+    }
+  }
+  return cells;
+}
+
+const overpassCellKey = (cls, cell) => `overpass-cell:${cls}:${cell.key}`;
+
+/** A cached value without producing one: memory, then disk. */
+async function peekCached(key, ttlMs) {
+  if (wantsFresh()) return undefined;
+  const hit = cache.get(key);
+  if (hit && hit.expires > Date.now()) { remember(key, hit); return hit.value; }
+  const disk = await readDiskCache(key, ttlMs);
+  if (disk !== undefined) remember(key, { expires: Date.now() + ttlMs, value: disk });
+  return disk;
+}
+
+/**
+ * `classes` is a list of { key, body(bbox) -> QL clauses, match(tags) }: the
+ * infrastructure presets, or the ALPR layer's single class. `key` names the
+ * class in the cache, so it must be unique across every caller.
+ */
+// The most elements one Overpass query may return. Generous on purpose: an
+// answer that reaches it is incomplete, cannot be stored for long, and gets
+// asked for again, so a cap sized for drawing (the browser's 800) made dense
+// areas re-query every hour. Past this the area is split and asked in parts.
+const overpassLimits = {   // an object so tests can lower it
+  queryCap: 4000,
+  cellBudget: 32,      // cells x classes one query may cover (see overpassMaxCells)
+  minCells: 4,
+  timeoutSec: 30,
+  maxsize: 128 * 1024 * 1024,
+};
+
+async function overpassCells(box, classes, cap, label = 'Overpass', ttl = RETAIN['overpass.infrastructure']) {
+  const byKey = new Map(classes.map((c) => [c.key, c]));
+  const chosen = classes.map((c) => c.key);
+  const cells = overpassCellsOf(box);
+  const held = new Map();   // pair key -> { elements, truncated }
+  const missing = [];
+  await Promise.all(chosen.flatMap((p) => cells.map(async (c) => {
+    const k = overpassCellKey(p, c);
+    const v = await peekCached(k, ttl);
+    if (v && Array.isArray(v.elements)) held.set(k, v);
+    else missing.push({ p, c });
+  })));
+
+  if (missing.length) {
+    const presets = chosen.filter((p) => missing.some((m) => m.p === p));
+    const need = [...new Map(missing.map((m) => [m.c.key, m.c])).values()];
+    log('info', `${label}: ${need.length} of ${cells.length} cells not cached (${presets.join(', ')}) — querying`);
+    await overpassFetchCells(need, presets, byKey, box.step, label, ttl, held);
+  }
+
+  // Assemble the view, each element once however many classes or cells
+  // brought it in.
+  const seen = new Set();
+  const elements = [];
+  let truncated = false;
+  for (const p of chosen) {
+    for (const c of cells) {
+      const v = held.get(overpassCellKey(p, c));
+      if (!v) continue;
+      if (v.truncated) truncated = true;
+      for (const el of v.elements) {
+        const id = `${el.type}/${el.id}`;
+        if (seen.has(id)) continue;
+        seen.add(id);
+        elements.push(el);
+      }
+    }
+  }
+  return { elements, truncated };
+}
+
+/**
+ * Query a set of cells for some classes, and store each cell. If the answer
+ * reaches overpassLimits.queryCap it is incomplete, so the cells are split in two
+ * along the longer side and each half asked separately, down to single
+ * cells. Every complete part is stored as soon as it arrives, so a rate
+ * limit part-way through keeps what was already fetched, and the next
+ * request only asks for the rest.
+ */
+/**
+ * Cells known to be too dense to share a query: an answer that covered them
+ * reached the cap. Asking for them again in a group would run the same
+ * heavy query, hit the same cap and be thrown away before the split — the
+ * most expensive way to get nothing, and over somewhere like Manhattan it is
+ * what tipped every retry into a 429. Remembered per class set, in memory.
+ */
+const overpassDense = new Map();   // `${presets}|${cell}` -> expires
+const OVERPASS_DENSE_MS = 24 * 60 * 60_000;
+const denseKey = (presets, c) => `${presets.join(',')}|${c.key}`;
+function isDense(presets, c) {
+  const t = overpassDense.get(denseKey(presets, c));
+  if (t && t > Date.now()) return true;
+  if (t) overpassDense.delete(denseKey(presets, c));
+  return false;
+}
+
+/**
+ * The most cells one query may cover. Cost on the server scales with area
+ * times the number of classes, so the more classes, the smaller the box:
+ * one class (ALPR) may take 32 cells, all ten take 4.
+ */
+function overpassMaxCells(presets) {
+  return Math.max(overpassLimits.minCells, Math.floor(overpassLimits.cellBudget / Math.max(1, presets.length)));
+}
+
+/** Two halves along the longer side; null if they cannot be separated. */
+function splitCells(need) {
+  const s = Math.min(...need.map((c) => c.south)), n = Math.max(...need.map((c) => c.north));
+  const w = Math.min(...need.map((c) => c.west)), e = Math.max(...need.map((c) => c.east));
+  const wide = e - w >= n - s;
+  const mid = wide ? (w + e) / 2 : (s + n) / 2;
+  const a = need.filter((c) => (wide ? c.west < mid : c.south < mid));
+  const b = need.filter((c) => !a.includes(c));
+  return a.length && b.length ? [a, b] : null;
+}
+
+async function overpassFetchCells(need, presets, byKey, step, label, ttl, held) {
+  // Split BEFORE asking when the box is bigger than one query should cover,
+  // or holds a cell already known to overflow the cap.
+  if (need.length > 1
+      && (need.length > overpassMaxCells(presets) || need.some((c) => isDense(presets, c)))) {
+    const parts = splitCells(need);
+    if (parts) {
+      for (const part of parts) {
+        await overpassFetchCells(part, presets, byKey, step, label, ttl, held);
+      }
+      return;
+    }
+  }
+
+  const qb = {
+    south: Math.min(...need.map((c) => c.south)), west: Math.min(...need.map((c) => c.west)),
+    north: Math.max(...need.map((c) => c.north)), east: Math.max(...need.map((c) => c.east)),
+    step,
+  };
+  const bb = `${qb.south},${qb.west},${qb.north},${qb.east}`;
+  const clauses = presets.map((k) => byKey.get(k).body(bb)).join('');
+  // Declared limits are what Overpass admits a query on: it must fit in half
+  // the server's remaining time and memory, else a 504. The defaults (180 s,
+  // 512 MiB) are far more than a few cells need, and a smaller claim gets in
+  // when the server is busy and a large one does not.
+  const ql = `[out:json][timeout:${overpassLimits.timeoutSec}][maxsize:${overpassLimits.maxsize}];`
+    + `(${clauses});out center ${overpassLimits.queryCap};`;
+  // Memory-only, briefly: joins a duplicate request already in flight.
+  const raw = await cached(`overpass-q:${ql}`, 60_000, () => overpassQuery(ql, label));
+  const elements = raw.elements || [];
+  const full = elements.length >= overpassLimits.queryCap;
+
+  if (full) {
+    for (const c of need) overpassDense.set(denseKey(presets, c), Date.now() + OVERPASS_DENSE_MS);
+  }
+  if (full && need.length > 1) {
+    const parts = splitCells(need);
+    // Degenerate split (all on one side): fall through and store as truncated.
+    if (parts) {
+      log('info', `${label}: ${need.length} cells came back over ${overpassLimits.queryCap} elements — asking in two parts`);
+      for (const part of parts) {
+        await overpassFetchCells(part, presets, byKey, step, label, ttl, held);
+      }
+      return;
+    }
+  }
+
+  // Sort the answer into cells by each element's point (its centre, for
+  // ways), and into every class it belongs to. Every cell inside the query
+  // box is complete for these classes, so all of them are stored.
+  const inBox = overpassCellsOf(qb);
+  const bucket = new Map(presets.flatMap((p) => inBox.map((c) => [overpassCellKey(p, c), []])));
+  const cols = Math.round((qb.east - qb.west) / qb.step);
+  for (const el of elements) {
+    const lat = el.lat ?? el.center?.lat;
+    const lon = el.lon ?? el.center?.lon;
+    if (lat == null || lon == null) continue;
+    const iy = Math.floor((lat - qb.south) / qb.step);
+    const ix = Math.floor((lon - qb.west) / qb.step);
+    const c = inBox[iy * cols + ix];
+    if (!c || ix < 0 || ix >= cols) continue;
+    const t = el.tags || {};
+    for (const p of presets) {
+      let ok = false;
+      try { ok = byKey.get(p).match(t); } catch { /* not this class */ }
+      if (ok) bucket.get(overpassCellKey(p, c)).push(el);
+    }
+  }
+  for (const [k, list] of bucket) {
+    // Only a single cell can still be full here; it is held in memory only.
+    const value = { elements: list, truncated: full };
+    if (full) {
+      remember(k, { expires: Date.now() + RETAIN['overpass.truncated'], value });
+    } else {
+      remember(k, { expires: Date.now() + ttl, value });
+      await writeDiskCache(k, value);
+    }
+    held.set(k, value);
+  }
+}
+
+/**
+ * Keep the `cap` features nearest the middle of a box, for drawing. The
+ * cache holds everything; this only limits what one answer sends.
+ */
+function nearestFirst(items, b, cap) {
+  if (items.length <= cap) return items;
+  const lat = (b.south + b.north) / 2;
+  const lon = (b.west + b.east) / 2;
+  const k = Math.cos((lat * Math.PI) / 180);
+  const d = (f) => (f.lat - lat) ** 2 + ((f.lon - lon) * k) ** 2;
+  return items.map((f) => [d(f), f]).sort((x, y) => x[0] - y[0]).slice(0, cap).map((x) => x[1]);
+}
+
+/**
  * Fetch several feature classes in ONE Overpass query.
  *
  * One request per class would mean ten simultaneous requests to a service
@@ -1654,13 +2179,11 @@ async function overpass({ bbox, presets, preset, limit }) {
   const q = viewCell(b, 'overpass');
   const bb = q.key;
 
-  const clauses = chosen.map((k) => OVERPASS_PRESETS[k].body(bb)).join('');
-  const ql = `[out:json][timeout:40];(${clauses});out center ${cap};`;
-
   // TTL.static. Mapped infrastructure — masts, substations, cameras — changes
   // on the order of weeks, and Overpass is donated capacity.
-  const key = `overpass:${chosen.join('+')}:${bb}:${cap}`;
-  const raw = await cachedPersistent(key, TTL.static, () => overpassQuery(ql));
+  const raw = await overpassCells(q,
+    chosen.map((k) => ({ key: k, body: OVERPASS_PRESETS[k].body, match: OVERPASS_PRESETS[k].match })), cap,
+    'Overpass', RETAIN['overpass.infrastructure']);
 
   const byPreset = Object.fromEntries(chosen.map((k) => [k, 0]));
   const features = [];
@@ -1695,20 +2218,28 @@ async function overpass({ bbox, presets, preset, limit }) {
     });
   }
 
+  // The cache holds everything; one answer sends at most `cap` to draw, the
+  // ones nearest the middle of the view.
+  const shown = nearestFirst(features, b, cap);
+  if (shown.length < features.length) {
+    for (const k of chosen) byPreset[k] = 0;
+    for (const f of shown) byPreset[f.preset]++;
+  }
+
   return {
     presets: chosen,
     byPreset,
     colors: Object.fromEntries(chosen.map((k) => [k, OVERPASS_PRESETS[k].color])),
     labels: Object.fromEntries(chosen.map((k) => [k, OVERPASS_PRESETS[k].label])),
-    count: features.length,
-    truncated: (raw.elements || []).length >= cap,
+    count: shown.length,
+    truncated: raw.truncated || shown.length < features.length,
     // The ground this answer actually covers, which is the snapped cell and
     // not the box the browser asked for. Telling it lets it record coverage
     // from what was fetched instead of guessing from what it requested — and
     // the cell is the larger of the two, so panning stays inside it.
     covered: bb,
     trimmed: q.trimmed || false,
-    features,
+    features: shown,
   };
 }
 
@@ -1756,9 +2287,33 @@ const ais = {
   bbox: null,
   connectedAt: null,
   messages: 0,
+  unreadable: 0,           // frames that could not be decoded as JSON
+  views: new Map(),        // box key -> { b, at }: every view asking lately
   reconnectDelay: 2000,
   reconnectTimer: null,
 };
+
+// The subscription is one per process, but several browsers (or tabs) can be
+// watching different places. Following whichever asked last made two viewers
+// steal it from each other on every poll, and each got almost nothing.
+// AISStream takes several boxes in one subscription, so keep every view
+// that asked recently and subscribe to all of them.
+const AIS_VIEW_TTL_MS = 3 * 60_000;
+const AIS_MAX_BOXES = 8;
+
+/** Note a view that wants vessels. True if the subscription should change. */
+function aisNoteView(b) {
+  const now = Date.now();
+  let changed = false;
+  for (const [k, v] of ais.views) {
+    if (now - v.at > AIS_VIEW_TTL_MS) { ais.views.delete(k); changed = true; }
+  }
+  const same = [...ais.views.values()].find((v) => !boxMovedEnough(v.b, b));
+  if (same) { same.at = now; return changed; }
+  ais.views.set(`${b.south},${b.west},${b.north},${b.east}`, { b, at: now });
+  while (ais.views.size > AIS_MAX_BOXES) ais.views.delete(ais.views.keys().next().value);
+  return true;
+}
 
 function aisBoxesFor(b) {
   // AISStream wants [[[north, west], [south, east]]].
@@ -1767,19 +2322,59 @@ function aisBoxesFor(b) {
 
 function aisSubscribe(b) {
   if (!ais.socket || ais.socket.readyState !== 1) return;
+  const views = [...ais.views.values()].map((v) => v.b);
+  const boxes = views.length ? views : [b || ais.bbox || { south: -90, west: -180, north: 90, east: 180 }];
   ais.socket.send(JSON.stringify({
     APIKey: CFG.aisKey,
-    BoundingBoxes: aisBoxesFor(b),
+    BoundingBoxes: boxes.flatMap(aisBoxesFor),
     FilterMessageTypes: ['PositionReport', 'ShipStaticData', 'StandardClassBPositionReport'],
   }));
-  ais.bbox = b;
+  ais.bbox = b || boxes[boxes.length - 1];
+}
+
+// AISStream sends its JSON in *binary* frames. Node's WebSocket hands those
+// over as a Blob unless told otherwise, and String(blob) is "[object Blob]",
+// so every message was counted, failed to parse, and was dropped without a
+// word: a live stream that never produced a single vessel. Asking for
+// ArrayBuffers and decoding them fixes that; text frames and Blobs (another
+// runtime, a changed default) are still handled.
+const aisDecoder = new TextDecoder();
+
+function aisHandleFrame(data) {
+  if (typeof data === 'string') return aisHandleText(data);
+  if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) return aisHandleText(aisDecoder.decode(data));
+  if (typeof Blob !== 'undefined' && data instanceof Blob) {
+    return data.text().then(aisHandleText, () => { ais.unreadable++; });
+  }
+  ais.unreadable++;
+}
+
+function aisHandleText(text) {
+  let msg;
+  try { msg = JSON.parse(text); } catch {
+    ais.unreadable++;
+    // Say so once, loudly, rather than counting silently forever.
+    if (ais.unreadable === 20 && ais.vessels.size === 0) {
+      log('warn', `AIS: 20 messages could not be read (first: ${clip(String(text), 80)})`);
+    }
+    return;
+  }
+  // A refused subscription (bad key, malformed box) is a JSON {"error": ...}
+  // followed by a close. It has no MMSI, so it used to vanish in aisIngest.
+  if (msg && typeof msg.error === 'string') {
+    ais.error = `AISStream: ${msg.error}`;
+    log('warn', ais.error);
+    return;
+  }
+  aisIngest(msg);
 }
 
 function aisConnect(b) {
   if (!CFG.aisKey) { ais.status = 'disabled'; return; }
+  const changed = b ? aisNoteView(b) : false;
   if (ais.socket && (ais.socket.readyState === 0 || ais.socket.readyState === 1)) {
-    // Already up — just move the subscription if the view shifted materially.
-    if (b && (!ais.bbox || boxMovedEnough(ais.bbox, b))) aisSubscribe(b);
+    // Already up — resubscribe only if the set of views changed materially.
+    if (changed) aisSubscribe(b);
     return;
   }
   if (typeof WebSocket === 'undefined') {
@@ -1791,6 +2386,7 @@ function aisConnect(b) {
   ais.status = 'connecting';
   ais.error = null;
   const ws = new WebSocket('wss://stream.aisstream.io/v0/stream');
+  ws.binaryType = 'arraybuffer';
   ais.socket = ws;
 
   ws.addEventListener('open', () => {
@@ -1803,10 +2399,7 @@ function aisConnect(b) {
 
   ws.addEventListener('message', (ev) => {
     ais.messages++;
-    let msg;
-    try { msg = JSON.parse(typeof ev.data === 'string' ? ev.data : ev.data.toString()); }
-    catch { return; }
-    aisIngest(msg);
+    aisHandleFrame(ev.data);
   });
 
   ws.addEventListener('error', () => {
@@ -1916,6 +2509,8 @@ async function vessels({ bbox }) {
       status: ais.status,
       error: ais.error,
       messages: ais.messages,
+      unreadable: ais.unreadable,
+      watching: ais.views.size,
       uptimeSeconds: ais.connectedAt ? Math.round((Date.now() - ais.connectedAt) / 1000) : 0,
       // The feed needs a moment after subscribing before anything arrives.
       warmingUp: ais.status === 'open' && list.length === 0 && ais.messages < 5,
@@ -1988,17 +2583,19 @@ async function alpr({ bbox, vendor, limit }) {
 
   // Three clauses: the canonical ALPR/ANPR tag, plus Flock units that carry
   // only a manufacturer or brand. Overlaps are de-duplicated by OSM id below.
-  const ql = `[out:json][timeout:40];(`
-    + `nwr["surveillance:type"~"^(ALPR|ANPR)$",i](${bb});`
-    + `nwr["man_made"="surveillance"]["manufacturer"~"flock",i](${bb});`
-    + `nwr["man_made"="surveillance"]["brand"~"flock",i](${bb});`
-    + `);out center ${cap};`;
-
-  // Shares the Overpass queue with the infrastructure layer, so having both
-  // enabled can't put two concurrent queries on the same mirror. TTL.static
-  // like that layer: OSM-sourced and slow-moving.
-  const raw = await cachedPersistent(`alpr:${bb}:${cap}`, TTL.static,
-    () => overpassQuery(ql, 'Overpass (ALPR)'));
+  //
+  // Cached per grid cell like the infrastructure layer, for the same reason:
+  // a cache keyed on the whole view box was only ever reused for exactly that
+  // box, so every other zoom or pan queried Overpass again. It shares the
+  // Overpass queue with that layer, so both on can't put two concurrent
+  // queries on the same mirror. TTL.static: OSM-sourced and slow-moving.
+  const raw = await overpassCells(q, [{
+    key: 'alpr-layer',
+    body: (box) => `nwr["surveillance:type"~"^(ALPR|ANPR)$",i](${box});`
+      + `nwr["man_made"="surveillance"]["manufacturer"~"flock",i](${box});`
+      + `nwr["man_made"="surveillance"]["brand"~"flock",i](${box});`,
+    match: () => true,   // the query is the filter
+  }], cap, 'Overpass (ALPR)', RETAIN['overpass.alpr']);
 
   const seen = new Set();
   let cameras = [];
@@ -2053,6 +2650,8 @@ async function alpr({ bbox, vendor, limit }) {
     const want = new Set(String(vendor).split(',').map((s) => s.trim()));
     cameras = cameras.filter((c) => want.has(c.vendor));
   }
+  const filtered = cameras.length;
+  cameras = nearestFirst(cameras, b, cap);
 
   return {
     count: cameras.length,
@@ -2064,6 +2663,7 @@ async function alpr({ bbox, vendor, limit }) {
     vendors: ALPR_VENDORS.map(({ key, label, color }) => ({ key, label, color })),
     covered: bb,
     trimmed: q.trimmed || false,
+    truncated: raw.truncated || cameras.length < filtered,
     cameras,
   };
 }
@@ -2097,7 +2697,7 @@ async function atlasProbes(raw_b) {
   url.searchParams.set('format', 'json');
   url.searchParams.set('page_size', '500');
 
-  const raw = await cachedPersistent(`atlas:${b.key}`, TTL.static,
+  const raw = await cachedPersistent(`atlas:${b.key}`, RETAIN['network.infrastructure'],
     () => grab(url, {}, { label: 'RIPE Atlas', timeoutMs: 25000 }));
 
   return (raw.results || []).map((p) => {
@@ -2136,7 +2736,7 @@ async function cellTowers(raw_b) {
   url.searchParams.set('format', 'json');
   url.searchParams.set('limit', '50');       // API hard cap per request
 
-  const raw = await cachedPersistent(`cell:${b.key}`, TTL.static,
+  const raw = await cachedPersistent(`cell:${b.key}`, RETAIN['network.infrastructure'],
     () => grab(url, {}, { label: 'OpenCelliD', timeoutMs: 20000 }));
 
   if (raw?.error) throw new UpstreamError(502, `OpenCelliD: ${raw.error}`);
@@ -2173,7 +2773,7 @@ async function wigleNetworks(raw_b) {
   url.searchParams.set('resultsPerPage', '100');
 
   const auth = Buffer.from(`${CFG.wigleName}:${CFG.wigleToken}`).toString('base64');
-  const raw = await cachedPersistent(`wigle:${b.key}`, TTL.static,
+  const raw = await cachedPersistent(`wigle:${b.key}`, RETAIN['network.infrastructure'],
     () => grab(url, { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } },
       { label: 'WiGLE', timeoutMs: 25000 }));
 
@@ -2212,7 +2812,7 @@ async function torRelays(b) {
   url.searchParams.set('running', 'true');
   url.searchParams.set('fields', 'country,country_name,as_name,observed_bandwidth,flags');
 
-  const raw = await cachedPersistent('tor:relays', TTL.static,
+  const raw = await cachedPersistent('tor:relays', RETAIN['network.infrastructure'],
     () => grab(url, {}, { label: 'Onionoo', timeoutMs: 40000 }));
 
   const byCountry = new Map();
@@ -2333,7 +2933,7 @@ async function iotSensors({ bbox, includeIndoor }) {
   // TTL.hazard, not TTL.static: this payload is readings with timestamps, and
   // the UI colours each sensor against the WHO PM2.5 guideline. Held for days
   // it would state three-day-old air quality as the current figure.
-  const raw = await cachedPersistent(`iot:${q.key}`, TTL.hazard,
+  const raw = await cachedPersistent(`iot:${q.key}`, RETAIN['current.sensors'],
     () => grab(url, { headers: { 'User-Agent': USER_AGENT } },
       { label: 'Sensor.Community', timeoutMs: 25000 }));
 
@@ -2408,7 +3008,7 @@ async function iotSensors({ bbox, includeIndoor }) {
 // names servers that are active now, so it takes the `hazard` TTL.
 let feodoIndex = { rows: null, map: null };
 async function feodoSet() {
-  const rows = await cachedPersistent('feodo:rows', TTL.hazard, async () => {
+  const rows = await cachedPersistent('feodo:rows', RETAIN['current.threats'], async () => {
     const list = await grab('https://feodotracker.abuse.ch/downloads/ipblocklist.json',
       {}, { label: 'Feodo Tracker', timeoutMs: 25000 });
     return (Array.isArray(list) ? list : []).filter((r) => r && r.ip_address);
@@ -2484,7 +3084,7 @@ async function iodaOutages() {
   url.searchParams.set('entityType', 'country');
   url.searchParams.set('limit', '40');
 
-  const raw = await cached('ioda:summary', TTL.hazard,
+  const raw = await cached('ioda:summary', RETAIN['current.outages'],
     () => grab(url, {}, { label: 'IODA', timeoutMs: 25000 }));
 
   return (raw.data || [])
@@ -2557,7 +3157,7 @@ async function shakeStations(raw_b) {
     + `&maxlatitude=${b.north.toFixed(3)}&minlongitude=${b.west.toFixed(3)}`
     + `&maxlongitude=${b.east.toFixed(3)}`;
 
-  const text = await cachedPersistent(`shake:${b.key}`, TTL.static,
+  const text = await cachedPersistent(`shake:${b.key}`, RETAIN['places.seismic'],
     () => grab(url, {}, { as: 'text', label: 'Raspberry Shake', timeoutMs: 25000 }));
 
   // FDSN text format: #Network|Station|Latitude|Longitude|Elevation|SiteName|...
@@ -2695,7 +3295,7 @@ async function traffic({ bbox }) {
   const cell = viewCell(b, 'traffic');
   const settled = await Promise.allSettled(
     states.map(([state, key]) =>
-      cached(`511:${state}:${cell.key}`, TTL.hazard,
+      cached(`511:${state}:${cell.key}`, RETAIN['current.traffic'],
         () => fiveElevenState(state, key, cell))),
   );
 
@@ -2777,7 +3377,7 @@ async function flightRoute({ callsign }) {
   // Date-scoped as well as short-lived: the TTL bounds staleness within a
   // day, and the key guarantees a stored answer can never bleed across one.
   const day = new Date().toISOString().slice(0, 10);
-  return cachedPersistent(`route:${cs}:${day}`, TTL.schedule, async () => {
+  return cachedPersistent(`route:${cs}:${day}`, RETAIN['aircraft.routes'], async () => {
     let raw;
     try {
       raw = await grab(`https://api.adsbdb.com/v0/callsign/${encodeURIComponent(cs)}`,
@@ -2810,7 +3410,7 @@ async function flightRoute({ callsign }) {
 async function aircraftInfo({ icao24 }) {
   const hex = String(icao24 || '').trim().toLowerCase().replace(/[^0-9a-f]/g, '');
   if (hex.length !== 6) throw new UpstreamError(400, 'icao24 hex required');
-  return cachedPersistent(`ac:${hex}`, TTL.static, async () => {
+  return cachedPersistent(`ac:${hex}`, RETAIN['aircraft.airframes'], async () => {
     try {
       const raw = await grab(`https://api.adsbdb.com/v0/aircraft/${hex}`,
         {}, { label: 'adsbdb aircraft', timeoutMs: 15000 });
@@ -2914,7 +3514,7 @@ async function imagery({ layer, date }) {
 // ---------------------------------------------------------------------------
 
 async function weather() {
-  return cached('weather:frames', TTL.live, async () => {
+  return cached('weather:frames', RETAIN['current.radar'], async () => {
     const j = await grab('https://api.rainviewer.com/public/weather-maps.json',
       {}, { label: 'RainViewer', timeoutMs: 15000 });
 
@@ -3013,7 +3613,7 @@ async function windyWebcams(b) {
 
 async function nycWebcams(b) {
   // NYC DOT publishes its traffic camera roster openly, no key required.
-  const raw = await cachedPersistent('cams:nyc', TTL.static, () =>
+  const raw = await cachedPersistent('cams:nyc', RETAIN['cameras.directories'], () =>
     grab('https://webcams.nyctmc.org/api/cameras', {}, { label: 'NYC DOT' }));
   const list = Array.isArray(raw) ? raw : (raw.cameras || raw.results || []);
   return list
@@ -3074,7 +3674,7 @@ function normaliseOwcdb(w) {
 
 async function owcdbCatalogue() {
   if (!CFG.owcdbKey) return [];
-  return cachedPersistent('cams:owcdb:all', TTL.static, async () => {
+  return cachedPersistent('cams:owcdb:all', RETAIN['cameras.directories'], async () => {
     const headers = { Authorization: `Bearer ${CFG.owcdbKey}`, Accept: 'application/json' };
     const out = [];
     const seen = new Set();
@@ -3124,7 +3724,7 @@ const ALERTCA_URL = 'https://services8.arcgis.com/X84q166Srnyl4JMV/arcgis/rest/s
   + '/ALERTCalifornia_Camera_Feed/FeatureServer/0/query';
 
 async function alertCaWebcams(b) {
-  const raw = await cachedPersistent('cams:alertca', TTL.static, async () => {
+  const raw = await cachedPersistent('cams:alertca', RETAIN['cameras.directories'], async () => {
     const url = new URL(ALERTCA_URL);
     url.searchParams.set('where', '1=1');
     url.searchParams.set('outFields',
@@ -3238,7 +3838,7 @@ async function gdacsEvents(b) {
   url.searchParams.set('toDate', iso(to));
   url.searchParams.set('alertlevel', 'Green;Orange;Red');
 
-  const raw = await cached('ev:gdacs', TTL.hazard, () =>
+  const raw = await cached('ev:gdacs', RETAIN['current.events'], () =>
     grab(url, {}, { label: 'GDACS', timeoutMs: 30000 }));
 
   return (raw.features || []).map((f) => {
@@ -3277,7 +3877,7 @@ async function eonetEvents(view) {
   url.searchParams.set('bbox', `${b.west},${b.north},${b.east},${b.south}`);
 
   const key = `ev:eonet:${b.key}`;
-  const raw = await cached(key, TTL.hazard, () =>
+  const raw = await cached(key, RETAIN['current.events'], () =>
     grab(url, {}, { label: 'EONET', timeoutMs: 25000 }));
 
   return (raw.features || []).map((f) => {
@@ -3316,7 +3916,7 @@ async function eonetEvents(view) {
 
 /* --- USGS ------------------------------------------------------------ */
 async function usgsEvents(b) {
-  const raw = await cached('ev:usgs', TTL.hazard, () =>
+  const raw = await cached('ev:usgs', RETAIN['current.events'], () =>
     grab('https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_day.geojson',
       {}, { label: 'USGS', timeoutMs: 25000 }));
 
@@ -3356,7 +3956,7 @@ async function nwsEvents(b) {
   url.searchParams.set('status', 'actual');
   url.searchParams.set('message_type', 'alert');
 
-  const raw = await cached('ev:nws', TTL.hazard, () =>
+  const raw = await cached('ev:nws', RETAIN['current.events'], () =>
     grab(url, {
       headers: {
         Accept: 'application/geo+json',
@@ -3424,7 +4024,7 @@ async function firmsEvents(view) {
   const url = `https://firms.modaps.eosdis.nasa.gov/api/area/csv/${encodeURIComponent(CFG.firmsKey)}`
     + `/VIIRS_SNPP_NRT/${area}/2`;
 
-  const text = await cached(`ev:firms:${area}`, TTL.hazard, () =>
+  const text = await cached(`ev:firms:${area}`, RETAIN['current.events'], () =>
     grab(url, {}, { as: 'text', label: 'FIRMS', timeoutMs: 30000 }));
 
   if (/Invalid|error/i.test(text.slice(0, 120)) && !text.includes('latitude')) {
@@ -3470,7 +4070,7 @@ async function firmsEvents(view) {
 /* --- RSOE EDIS (enterprise, opt-in) ---------------------------------- */
 async function edisEvents(b) {
   if (!CFG.edisUrl) return [];
-  const raw = await cached('ev:edis', TTL.hazard, () =>
+  const raw = await cached('ev:edis', RETAIN['current.events'], () =>
     grab(CFG.edisUrl, {
       headers: CFG.edisKey ? { Authorization: `Bearer ${CFG.edisKey}` } : {},
     }, { label: 'RSOE EDIS', timeoutMs: 30000 }));
@@ -3566,7 +4166,7 @@ async function geocode({ q }) {
 
   // Memory only: the key is whatever was typed into the search box, and an
   // on-disk copy would be a search history that outlives the session.
-  const raw = await cached(`geo:${query.toLowerCase()}`, TTL.static, () =>
+  const raw = await cached(`geo:${query.toLowerCase()}`, RETAIN['places.geocode'], () =>
     grab(url, {
       headers: { 'User-Agent': USER_AGENT },
     }, { label: 'Nominatim' }));
@@ -3719,9 +4319,24 @@ const SECURITY_HEADERS = {
 //  - connect-src stays https: because the browser fetches map tiles itself
 //    from hosts that are configurable (TITILER_URL, SHORTBREAD_URL) and from
 //    Cesium Ion's CDN.
+//  - The one http exception: Cesium World Imagery is Bing aerial tiles, and
+//    Cesium asks Bing for tile URLs in the page's own scheme. Served from
+//    http://localhost that means http:// tile URLs, which an https-only
+//    policy blocks tile by tile, leaving a bare blue globe. Only Bing's tile
+//    hosts are allowed over http.
 //  - frame-src stays https: because webcam players come from whatever host a
 //    camera directory names. Those frames are cross-origin and sandboxed
 //    (see WebcamLayer.enrich), so they cannot reach this page.
+const BING_TILES_HTTP = 'http://*.tiles.virtualearth.net';
+// The tile ports (see "Tile ports") are other origins as far as the browser
+// is concerned, so a page served as host:PORT may also load from host:PORT+n.
+const cspFor = (host) => {
+  const name = String(host || '').replace(/:\d+$/, '');
+  const extra = name && tilePortsLive.length
+    ? ' ' + tilePortsLive.map((p) => `http://${name}:${p}`).join(' ') : '';
+  return CSP.replace(`img-src 'self'`, `img-src 'self'${extra}`)
+    .replace(`connect-src 'self'`, `connect-src 'self'${extra}`);
+};
 const CSP = [
   "default-src 'self'",
   "script-src 'self' 'unsafe-eval' https://cdnjs.cloudflare.com",
@@ -3729,9 +4344,9 @@ const CSP = [
   "worker-src 'self' blob: https://cdnjs.cloudflare.com",
   "style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://fonts.googleapis.com",
   "font-src 'self' data: https://fonts.gstatic.com https://cdnjs.cloudflare.com",
-  "img-src 'self' data: blob: https:",
+  `img-src 'self' data: blob: https: ${BING_TILES_HTTP}`,
   "media-src 'self' blob: https:",
-  "connect-src 'self' data: blob: https:",
+  `connect-src 'self' data: blob: https: ${BING_TILES_HTTP}`,
   'frame-src https:',
   "object-src 'none'",
   "base-uri 'none'",
@@ -3846,7 +4461,7 @@ async function sentinelScenes({ bbox, from, to, maxCloud, limit }) {
   };
 
   const key = `stac:${JSON.stringify(body)}`;
-  const raw = await cachedPersistent(key, TTL.static, () => grab(STAC_SEARCH, {
+  const raw = await cachedPersistent(key, RETAIN['maps.scenes'], () => grab(STAC_SEARCH, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
@@ -4183,6 +4798,20 @@ const ROUTES = {
     cesiumIonToken: CFG.cesiumIonToken || null,
     // Only whether labels can be drawn; the CARTO key itself stays here.
     cartoLabels: !!CFG.cartoKey,
+    // Tile hosts the browser should fetch through the disk cache.
+    tileCache: { hosts: tileCacheHosts(), ports: tilePortsLive },
+    // How long the browser should treat a view as already fetched, per
+    // layer, so it does not re-ask the server about what it still holds.
+    retention: {
+      shodan: RETAIN['shodan.hosts'],
+      overpass: RETAIN['overpass.infrastructure'],
+      alpr: RETAIN['overpass.alpr'],
+      netinfra: RETAIN['network.infrastructure'],
+      webcams: RETAIN['cameras.directories'],
+      events: RETAIN['current.events'],
+      iot: RETAIN['current.sensors'],
+      traffic: RETAIN['current.traffic'],
+    },
   }),
   // A free-form query (q=) is accepted only by POST — see apiAllowed().
   '/api/shodan': (q) => shodanSearch({ bbox: q.get('bbox'), preset: q.get('preset'), custom: q.get('q') }),
@@ -4228,6 +4857,245 @@ const ROUTES = {
 };
 
 // ---------------------------------------------------------------------------
+// Map tile disk cache
+// ---------------------------------------------------------------------------
+//
+// Base-map and imagery tiles, kept on disk for TTL.tile (a month) so that
+// returning to a place, a reload or a restart is drawn from here rather than
+// fetched again. The browser asks /tiles/cache?u=<tile url>; this fetches the
+// tile once, stores it under providers/tiles, and serves the copy until it
+// expires. Expired tiles are deleted when read and swept by pruneTileCache()
+// at startup and every six hours, which also keeps the folder under
+// TILE_CACHE_MAX_MB by dropping the oldest tiles first.
+//
+// Only known tile sources are fetched, each limited to its tile paths: an
+// open "fetch any URL for me" endpoint would let any page that can reach
+// this server use it as a proxy. Weather radar is deliberately absent; a
+// radar frame is a moment, not a map, and is useless within the hour.
+
+const TILE_DIR = path.join(PROVIDERS_DIR, 'tiles');
+// maps.tiles and maps.tiles_max_size in cache.conf.
+const tileMaxAge = () => RETAIN['maps.tiles'];
+const TILE_MAX_BYTES = 8 * 1024 * 1024;   // no real tile is this big
+
+/** A configured URL template's host and the path prefix its tiles live under. */
+function templateSource(template, label) {
+  try {
+    const u = new URL(template.replace(/\{[^}]+\}/g, '0'));
+    const raw = new URL(template.split('{')[0]);
+    const prefix = decodeURIComponent(raw.pathname);
+    return [{ label, hosts: [u.host], path: (p) => p.startsWith(prefix) }];
+  } catch {
+    return [];
+  }
+}
+
+const TILE_SOURCES = [
+  // Cesium World Imagery: Bing aerial tiles, quadkey addressed.
+  { label: 'Bing aerial', hosts: [0, 1, 2, 3, 4, 5, 6, 7].map((n) => `ecn.t${n}.tiles.virtualearth.net`),
+    path: (p) => /^\/tiles\/[a-z]\d{1,30}\.(jpeg|png)$/.test(p) },
+  { label: 'OpenStreetMap', hosts: ['tile.openstreetmap.org'],
+    path: (p) => /^\/\d{1,2}\/\d{1,7}\/\d{1,7}\.png$/.test(p) },
+  // The location inset's aerial style.
+  { label: 'Esri imagery', hosts: ['server.arcgisonline.com'],
+    path: (p) => p.startsWith('/ArcGIS/rest/services/World_Imagery/MapServer/tile/') },
+  { label: 'NASA GIBS', hosts: ['gibs.earthdata.nasa.gov'], path: (p) => p.startsWith('/wmts/') },
+  ...templateSource(SHORTBREAD_URL, 'Shortbread'),
+  ...templateSource(`${TITILER}/cog/tiles/{z}`, 'TiTiler'),
+];
+
+/** Hosts whose tiles the browser should ask for through /tiles/cache. */
+function tileCacheHosts() {
+  return [...new Set(TILE_SOURCES.flatMap((s) => s.hosts))];
+}
+
+/** The tile source a URL belongs to, or null if this server will not fetch it. */
+function tileSourceFor(raw) {
+  let u;
+  try { u = new URL(raw); } catch { return null; }
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') return null;
+  if (u.username || u.password) return null;
+  return TILE_SOURCES.find((s) => s.hosts.includes(u.host) && s.path(u.pathname)) || null;
+}
+
+// Named by a hash of the address, never the address itself, in keeping with
+// the answer cache: the folder should not read as a list of places looked at.
+// Sharded by the first two hex digits so no one directory holds them all.
+function tileFile(key) {
+  const h = crypto.createHash('sha1').update(`openpanopticon:${key}`).digest('hex');
+  return path.join(TILE_DIR, h.slice(0, 2), `${h}.tile`);
+}
+
+/**
+ * A stored tile, or null. One file per tile: a header line
+ * "<status> <content-type>" and then the bytes. The age is the file's mtime,
+ * which is when it was fetched; reading it does not renew it, so a tile is
+ * re-fetched a month after it was downloaded however often it is used.
+ */
+async function readTile(key, now = Date.now()) {
+  const file = tileFile(key);
+  let st;
+  try { st = await fsp.stat(file); } catch { return null; }
+  if (now - st.mtimeMs > tileMaxAge()) {
+    await fsp.unlink(file).catch(() => {});
+    return null;
+  }
+  try {
+    const buf = await fsp.readFile(file);
+    const nl = buf.indexOf(10);
+    if (nl < 0 || nl > 200) return null;
+    const [code, type] = buf.subarray(0, nl).toString('utf8').split(' ');
+    const status = Number(code);
+    if (!Number.isInteger(status)) return null;
+    return { status, type: type || 'application/octet-stream', body: buf.subarray(nl + 1) };
+  } catch {
+    return null;
+  }
+}
+
+async function writeTile(key, { status, type, body }) {
+  if (!(tileMaxAge() > 0)) return;   // maps.tiles = 0: do not keep tiles
+  const file = tileFile(key);
+  try {
+    await fsp.mkdir(path.dirname(file), { recursive: true });
+    // Write then rename, so a crash mid-write never leaves half a tile.
+    const tmp = `${file}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
+    await fsp.writeFile(tmp, Buffer.concat([Buffer.from(`${status} ${type}\n`), body]));
+    await fsp.rename(tmp, file);
+  } catch (e) {
+    log('warn', `could not store tile: ${e.message}`);
+  }
+}
+
+const tileInflight = new Map();
+const TILE_TYPE_RE = /^(image\/[\w.+-]+|application\/(x-protobuf|vnd\.mapbox-vector-tile|octet-stream))$/;
+
+/**
+ * A tile from disk, or fetched and stored. `fetcher` returns the upstream
+ * Response. "Nothing here" (204/404, which vector sources answer over open
+ * ocean) is stored too, so empty tiles are not asked for again either.
+ */
+async function cachedTile(key, fetcher) {
+  if (tileInflight.has(key)) return tileInflight.get(key);
+  const p = (async () => {
+    const hit = await readTile(key);
+    if (hit) return { ...hit, cache: 'hit' };
+    let res;
+    try {
+      res = await fetcher();
+    } catch (err) {
+      throw err instanceof UpstreamError ? err : new UpstreamError(504, `tile source unreachable: ${err.message}`);
+    }
+    if (res.status === 204 || res.status === 404) {
+      const rec = { status: res.status, type: 'text/plain', body: Buffer.alloc(0) };
+      await writeTile(key, rec);
+      return { ...rec, cache: 'miss' };
+    }
+    if (!res.ok) throw new UpstreamError(res.status, `tile source returned HTTP ${res.status}`);
+    const type = (res.headers.get('content-type') || 'application/octet-stream').split(';')[0].trim().toLowerCase();
+    if (!TILE_TYPE_RE.test(type)) throw new UpstreamError(502, `tile source returned ${type}, not a tile`);
+    const body = Buffer.from(await res.arrayBuffer());
+    if (body.length > TILE_MAX_BYTES) throw new UpstreamError(502, 'tile source returned an oversized tile');
+    const rec = { status: 200, type, body };
+    await writeTile(key, rec);
+    return { ...rec, cache: 'miss' };
+  })().finally(() => tileInflight.delete(key));
+  tileInflight.set(key, p);
+  return p;
+}
+
+function fetchTileUpstream(url, headers = {}) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 15000);
+  // No redirects: a source on the list must not be able to bounce this
+  // server to an address that is not.
+  return fetch(url, { headers: { 'User-Agent': USER_AGENT, ...headers }, redirect: 'error', signal: ac.signal })
+    .finally(() => clearTimeout(timer));
+}
+
+function sendTile(res, t) {
+  const headers = {
+    ...SECURITY_HEADERS,
+    // The browser keeps its own copy for a day on top of the disk one.
+    'Cache-Control': `public, max-age=${Math.round(RETAIN['maps.browser'] / 1000)}`,
+    'X-Tile-Cache': t.cache || 'hit',
+  };
+  if (t.status !== 200) {
+    res.writeHead(t.status, { ...headers, 'Content-Length': 0 }).end();
+    return;
+  }
+  res.writeHead(200, { ...headers, 'Content-Type': t.type, 'Content-Length': t.body.length });
+  res.end(t.body);
+}
+
+async function serveCachedTile(req, res, url, { trusted = false } = {}) {
+  if (!trusted && !fromOwnPage(req)) {
+    res.writeHead(403, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain' })
+      .end('Tiles are served to this app\'s own page only');
+    return;
+  }
+  const raw = url.searchParams.get('u') || '';
+  if (!tileSourceFor(raw)) {
+    res.writeHead(400, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain' })
+      .end('Not a tile source this server caches');
+    return;
+  }
+  try {
+    sendTile(res, await cachedTile(`tile:${raw}`, () => fetchTileUpstream(raw)));
+  } catch (err) {
+    const status = err instanceof UpstreamError ? err.status : 502;
+    res.writeHead(status, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain' }).end(err.message);
+  }
+}
+
+/**
+ * Delete expired tiles, and the oldest beyond the size cap.
+ *
+ * Runs at startup and every six hours. Without it a month-old tile would
+ * only go when that exact tile was asked for again, and a place visited once
+ * would sit on disk for good.
+ */
+async function pruneTileCache({ now = Date.now(), maxBytes = RETAIN['maps.tiles_max_size'] } = {}) {
+  let shards;
+  try { shards = await fsp.readdir(TILE_DIR); } catch { return { removed: 0, kept: 0, bytes: 0 }; }
+  let removed = 0;
+  const live = [];
+  for (const shard of shards) {
+    const dir = path.join(TILE_DIR, shard);
+    let names;
+    try { names = await fsp.readdir(dir); } catch { continue; }
+    for (const name of names) {
+      const file = path.join(dir, name);
+      try {
+        const st = await fsp.stat(file);
+        if (!st.isFile()) continue;
+        const age = now - st.mtimeMs;
+        if (name.endsWith('.tmp')) {
+          // A write that never got renamed; give a live one an hour.
+          if (age > 60 * 60_000) { await fsp.unlink(file); removed++; }
+          continue;
+        }
+        if (age > tileMaxAge()) { await fsp.unlink(file); removed++; continue; }
+        live.push({ file, mtime: st.mtimeMs, size: st.size });
+      } catch { /* already gone */ }
+    }
+    try { if ((await fsp.readdir(dir)).length === 0) await fsp.rmdir(dir); } catch { /* in use */ }
+  }
+  let bytes = live.reduce((a, t) => a + t.size, 0);
+  let kept = live.length;
+  if (bytes > maxBytes) {
+    // Down to 90%, so the cap is not hit again by the next few tiles.
+    live.sort((a, b) => a.mtime - b.mtime);
+    for (const t of live) {
+      if (bytes <= maxBytes * 0.9) break;
+      try { await fsp.unlink(t.file); bytes -= t.size; kept--; removed++; } catch { /* gone */ }
+    }
+  }
+  return { removed, kept, bytes };
+}
+
+
+// ---------------------------------------------------------------------------
 // CARTO label tiles, proxied
 //
 // Since 25 Sep 2026 CARTO serves raster basemaps only with a key, and
@@ -4237,7 +5105,7 @@ const ROUTES = {
 // ---------------------------------------------------------------------------
 
 const CARTO_TILE_RE = /^\/tiles\/carto\/(dark_only_labels|light_only_labels)\/(\d{1,2})\/(\d{1,7})\/(\d{1,7})(@2x)?\.png$/;
-const CARTO_CACHE_MAX = 3000;
+const cartoCacheMax = () => RETAIN['memory.label_tiles'] ?? 3000;   // cache.conf
 const cartoCache = new Map();   // path -> Buffer, insertion order = LRU
 
 /**
@@ -4256,8 +5124,8 @@ function fromOwnPage(req) {
   return site === undefined || site === 'same-origin' || site === 'none';
 }
 
-async function serveCartoTile(req, res, m) {
-  if (!fromOwnPage(req)) {
+async function serveCartoTile(req, res, m, { trusted = false } = {}) {
+  if (!trusted && !fromOwnPage(req)) {
     res.writeHead(403, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain' })
       .end('Tiles are served to this app\'s own page only');
     return;
@@ -4281,15 +5149,24 @@ async function serveCartoTile(req, res, m) {
     // so a key restricted to it still works, without forwarding the browser's
     // full page URL upstream.
     const headers = { Referer: `http://${req.headers.host}/` };
-    buf = await grab(upstream, { headers }, { as: 'buffer', label: 'CARTO', timeoutMs: 15000 });
+    // On disk for a month like every other tile, keyed without the API key.
+    const t = await cachedTile(`carto:${key}`, async () => {
+      const r = await fetchTileUpstream(upstream, headers);
+      if (!r.ok && r.status !== 404 && r.status !== 204) {
+        throw new UpstreamError(r.status, `CARTO returned HTTP ${r.status}`);
+      }
+      return r;
+    });
+    if (t.status !== 200) { sendTile(res, t); return; }
+    buf = t.body;
     cartoCache.set(key, buf);
-    if (cartoCache.size > CARTO_CACHE_MAX) cartoCache.delete(cartoCache.keys().next().value);
+    while (cartoCache.size > cartoCacheMax() && cartoCache.size) cartoCache.delete(cartoCache.keys().next().value);
   }
   res.writeHead(200, {
     ...SECURITY_HEADERS,
     'Content-Type': 'image/png',
     'Content-Length': buf.length,
-    'Cache-Control': 'public, max-age=86400',
+    'Cache-Control': `public, max-age=${Math.round(RETAIN['maps.browser'] / 1000)}`,
   });
   res.end(buf);
 }
@@ -4306,7 +5183,7 @@ async function serveStatic(req, res, pathname) {
     const ext = path.extname(target);
     res.writeHead(200, {
       ...SECURITY_HEADERS,
-      ...(ext === '.html' ? { 'Content-Security-Policy': CSP } : {}),
+      ...(ext === '.html' ? { 'Content-Security-Policy': cspFor(req.headers.host) } : {}),
       'Content-Type': MIME[ext] || 'application/octet-stream',
       'Content-Length': data.length,
       'Cache-Control': 'no-cache',
@@ -4335,6 +5212,103 @@ function loggable(url) {
   return `${url.pathname}?${pairs.join('&')}`;
 }
 
+// ---------------------------------------------------------------------------
+// Tile ports
+// ---------------------------------------------------------------------------
+//
+// A browser opens at most six HTTP/1.1 connections to one host:port. With
+// every map tile coming through the disk cache, tiles shared those six with
+// the API — and an Overpass or OpenSky call can hold one for many seconds —
+// where Bing alone had offered four hosts and twenty-four connections. So
+// the tile routes are also served on TILE_PORTS extra ports (PORT+1 …), each
+// a separate six as far as the browser is concerned. Only the tile routes
+// answer there. A port that cannot be bound is skipped, and with none the
+// page simply uses the main port. Loopback-bound servers only; see
+// startTilePorts().
+
+const TILE_PORT_COUNT = clamp(Number.parseInt(process.env.TILE_PORTS ?? '4', 10) || 0, 0, 8);
+const tilePortsLive = [];      // the ones actually listening
+const tileServers = [];
+
+/** The main-port host a tile-port Host header stands for, or null. */
+function mainHostFor(host) {
+  const m = /^(.*):(\d+)$/.exec(String(host || '').toLowerCase());
+  if (!m || !tilePortsLive.includes(Number(m[2]))) return null;
+  return `${m[1]}:${CFG.port}`;
+}
+
+async function serveTilePort(req, res) {
+  const main = mainHostFor(req.headers.host);
+  if (!main || !ALLOWED_HOSTS.has(main)) {
+    res.writeHead(421, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain' }).end('Misdirected request');
+    return;
+  }
+  // Same page only: the request must come from this app on its main port.
+  // Image and fetch requests from it carry an Origin; plain <img>s a Referer.
+  let from = req.headers.origin || null;
+  if (!from && req.headers.referer) { try { from = new URL(req.headers.referer).origin; } catch { /* none */ } }
+  const ok = from === `http://${main}` || from === `https://${main}`;
+  if (!ok) {
+    res.writeHead(403, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain' })
+      .end('Tiles are served to this app\'s own page only');
+    return;
+  }
+  res.setHeader('Access-Control-Allow-Origin', from);
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  res.setHeader('Vary', 'Origin');
+  if (req.method === 'OPTIONS') { res.writeHead(204).end(); return; }
+  if (ACCESS_KEY) {
+    const held = cookieValue(req, ACCESS_COOKIE);
+    if (!held || !sameSecret(held, ACCESS_KEY)) {
+      res.writeHead(401, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain' }).end('Access key required');
+      return;
+    }
+  }
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  try {
+    if (url.pathname === '/tiles/ping') { res.writeHead(204, SECURITY_HEADERS).end(); return; }
+    if (url.pathname === '/tiles/cache') { await serveCachedTile(req, res, url, { trusted: true }); return; }
+    const carto = CARTO_TILE_RE.exec(url.pathname);
+    if (carto) { await serveCartoTile(req, res, carto, { trusted: true }); return; }
+    res.writeHead(404, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain' }).end('Tile routes only on this port');
+  } catch (err) {
+    const status = err instanceof UpstreamError ? err.status : 500;
+    if (!res.headersSent) res.writeHead(status, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain' });
+    res.end(err.message);
+  }
+}
+
+/** Close the tile ports (shutdown, tests). */
+function stopTilePorts() {
+  return Promise.all(tileServers.splice(0).map((t) => new Promise((resolve) => {
+    t.closeAllConnections?.();
+    t.close(() => resolve());
+  }))).then(() => { tilePortsLive.length = 0; });
+}
+
+/** Open the tile ports. Resolves once each has listened or failed. */
+function startTilePorts() {
+  // Loopback only. Beyond this machine every request needs the access
+  // cookie, and Cesium sends cookies to other origins only for servers it is
+  // told to trust ahead of time, which a tile URL it rewrites is not.
+  if (ACCESS_KEY) return Promise.resolve();
+  const ports = Array.from({ length: TILE_PORT_COUNT }, (_, i) => CFG.port + 1 + i);
+  return Promise.all(ports.map((port) => new Promise((resolve) => {
+    const srv = http.createServer((req, res) => { serveTilePort(req, res); });
+    srv.keepAliveTimeout = 30_000;
+    srv.once('error', (e) => {
+      log('warn', `tile port ${port} unavailable (${e.code || e.message}); tiles use the main port`);
+      resolve();
+    });
+    srv.listen(port, CFG.host, () => {
+      tilePortsLive.push(port);
+      tilePortsLive.sort((a, b) => a - b);
+      tileServers.push(srv);
+      resolve();
+    });
+  })));
+}
+
 const server = http.createServer(async (req, res) => {
   const started = Date.now();
   if (!gate(req, res)) return;
@@ -4347,6 +5321,9 @@ const server = http.createServer(async (req, res) => {
   // 5s, and say so when the browser gives up first.
   let settled = false;
   let slowTimer = null;
+  // Aborted when the browser hangs up first, so queued upstream work that
+  // has not started yet can be dropped instead of spending a rate limit.
+  const gone = new AbortController();
   if (pathname.startsWith('/api/')) {
     slowTimer = setTimeout(() => {
       if (!settled) log('req', `${loggable(url)} still running after 5s…`);
@@ -4354,6 +5331,7 @@ const server = http.createServer(async (req, res) => {
     res.on('close', () => {
       if (settled) return;
       settled = true;
+      gone.abort();
       clearTimeout(slowTimer);
       log('warn', `${pathname} — browser disconnected after `
         + `${Math.round((Date.now() - started) / 1000)}s; the work continues and its `
@@ -4363,6 +5341,10 @@ const server = http.createServer(async (req, res) => {
   const done = () => { settled = true; clearTimeout(slowTimer); };
 
   try {
+    if (pathname === '/tiles/cache') {
+      await serveCachedTile(req, res, url);
+      return;
+    }
     const cartoTile = CARTO_TILE_RE.exec(pathname);
     if (cartoTile) {
       await serveCartoTile(req, res, cartoTile);
@@ -4372,7 +5354,7 @@ const server = http.createServer(async (req, res) => {
     const handler = ROUTES[pathname];
     if (handler) {
       const fresh = url.searchParams.get('fresh') === '1';
-      const payload = await reqCtx.run({ fresh }, () => handler(url.searchParams));
+      const payload = await reqCtx.run({ fresh, signal: gone.signal }, () => handler(url.searchParams));
       done();
       sendJson(res, 200, payload);
       log('req', `${loggable(url)} -> 200 (${Date.now() - started}ms)`);
@@ -4426,9 +5408,30 @@ const prune = () => pruneDiskCache().then(({ removed, rewritten }) => {
 }).catch(() => {});
 prune();
 setInterval(prune, 6 * 60 * 60_000).unref();
+// Map tiles: a month on disk, then gone, on the same schedule.
+const pruneTiles = () => pruneTileCache().then(({ removed, kept, bytes }) => {
+  if (removed) log('info', `tile cache: removed ${removed}, kept ${kept} (${Math.round(bytes / 1048576)} MB)`);
+}).catch(() => {});
+pruneTiles();
+setInterval(pruneTiles, 6 * 60 * 60_000).unref();
 // The shortest TTL is minutes, so the memory tier is swept far more often.
 setInterval(sweepCache, 10 * 60_000).unref();
 
+// cache.conf: write it with the defaults if there is none, say what could not
+// be used, and re-read it whenever it is saved.
+if (!fs.existsSync(CACHE_CONF_FILE)) {
+  try { fs.writeFileSync(CACHE_CONF_FILE, cacheConfText(), 'utf8'); log('info', `wrote ${path.basename(CACHE_CONF_FILE)} with the default cache retention`); }
+  catch (e) { log('warn', `could not write ${CACHE_CONF_FILE}: ${e.message}`); }
+}
+for (const p of cacheConfProblems) log('warn', `cache.conf ${p} — using the default`);
+fs.watchFile(CACHE_CONF_FILE, { interval: 2000 }, (cur, prev) => {
+  if (cur.mtimeMs === prev.mtimeMs) return;
+  const { problems } = loadCacheConf();
+  log('info', `cache.conf reloaded${problems.length ? ` (${problems.length} problem${problems.length > 1 ? 's' : ''})` : ''}`);
+  for (const p of problems) log('warn', `cache.conf ${p} — using the default`);
+});
+
+startTilePorts();
 server.listen(CFG.port, CFG.host, () => {
   const ok = (b) => (b ? `${C.grn}ready${C.rst}` : `${C.yel}not configured${C.rst}`);
   console.log(`
@@ -4480,6 +5483,7 @@ ${ACCESS_KEY ? `  ${C.yel}!${C.rst} Listening on ${CFG.host}, beyond this machin
 function shutdown(signal) {
   console.log(`\n  shutting down (${signal})`);
   try { ais.socket?.close(); } catch { /* already closed */ }
+  for (const t of tileServers) { t.close(); t.closeAllConnections?.(); }
   server.close(() => process.exit(0));
   server.closeAllConnections?.();
   setTimeout(() => process.exit(0), 3000).unref();
@@ -4493,19 +5497,31 @@ if (require.main === module) start();
 // For the test suite. Nothing in the app imports these.
 module.exports = {
   server, start, CFG, TTL, ROUTES, PROVIDERS_DIR, DISK_CACHE_DIR, TLE_DIR,
-  cache, inflight, cached, sweepCache, CACHE_MAX_ENTRIES, cachedPersistent, readDiskCache, writeDiskCache, clearDiskCache,
-  pruneDiskCache, diskName, diskKeyHash, DISK_MAX_AGE,
-  reqCtx, wantsFresh, isCached,
+  cache, inflight, cached, sweepCache, cachedPersistent, readDiskCache, writeDiskCache, clearDiskCache,
+  pruneDiskCache, diskName, diskKeyHash,
+  RETAIN, CACHE_SCHEMA, loadCacheConf, cacheConfText, parseDuration, parseSize, diskMaxAge,
+  reqCtx, wantsFresh, isCached, peekCached, overpassCellsOf, overpassBackoffMs, overpassLimits, nearestFirst,
   parse511, loadDotEnv, clip, htmlText, refusalReason, UpstreamError, grab, USER_AGENT,
   parseBbox, clamp, bboxCenter, bboxRadiusKm, snapFixed, viewCell, VIEW_CELL_DEG, VIEW_MAX_DEG,
   boxContains, shodanIndex, findBoughtShodanBox, rememberShodanBox, serviceCategory, SHODAN_PRESETS, SHODAN_CELL_DEG,
   openSky, openSkyPollSec, openSkyRefillSec, noteOpenSkyHeaders, assertOpenSkyCredit, OPENSKY_FLOOR,
   SAT_GROUPS, fetchTle, readCachedTle, writeCachedTle, tleCachePath,
   overpassGate, overpassQuery, mirrorFailure, OVERPASS_PRESETS, OVERPASS_ENDPOINTS,
+  parseOverpassStatus, overpassDense,
   ais, aisIngest, aisConnect, aisBoxesFor, boxMovedEnough, shipTypeName,
   parseDirections, vendorOf, ALPR_VENDORS, airQualityBand, parseCsv,
   feodoSet, greyNoiseLookup, enrich, normaliseOwcdb, cloudSource, gibsTemplate, gibsDefaultDate,
   GIBS_LAYERS, COUNTRY_CENTROIDS, FIVE_ELEVEN_HOSTS, basemapProviders, sentinelTileTemplate,
   safeUrl, sameSecret, cookieValue, gate, apiAllowed, ALLOWED_HOSTS, ACCESS_KEY, fromOwnPage, loggable,
-  SECURITY_HEADERS, CSP, MIME, cartoCache, log,
+  SECURITY_HEADERS, CSP, cspFor, MIME, cartoCache, log,
+  tilePortsLive, startTilePorts, stopTilePorts, serveTilePort, mainHostFor,
+  TILE_DIR, tileMaxAge, TILE_SOURCES, tileSourceFor, tileCacheHosts, tileFile, readTile, writeTile,
+  cachedTile, pruneTileCache,
 };
+
+// Read at call time, so a cache.conf edit shows through to the tests too.
+Object.defineProperties(module.exports, {
+  DISK_MAX_AGE: { get: diskMaxAge, enumerable: true },
+  TILE_MAX_AGE: { get: tileMaxAge, enumerable: true },
+  CACHE_MAX_ENTRIES: { get: cacheMaxEntries, enumerable: true },
+});

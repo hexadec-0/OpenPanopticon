@@ -26,7 +26,14 @@ async function launch(extraEnv = {}, envFileText = null) {
   if (envFileText != null) fs.writeFileSync(envFile, envFileText);
   const port = await freePort();
   const child = spawn(process.execPath, [SERVER], {
-    env: cleanEnv({ PORT: String(port), OPENPANOPTICON_DATA_DIR: dir, OPENPANOPTICON_ENV_FILE: envFile, NO_COLOR: '1', ...extraEnv }),
+    env: cleanEnv({
+      PORT: String(port), OPENPANOPTICON_DATA_DIR: dir, OPENPANOPTICON_ENV_FILE: envFile, NO_COLOR: '1',
+      // Its own cache.conf, so a test run never writes one into the project.
+      OPENPANOPTICON_CACHE_CONF: path.join(dir, 'cache.conf'),
+      // No tile ports: a parallel test may hold PORT+1.
+      TILE_PORTS: '0',
+      ...extraEnv,
+    }),
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let out = '';

@@ -8,7 +8,7 @@ import { test, describe, beforeEach, afterEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { installCesium, makeViewer } from '../../helpers/cesium-stub.mjs';
 import { installDom } from '../../helpers/dom-stub.mjs';
-import { api, apiQueueDepth, OverpassLayer, ShodanLayer } from '../../../public/js/layers.js';
+import { api, apiQueueDepth, OverpassLayer, ShodanLayer, AlprLayer } from '../../../public/js/layers.js';
 
 /** A fetch whose requests stay open until the test releases them. */
 function controlledFetch() {
@@ -119,6 +119,138 @@ class TestLayer extends OverpassLayer {
     this.redraw();
   }
 }
+
+describe('markers on real terrain', () => {
+  const cam = (id, lat, lon) => ({ id, lat, lon, directions: [90], vendor: 'flock' });
+
+  test('are placed at the sampled ground height, not left to Cesium\'s clamp', async () => {
+    const viewer = makeViewer();
+    viewer.scene.terrainProvider = { availability: {} };
+    viewer.scene.requestRender = () => {};
+    const asked = [];
+    Cesium.sampleTerrainMostDetailed = async (tp, cs) => {
+      asked.push(cs.length);
+      return cs.map((c) => ({ ...c, height: 64.8 }));
+    };
+    const l = new AlprLayer(viewer);
+    l.accumulate = true;
+    l.remember([cam('a', 35.7701, -78.6401), cam('b', 35.7702, -78.6402)]);
+    l.redraw();
+    await tick(); await tick();
+    const pins = l.source.entities.values.filter((e) => e.billboard);
+    assert.equal(pins.length, 2);
+    for (const p of pins) {
+      assert.equal(p.billboard.heightReference, Cesium.HeightReference.NONE);
+      const h = (p.position.getValue?.() ?? p.position).h;
+      assert.ok(Math.abs(h - 65.3) < 0.01, `placed at ${h}`);
+    }
+    // A redraw reuses the heights already known.
+    l.redraw();
+    await tick();
+    assert.deepEqual(asked, [2]);
+  });
+
+  test('are left clamped on the plain ellipsoid, where clamping is exact', () => {
+    const viewer = makeViewer();
+    let called = false;
+    Cesium.sampleTerrainMostDetailed = async () => { called = true; return []; };
+    const l = new AlprLayer(viewer);
+    l.accumulate = true;
+    l.remember([cam('a', 35.7703, -78.6403)]);
+    l.redraw();
+    const pin = l.source.entities.values.find((e) => e.billboard);
+    assert.equal(pin.billboard.heightReference, Cesium.HeightReference.CLAMP_TO_GROUND);
+    assert.equal(called, false);
+  });
+});
+
+describe('altitude hold while a request is running', () => {
+  test('a request already in flight keeps the layer "loading", and rejoining it never says "held"', async () => {
+    const l = new OverpassLayer(makeViewer());
+    l.setEnabled(true);
+    let release;
+    l._inFlight = new Promise((r) => { release = r; });
+    l.status = 'loading';
+    await l.holdForAltitude();
+    assert.equal(l.status, 'loading', 'the hold leaves a running request alone');
+    l.status = 'held';   // e.g. held before this request started
+    const joined = l.refresh({ bbox: '35,-79,35.1,-78.9' });
+    assert.equal(l.status, 'loading', 'coming back down shows it loading');
+    release();
+    await joined;
+  });
+});
+
+describe('a view change while a request is running', () => {
+  function slowLayer() {
+    const l = new OverpassLayer(makeViewer());
+    l.setEnabled(true);
+    const calls = [];
+    l.load = (ctx) => new Promise((resolve) => {
+      calls.push({ bbox: ctx.bbox, resolve });
+      l.coveredBbox = ctx.bbox;
+    });
+    return { l, calls };
+  }
+  const RALEIGH = '35.7,-78.7,35.8,-78.6';
+  const GREENSBORO = '36.0,-79.9,36.1,-79.8';
+
+  test('back over ground already fetched: drawn at once, not left "loading" behind the other query', async () => {
+    const { l, calls } = slowLayer();
+    l.markCovered(RALEIGH);
+    const away = l.refresh({ bbox: GREENSBORO });
+    assert.equal(l.status, 'loading');
+    await l.refresh({ bbox: RALEIGH });
+    assert.equal(l.status, 'ok', 'served from what is held');
+    assert.equal(calls.length, 1, 'no request for Raleigh');
+    calls[0].resolve();
+    await away;
+    assert.equal(calls.length, 1, 'and none queued after');
+  });
+
+  test('the other place failing does not mark the view you came back to as failed', async () => {
+    const { l, calls } = slowLayer();
+    l.markCovered(RALEIGH);
+    const away = l.refresh({ bbox: GREENSBORO });
+    await l.refresh({ bbox: RALEIGH });
+    calls[0].resolve(Promise.reject(Object.assign(new Error('Overpass busy'), { status: 502 })));
+    await away;
+    assert.equal(l.status, 'ok');
+    assert.equal(l.error, null);
+    assert.equal(l.retryAt, null, 'no retry booked for Greensboro');
+  });
+
+  test('somewhere new is asked for once the running query finishes, latest view only', async () => {
+    const { l, calls } = slowLayer();
+    const first = l.refresh({ bbox: GREENSBORO });
+    l.refresh({ bbox: '30,-80,30.1,-79.9' });   // panned through
+    l.refresh({ bbox: RALEIGH });               // where the camera stopped
+    calls[0].resolve();
+    await first;
+    await tick();
+    assert.equal(calls.length, 2);
+    assert.equal(calls[1].bbox, RALEIGH);
+    calls[1].resolve();
+  });
+});
+
+describe('altitude hold during a backoff', () => {
+  test('coming back down says it is waiting on the backoff, and books the retry again', async () => {
+    const l = new OverpassLayer(makeViewer());
+    l.setEnabled(true);
+    l.error = 'Overpass is rate-limiting every mirror';
+    l.status = 'error';
+    l.retryAt = Date.now() + 60_000;
+    await l.holdForAltitude();
+    assert.equal(l.status, 'held');
+    assert.equal(l._retryTimer, null, 'the hold cancels the timer');
+    await l.refresh({ bbox: '35,-79,35.1,-78.9' });
+    assert.equal(l.status, 'error', 'no longer claims to be held');
+    assert.match(l.error, /rate-limiting/);
+    assert.ok(l._retryTimer, 'a retry is booked again');
+    clearTimeout(l._retryTimer);
+  });
+});
 
 describe('Layer base class', () => {
   let layer;
