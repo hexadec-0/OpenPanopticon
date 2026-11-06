@@ -586,6 +586,30 @@ function registerDefaults(mock) {
 
   mock.on((url) => OVERPASS_HOSTS.includes(url.hostname), overpass);
 
+  // Ship photos: Wikidata knows one ship, IMO 9876543, and Commons has its photo.
+  mock.on(host('query.wikidata.org', '/sparql'), ({ params }) => {
+    const q = params.get('query') || '';
+    const hit = /"9876543"/.test(q);
+    return json({ results: { bindings: hit ? [{
+      item: { value: 'http://www.wikidata.org/entity/Q1' },
+      itemLabel: { value: 'TEST VESSEL' },
+      image: { value: 'http://commons.wikimedia.org/wiki/Special:FilePath/Test%20vessel%20at%20sea.jpg' },
+    }] : [] } });
+  });
+  mock.on(host('commons.wikimedia.org', '/w/api.php'), ({ params }) => json({ query: { pages: [{
+    title: params.get('titles'),
+    imageinfo: [{
+      url: 'https://upload.wikimedia.org/wikipedia/commons/a/ab/Test_vessel_at_sea.jpg',
+      thumburl: 'https://upload.wikimedia.org/wikipedia/commons/thumb/a/ab/Test_vessel_at_sea.jpg/960px-Test_vessel_at_sea.jpg',
+      descriptionurl: 'https://commons.wikimedia.org/wiki/File:Test_vessel_at_sea.jpg',
+      extmetadata: {
+        Artist: { value: '<a href="//commons.wikimedia.org/wiki/User:Tester">A. Photographer</a>' },
+        LicenseShortName: { value: 'CC BY-SA 4.0' },
+        LicenseUrl: { value: 'https://creativecommons.org/licenses/by-sa/4.0' },
+      },
+    }],
+  }] } }));
+
   mock.on(host('atlas.ripe.net', '/api/v2/probes'), atlas);
   mock.on(host('opencellid.org', '/cell/getInArea'), openCellId);
   mock.on(host('api.wigle.net', '/api/v2/network/search'), wigle);

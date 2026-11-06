@@ -497,6 +497,28 @@ describe('WebcamLayer', () => {
     } finally { mock.timers.reset(); }
   });
 
+  test('closing the view blanks and removes the player, and stops a still refreshing', async () => {
+    mock.timers.enable({ apis: ['setInterval'] });
+    try {
+      const l = new L.WebcamLayer(viewer);
+      let root = new FakeElement('div');
+      await l.enrich({ source: 'windy', embed: 'https://webcams.windy.com/player/1', title: 't' }, root);
+      const [frame] = root.querySelector('[data-slot="camstage"]').children;
+      l.stopLive();
+      assert.equal(frame.src, 'about:blank');
+      assert.ok(frame.removed);
+
+      root = new FakeElement('div');
+      await l.enrich({ source: 'nycdot', image: 'https://webcams.nyctmc.org/api/cameras/1/image', title: 'Cam' }, root);
+      const [img] = root.querySelector('[data-slot="camstage"]').children;
+      assert.ok(l.liveTimer);
+      l.stopLive();
+      assert.equal(l.liveTimer, null);
+      assert.ok(img.removed);
+      assert.equal(img.onerror, null);
+    } finally { mock.timers.reset(); }
+  });
+
   test('detail links only to safe URLs', () => {
     const l = new L.WebcamLayer(viewer);
     const ok = l.detail({ source: 'alertca', title: 'Peak', lat: 1, lon: 1, link: 'https://cameras.alertcalifornia.org/', pan: 120.4, tilt: -5 });
@@ -530,6 +552,28 @@ describe('VesselLayer', () => {
     assert.match(d.html, /Cargo/);
     assert.match(d.html, /Length × beam<\/th><td>200 × 30 m/);
     assert.match(d.html, /12\.0 kn/);
+  });
+
+  test('photo from Commons with its credit, and links to the tracking sites by IMO and MMSI', async () => {
+    const rec = { mmsi: '366000001', imo: 9876543, name: 'TEST VESSEL', lat: 35, lon: -79, shipTypeName: 'Cargo' };
+    const l = on(new L.VesselLayer(viewer));
+    const d = l.detail(rec);
+    assert.match(d.html, /marinetraffic\.com\/en\/ais\/details\/ships\/mmsi:366000001/);
+    assert.match(d.html, /vesselfinder\.com\/vessels\/details\/9876543/);
+    assert.doesNotMatch(d.html, /vessels\?name=/, 'the old search link, which found nothing, is gone');
+    const root = new FakeElement('div');
+    await l.enrich(rec, root);
+    const photo = root.querySelector('[data-slot="photo"]').innerHTML;
+    assert.match(photo, /src="https:\/\/upload\.wikimedia\.org\//);
+    assert.match(photo, /Photo: A\. Photographer · <a [^>]*creativecommons[^>]*>CC BY-SA 4\.0<\/a> · <a [^>]*>Wikimedia Commons<\/a>/);
+  });
+
+  test('a ship with no photo leaves the slot empty', async () => {
+    const rec = { mmsi: '366999999', name: 'SMALL BOAT', lat: 35, lon: -79 };
+    const l = on(new L.VesselLayer(viewer));
+    const root = new FakeElement('div');
+    await l.enrich(rec, root);
+    assert.equal(root.querySelector('[data-slot="photo"]').innerHTML || '', '');
   });
 });
 

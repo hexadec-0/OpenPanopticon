@@ -67,7 +67,7 @@ const BULK_LIMIT = MAX_INFLIGHT - 1;
 
 // Short lookups behind a click.
 const INTERACTIVE = new Set([
-  '/api/route', '/api/aircraft', '/api/enrich', '/api/geocode',
+  '/api/route', '/api/aircraft', '/api/vessel-photo', '/api/enrich', '/api/geocode',
   '/api/health', '/api/config', '/api/geoip',
 ]);
 // Time-critical polls. These are worthless late: an aircraft position that
@@ -2198,6 +2198,7 @@ export class WebcamLayer extends Layer {
       frame.setAttribute('allow', 'autoplay; fullscreen; picture-in-picture');
       stage.append(frame);
       stage.append(liveBadge('live player'));
+      this.liveEls = [frame];
       return;
     }
 
@@ -2222,6 +2223,7 @@ export class WebcamLayer extends Layer {
     }
     const stamp = liveBadge('updating\u2026');
     stage.append(img, stamp);
+    this.liveEls = [img];
 
     let fails = 0;
     const tick = () => {
@@ -2235,19 +2237,57 @@ export class WebcamLayer extends Layer {
     img.onerror = () => {
       // Some cameras go offline for long stretches; stop rather than hammer.
       if (++fails >= 3) {
-        this.stopLive();
+        this.stopRefresh();
         stamp.textContent = 'camera not responding';
         img.style.display = 'none';
       }
     };
 
-    tick();
-    this.liveTimer = setInterval(tick, rec.source === 'nycdot' ? 3000 : 8000);
+    // Refetch only while the page is on screen: a frame nobody can see is
+    // a download and an image decode for nothing.
+    const period = rec.source === 'nycdot' ? 3000 : 8000;
+    const run = () => {
+      clearInterval(this.liveTimer);
+      tick();
+      this.liveTimer = setInterval(tick, period);
+    };
+    this.onLiveVisibility = () => {
+      if (document.visibilityState === 'visible') run();
+      else { clearInterval(this.liveTimer); this.liveTimer = null; }
+    };
+    document.addEventListener?.('visibilitychange', this.onLiveVisibility);
+    run();
   }
 
-  stopLive() {
+  /** Stop refetching the still, leaving what is on the page in place. */
+  stopRefresh() {
     clearInterval(this.liveTimer);
     this.liveTimer = null;
+    if (this.onLiveVisibility) {
+      document.removeEventListener?.('visibilitychange', this.onLiveVisibility);
+      this.onLiveVisibility = null;
+    }
+  }
+
+  /**
+   * End the live view and take the player or frame off the page. Closing the
+   * detail panel only hides it, so a player left in place would go on
+   * decoding video, and a still left in place would keep its last frame in
+   * memory.
+   */
+  stopLive() {
+    this.stopRefresh();
+    const els = this.liveEls || [];
+    this.liveEls = null;
+    for (const el of els) {
+      el.onload = null;
+      el.onerror = null;
+      // Blanking the player first stops its video and audio at once, rather
+      // than whenever the detached frame is collected.
+      if (el.tagName === 'IFRAME') el.src = 'about:blank';
+      else el.removeAttribute?.('src');
+      el.remove();
+    }
   }
 
   detail(rec) {
@@ -2378,6 +2418,8 @@ export class VesselLayer extends Layer {
       title: rec.name || `MMSI ${rec.mmsi}`,
       accent: vesselColor(rec.shipTypeName),
       html: `
+        <div data-slot="photo"></div>
+        <div data-slot="inset"></div>
         <table>${rows([
           ['MMSI', rec.mmsi],
           ['IMO', rec.imo || null],
@@ -2394,12 +2436,66 @@ export class VesselLayer extends Layer {
           ['Transponder', rec.classB ? 'Class B' : 'Class A'],
           ['Last report', rec.ageSeconds != null ? `${rec.ageSeconds}s ago` : null],
         ])}</table>
-        <a class="ext" href="https://www.vesselfinder.com/vessels?name=${encodeURIComponent(rec.mmsi)}"
-           target="_blank" rel="noopener">Look up vessel ↗</a>
+        ${vesselLinks(rec)}
         <p class="hint">Positions are self-reported over AIS. Transponders can be
         switched off or spoofed, so absence is not evidence of absence.</p>`,
     };
   }
+
+  /**
+   * After the panel renders: a freely licensed photo from Wikimedia Commons,
+   * found by IMO or MMSI. Most small craft have none, and then the slot
+   * simply stays empty; the links below lead to the tracking sites' photos.
+   */
+  async enrich(rec, root) {
+    const seq = ++this.enrichSeq;
+    const imo = /^[1-9]\d{6}$/.test(String(rec.imo || '')) ? String(rec.imo) : null;
+    const mmsi = /^\d{9}$/.test(String(rec.mmsi || '')) ? String(rec.mmsi) : null;
+    if (!imo && !mmsi) return;
+    let p;
+    try { p = await api('/api/vessel-photo', { imo, mmsi }); } catch { return; }
+    const slot = this.enrichSeq === seq ? root.querySelector('[data-slot="photo"]') : null;
+    if (!slot || !p?.known || !safeUrl(p.photo)) return;
+    slot.innerHTML = vesselPhotoHtml(p);
+  }
+}
+
+/**
+ * Photos on the tracking sites themselves. Their photos belong to the
+ * photographers and need their permission to reuse, so they are linked to
+ * rather than shown here. The old link searched VesselFinder by MMSI as a
+ * ship name, which finds nothing; a ship's page is keyed by IMO when it has
+ * one, by MMSI otherwise.
+ */
+function vesselLinks(rec) {
+  const mmsi = /^\d{9}$/.test(String(rec.mmsi || '')) ? String(rec.mmsi) : null;
+  const imo = /^[1-9]\d{6}$/.test(String(rec.imo || '')) ? String(rec.imo) : null;
+  const links = [];
+  if (mmsi) {
+    links.push(['MarineTraffic', `https://www.marinetraffic.com/en/ais/details/ships/mmsi:${mmsi}`]);
+  }
+  if (imo || mmsi) {
+    links.push(['VesselFinder', `https://www.vesselfinder.com/vessels/details/${imo || mmsi}`]);
+  }
+  return links.map(([label, href]) => `<a class="ext" href="${esc(href)}" target="_blank"
+    rel="noopener">Photos &amp; details on ${label} ↗</a>`).join(' ');
+}
+
+/** The photo slot's contents: a Commons photo, always with its credit. */
+function vesselPhotoHtml(p) {
+  const by = esc(p.credit || 'Unknown author');
+  const lic = p.license
+    ? (safeUrl(p.licenseUrl)
+      ? `<a href="${esc(safeUrl(p.licenseUrl))}" target="_blank" rel="noopener">${esc(p.license)}</a>`
+      : esc(p.license))
+    : null;
+  const src = safeUrl(p.page)
+    ? `<a href="${esc(safeUrl(p.page))}" target="_blank" rel="noopener">Wikimedia Commons</a>`
+    : 'Wikimedia Commons';
+  return `<figure class="photo">
+      <img class="cam" src="${esc(safeUrl(p.photo) || '')}" alt="${esc(p.subject || 'vessel')}" data-hide-on-error>
+      <figcaption>Photo: ${by}${lic ? ` · ${lic}` : ''} · ${src}</figcaption>
+    </figure>`;
 }
 
 const vesselCache = new Map();

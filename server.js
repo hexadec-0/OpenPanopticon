@@ -131,6 +131,7 @@ const CACHE_SCHEMA = [
   ['cameras', 'directories', '3d', 'Webcam directories: NYC DOT, OpenWebcamDB, ALERTCalifornia.'],
   ['satellites', 'elements', '1d', 'Orbital elements from CelesTrak. Only accurate near their epoch: older\n# elements put low-orbit objects tens of kilometres from where they are.'],
   ['aircraft', 'airframes', '3d', 'Aircraft type and registration lookups.'],
+  ['vessels', 'photos', '7d', 'Ship photos found on Wikimedia Commons by IMO or MMSI, and the ships\n# found to have none (so they are not asked about again on every click).'],
   ['aircraft', 'routes', '30m', 'Flight routes by callsign. The same flight number flies different legs\n# on different days.'],
   ['places', 'geocode', '3d', 'Place-name searches.'],
   ['places', 'seismic', '3d', 'Seismometer station lists.'],
@@ -3492,6 +3493,76 @@ async function aircraftInfo({ icao24 }) {
 }
 
 // ---------------------------------------------------------------------------
+// SHIP PHOTOS — Wikimedia Commons, found through Wikidata (no key)
+//
+// The vessel-tracking sites' photos belong to their photographers and need
+// their permission to reuse, so they are linked to, not shown. Commons photos
+// are freely licensed: shown with the photographer and licence, they may be
+// used. Wikidata records the IMO number (P458) and MMSI (P587) of many ships,
+// with a Commons image (P18) for a good share of them. Coverage is best for
+// large and notable ships; most small craft have none.
+// ---------------------------------------------------------------------------
+
+/** Plain text from a little HTML (Commons credits are often links). */
+function plainText(html) {
+  return String(html || '')
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&quot;/g, '"')
+    .replace(/&#0?39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/\s+/g, ' ').trim();
+}
+
+/** "File name.jpg" from a Wikidata image value (a Special:FilePath URL). */
+function commonsFileName(value) {
+  const m = /Special:FilePath\/(.+)$/.exec(String(value || ''));
+  if (!m) return null;
+  try { return decodeURIComponent(m[1]); } catch { return null; }
+}
+
+async function vesselPhoto({ imo, mmsi }) {
+  const i = String(imo || '').replace(/\D/g, '');
+  const m = String(mmsi || '').replace(/\D/g, '');
+  const imoOk = /^[1-9]\d{6}$/.test(i);
+  const mmsiOk = /^\d{9}$/.test(m);
+  if (!imoOk && !mmsiOk) throw new UpstreamError(400, 'imo (7 digits) or mmsi (9 digits) required');
+  const none = { known: false, imo: imoOk ? i : null, mmsi: mmsiOk ? m : null };
+
+  return cachedPersistent(`vphoto:v1:${imoOk ? `imo:${i}` : `mmsi:${m}`}`, RETAIN['vessels.photos'], async () => {
+    // Digits only, checked above, so they are safe inside the query.
+    const which = [imoOk && `{ ?item wdt:P458 "${i}" }`, mmsiOk && `{ ?item wdt:P587 "${m}" }`]
+      .filter(Boolean).join(' UNION ');
+    const sparql = `SELECT ?item ?itemLabel ?image WHERE { ${which} ?item wdt:P18 ?image . `
+      + 'SERVICE wikibase:label { bd:serviceParam wikibase:language "en". } } LIMIT 1';
+    const found = await grab(`https://query.wikidata.org/sparql?${new URLSearchParams({ query: sparql, format: 'json' })}`,
+      { headers: { Accept: 'application/sparql-results+json' } }, { label: 'Wikidata', timeoutMs: 15000 });
+    const hit = found?.results?.bindings?.[0];
+    const file = commonsFileName(hit?.image?.value);
+    if (!file) return none;
+
+    const info = await grab(`https://commons.wikimedia.org/w/api.php?${new URLSearchParams({
+      action: 'query', format: 'json', formatversion: '2', prop: 'imageinfo',
+      iiprop: 'url|extmetadata', iiurlwidth: '960', titles: `File:${file}`,
+    })}`, {}, { label: 'Wikimedia Commons', timeoutMs: 15000 });
+    const ii = info?.query?.pages?.[0]?.imageinfo?.[0];
+    const photo = safeUrl(ii?.thumburl || ii?.url);
+    if (!photo) return none;
+    const meta = ii.extmetadata || {};
+    return {
+      known: true,
+      imo: none.imo, mmsi: none.mmsi,
+      photo,
+      // Credit and licence are what make showing it allowed: always sent.
+      credit: clip(plainText(meta.Artist?.value), 120) || 'Unknown author',
+      license: clip(plainText(meta.LicenseShortName?.value), 60) || null,
+      licenseUrl: safeUrl(meta.LicenseUrl?.value),
+      page: safeUrl(ii.descriptionurl),
+      subject: clip(plainText(hit.itemLabel?.value), 120) || null,
+      wikidata: safeUrl(hit.item?.value),
+    };
+  });
+}
+
+// ---------------------------------------------------------------------------
 // NASA GIBS — daily global satellite imagery, keyless WMTS
 //
 // Template: /wmts/epsg3857/best/{layer}/default/{time}/{matrixSet}/{z}/{y}/{x}.{ext}
@@ -4889,6 +4960,7 @@ const ROUTES = {
   '/api/geoip': () => geoip(),
   '/api/route': (q) => flightRoute({ callsign: q.get('callsign') }),
   '/api/aircraft': (q) => aircraftInfo({ icao24: q.get('icao24') }),
+  '/api/vessel-photo': (q) => vesselPhoto({ imo: q.get('imo'), mmsi: q.get('mmsi') }),
   '/api/weather': () => weather(),
   '/api/vessels': (q) => vessels({ bbox: q.get('bbox') }),
   '/api/netinfra': (q) => netinfra({ bbox: q.get('bbox'), sources: q.get('sources') }),
@@ -5566,6 +5638,7 @@ module.exports = {
   overpassGate, overpassQuery, mirrorFailure, OVERPASS_PRESETS, OVERPASS_ENDPOINTS,
   parseOverpassStatus, overpassDense,
   ais, aisIngest, aisConnect, aisBoxesFor, boxMovedEnough, shipTypeName,
+  vesselPhoto, plainText, commonsFileName,
   parseDirections, vendorOf, ALPR_VENDORS, airQualityBand, parseCsv,
   feodoSet, greyNoiseLookup, enrich, normaliseOwcdb, cloudSource, gibsTemplate, gibsDefaultDate,
   GIBS_LAYERS, COUNTRY_CENTROIDS, FIVE_ELEVEN_HOSTS, basemapProviders, sentinelTileTemplate,

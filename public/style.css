@@ -3,7 +3,10 @@
 :root {
   --hud: #39ff88;
   --bg: #05070a;
-  --panel: rgba(8, 12, 17, .82);
+  /* Panels are near-opaque rather than frosted: a backdrop-filter blur over
+     the WebGL canvas is redone by the compositor on every globe frame, in the
+     GPU process every Chrome tab shares. */
+  --panel: rgba(8, 12, 17, .93);
   --panel-solid: #0a0e14;
   --line: rgba(120, 160, 150, .22);
   --text: #cdd9d4;
@@ -40,9 +43,8 @@ html, body {
   position: fixed; top: 0; left: 0; right: 0; z-index: 20;
   display: flex; align-items: center; gap: 18px;
   padding: 10px 16px;
-  background: linear-gradient(180deg, rgba(4,7,10,.94) 0%, rgba(4,7,10,.72) 70%, transparent 100%);
+  background: rgba(8, 12, 17, .9);
   border-bottom: 1px solid var(--line);
-  backdrop-filter: blur(6px);
 }
 
 .brand { display: flex; align-items: baseline; gap: 9px; flex: 0 0 auto; }
@@ -156,7 +158,6 @@ html, body {
   overflow-y: auto;
   background: var(--panel);
   border-right: 1px solid var(--line);
-  backdrop-filter: blur(10px);
 }
 #sidebar::-webkit-scrollbar { width: 6px; }
 #sidebar::-webkit-scrollbar-thumb { background: rgba(120,160,150,.25); border-radius: 3px; }
@@ -336,9 +337,8 @@ select.ctl { cursor: pointer; }
   position: fixed; bottom: 0; left: 0; right: 0; z-index: 20;
   display: flex; align-items: center; gap: 26px;
   padding: 8px 16px; height: 42px;
-  background: linear-gradient(0deg, rgba(4,7,10,.95) 0%, rgba(4,7,10,.7) 70%, transparent 100%);
+  background: rgba(8, 12, 17, .9);
   border-top: 1px solid var(--line);
-  backdrop-filter: blur(6px);
   overflow-x: auto; scrollbar-width: none;
 }
 #hud::-webkit-scrollbar { display: none; }
@@ -365,7 +365,6 @@ select.ctl { cursor: pointer; }
   padding: 7px 14px;
   background: var(--panel); border: 1px solid var(--line);
   border-top: 0; border-radius: 0 0 4px 4px;
-  backdrop-filter: blur(10px);
   opacity: 0; transition: opacity .25s ease, transform .25s ease;
 }
 #weather.open { display: flex; opacity: 1; transform: translate(-50%, 0); }
@@ -395,7 +394,6 @@ select.ctl { cursor: pointer; }
   padding: 7px 14px;
   background: var(--panel); border: 1px solid var(--line);
   border-top: 0; border-radius: 0 0 4px 4px;
-  backdrop-filter: blur(10px);
   opacity: 0; transition: opacity .25s ease, transform .25s ease;
 }
 #imagery.open { display: flex; opacity: 1; transform: translate(-50%, 0); }
@@ -434,7 +432,6 @@ select.ctl { cursor: pointer; }
   background: var(--panel-solid); border: 1px solid var(--line);
   border-radius: 0 0 4px 4px;
   box-shadow: 0 14px 40px rgba(0,0,0,.6);
-  backdrop-filter: blur(10px);
 }
 /* `available` is set by the app when the menu has anything to offer; hover
    alone should not open controls for a layer that is switched off. */
@@ -568,7 +565,6 @@ select.ctl { cursor: pointer; }
   padding: 7px 11px; font-size: 10.5px;
   background: rgba(255,45,85,.13); color: #ff8fa8;
   border: 1px solid rgba(255,45,85,.4); border-left-width: 3px; border-radius: 3px;
-  backdrop-filter: blur(6px);
 }
 
 /* ---------------------------------------------------------------- */
@@ -580,7 +576,6 @@ select.ctl { cursor: pointer; }
   width: min(var(--detail-w, 440px), 85vw); padding: 18px 20px;
   overflow-y: auto;
   background: var(--panel); border-left: 2px solid var(--accent, var(--hud));
-  backdrop-filter: blur(12px);
   transform: translateX(102%); transition: transform .28s cubic-bezier(.2,.8,.25,1);
 }
 #detail.open { transform: none; }
@@ -645,6 +640,26 @@ select.ctl { cursor: pointer; }
   width: 100%; height: auto; max-height: 60vh; object-fit: contain; background: #000; border: 1px solid var(--line); border-radius: 3px;
   margin-bottom: 12px; display: block;
 }
+/* Aircraft (and vessel) photos: a box about 20% shorter than a 3:2 photo
+   at the same width, with the whole photo letterboxed inside it rather than
+   cropped, since the photographer's credit is printed along its bottom edge.
+   The cap keeps photo + map within the window on a wide panel, so the
+   details underneath are not pushed off the bottom. */
+#detail [data-slot="photo"] img.cam {
+  aspect-ratio: 15 / 8; max-height: 36vh;
+  /* Fill the box and crop what spills over, rather than letterboxing with
+     black bars. Aircraft photos are cropped from the top only: Airport-Data
+     prints the photographer's credit along the bottom edge of the image, and
+     that credit is the one condition on showing it. */
+  object-fit: cover; object-position: 50% 100%;
+}
+#detail figure.photo { margin: 0 0 12px; }
+/* Ship photos carry their credit in a caption, so they crop evenly. */
+#detail figure.photo img.cam { margin-bottom: 4px; object-position: 50% 50%; }
+#detail figure.photo figcaption {
+  font-size: 10px; color: var(--dim); line-height: 1.4; overflow-wrap: anywhere;
+}
+#detail figure.photo figcaption a { color: inherit; text-decoration: underline; }
 
 /* live camera stage ------------------------------------------------ */
 
@@ -831,7 +846,7 @@ body[data-mode="cel"]  { --hud: #ffd4a3; }
   position: relative; width: 100%; overflow: hidden; cursor: zoom-in;
   /* Scales with the panel: wider panel, taller map. Capped so a very wide
      panel cannot push the details off screen. */
-  aspect-ratio: 16 / 9; max-height: 55vh;
+  aspect-ratio: 20 / 9; max-height: 34vh;   /* 20% shorter than 16:9 */
   background: #0d1416; border: 1px solid var(--accent, var(--hud)); border-radius: 3px;
 }
 .inset-tiles img {

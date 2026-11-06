@@ -268,6 +268,12 @@ class OpenPanopticon {
       selectionIndicator: false,
       shouldAnimate: true,
       contextOptions: { webgl: { alpha: false, powerPreference: 'high-performance' } },
+      // No multisampling. Cesium's default of 4x multiplies the fill and memory
+      // bandwidth of every frame across the whole window, and that GPU time
+      // comes out of the process every other Chrome tab draws and decodes
+      // video through. Billboards and labels, most of what is on screen, are
+      // unaffected; only polygon and polyline edges lose some smoothing.
+      msaaSamples: 1,
     };
 
     // Set the ground layer explicitly in both cases.

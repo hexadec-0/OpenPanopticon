@@ -129,6 +129,36 @@ describe('/api/iot', () => {
   });
 });
 
+describe('/api/vessel-photo (Wikimedia Commons)', () => {
+  test('a ship Wikidata knows by IMO: a Commons photo with its credit and licence', async () => {
+    const d = (await s.api('/api/vessel-photo', { imo: '9876543', mmsi: '366000001' })).json();
+    assert.equal(d.known, true);
+    assert.match(d.photo, /^https:\/\/upload\.wikimedia\.org\/.*960px/);
+    assert.equal(d.credit, 'A. Photographer', 'HTML stripped from the credit');
+    assert.equal(d.license, 'CC BY-SA 4.0');
+    assert.equal(d.licenseUrl, 'https://creativecommons.org/licenses/by-sa/4.0');
+    assert.match(d.page, /commons\.wikimedia\.org\/wiki\/File:/);
+    const q = new URL(s.mock.callsTo('query.wikidata.org')[0].url).searchParams.get('query');
+    assert.match(q, /wdt:P458 "9876543"/);
+    assert.match(q, /wdt:P587 "366000001"/);
+  });
+
+  test('no photo is an ordinary answer, and is remembered', async () => {
+    const d = (await s.api('/api/vessel-photo', { mmsi: '366999999' })).json();
+    assert.equal(d.known, false);
+    await s.api('/api/vessel-photo', { mmsi: '366999999' });
+    assert.equal(s.mock.callsTo('query.wikidata.org').length, 1, 'asked once');
+    assert.equal(s.mock.callsTo('commons.wikimedia.org').length, 0);
+  });
+
+  test('anything but digits of the right length is refused before any query', async () => {
+    for (const q of [{}, { imo: '12' }, { mmsi: '" } ?x ?y ?z . {' }, { imo: '0000000' }]) {
+      assert.equal((await s.api('/api/vessel-photo', q)).status, 400, JSON.stringify(q));
+    }
+    assert.equal(s.mock.callsTo('wikidata').length, 0);
+  });
+});
+
 describe('/api/vessels (AIS)', () => {
   test('opens the stream, subscribes to the view and serves what arrives', async () => {
     FakeWebSocket.reset();
