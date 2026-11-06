@@ -164,7 +164,35 @@ const EMPTY_TRAIL = Object.freeze([]);
  * The last step repeats, so a persistent failure settles at one attempt an
  * hour — often enough to notice a recovery, rare enough to cost nothing.
  */
+/**
+ * How close to the camera a marker skips the depth test.
+ *
+ * Markers skip it so they stay visible over buildings and hills up close.
+ * At an infinite distance they also skipped the one depth test that hides
+ * things behind the planet, so flying to the other side of the world showed
+ * the pins left behind through the Earth. Ground hidden by the curve of the
+ * Earth is always beyond the horizon, about 600 km from a camera 30 km up
+ * and 110 km from one at 1 km, so 50 km keeps every marker near the camera
+ * on top and leaves everything farther to be hidden by the globe.
+ */
+export const DEPTH_FREE_M = 50_000;
+
 const RETRY_LADDER_SEC = [30, 60, 90, 120, 300, 3600];
+
+/**
+ * An OSM answer that came back in part: drawn already, and the rest is owed.
+ * Thrown after drawing so the layer neither claims the ground as covered nor
+ * waits for the next camera move to ask for the remainder.
+ */
+function partialAnswer(d) {
+  const secs = Math.max(5, Number(d.retryAfter) || 30);
+  const e = new Error(`Partly loaded: ${d.cells - d.missing} of ${d.cells} areas in. `
+    + `Overpass is busy, so the rest follows in about ${secs}s.`);
+  e.status = 429;
+  e.retryAfter = secs;
+  e.partial = true;
+  return e;
+}
 
 /**
  * How long the browser treats an area as already fetched.
@@ -727,9 +755,21 @@ class Layer {
    */
   scheduleRetry(err, ctx) {
     clearTimeout(this._retryTimer); this._retryTimer = null;
-    const step = RETRY_LADDER_SEC[Math.min(this.failures, RETRY_LADDER_SEC.length - 1)];
-    this.failures += 1;
-    const wait = Math.max(step, Number(err?.retryAfter) || 0);
+    const told = Number(err?.retryAfter) || 0;
+    let wait;
+    if (err?.status === 429 && told > 0) {
+      // Told exactly when to come back, by our own server (Overpass's
+      // cooldown) or the upstream behind it. Climbing the ladder on top of
+      // that turned a few minutes of cooldown into an hour of nothing after
+      // five refusals in a row, which a busy Overpass easily produces. A few
+      // seconds of spread so two layers do not come back on the same tick.
+      this.failures = Math.min(this.failures + 1, 3);
+      wait = told + Math.floor(Math.random() * 5);
+    } else {
+      const step = RETRY_LADDER_SEC[Math.min(this.failures, RETRY_LADDER_SEC.length - 1)];
+      this.failures += 1;
+      wait = Math.max(step, told);
+    }
     this.retryInSec = wait;
     this.retryAt = Date.now() + wait * 1000;
 
@@ -836,7 +876,7 @@ export class ShodanLayer extends Layer {
           color: color.withAlpha(0.85),
           outlineColor: color,
           outlineWidth: risky ? 2 : 1,
-          disableDepthTestDistance: Number.POSITIVE_INFINITY,
+          disableDepthTestDistance: DEPTH_FREE_M,
           heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
           scaleByDistance: new Cesium.NearFarScalar(1e3, 1.6, 6e5, 0.5),
         },
@@ -1107,7 +1147,7 @@ export class FlightLayer extends Layer {
             height: 26,
             rotation: 0,
             alignedAxis: Cesium.Cartesian3.ZERO,
-            disableDepthTestDistance: Number.POSITIVE_INFINITY,
+            disableDepthTestDistance: DEPTH_FREE_M,
             scaleByDistance: new Cesium.NearFarScalar(1e4, 1.3, 1.2e6, 0.45),
           },
           label: {
@@ -1119,7 +1159,7 @@ export class FlightLayer extends Layer {
             outlineWidth: 3,
             pixelOffset: new Cesium.Cartesian2(16, -14),
             horizontalOrigin: Cesium.HorizontalOrigin.LEFT,
-            disableDepthTestDistance: Number.POSITIVE_INFINITY,
+            disableDepthTestDistance: DEPTH_FREE_M,
             distanceDisplayCondition: new Cesium.DistanceDisplayCondition(0, 9e5),
           },
           polyline: {
@@ -1264,8 +1304,20 @@ export class FlightLayer extends Layer {
       // The photo leads the panel rather than sitting under the airframe
       // table, so it is the first thing seen on a pick.
       const ps = photoSlot();
-      if (ac.photo && ps) {
-        ps.innerHTML = `<img class="cam" src="${esc(safeUrl(ac.photo) || '')}" alt="aircraft" data-hide-on-error>`;
+      const full = safeUrl(ac.photo);
+      const thumb = safeUrl(ac.photoThumb);
+      if (full && ps) {
+        // Thumbnail first, as it arrives at once; the full-size photo
+        // replaces it when it has loaded, and if it never does the thumbnail
+        // stays rather than the slot going blank.
+        const first = thumb && thumb !== full ? thumb : full;
+        ps.innerHTML = `<img class="cam" src="${esc(first)}" alt="aircraft" data-hide-on-error>`;
+        if (first !== full && typeof Image === 'function') {
+          const img = ps.querySelector('img');
+          const pre = new Image();
+          pre.onload = () => { if (img?.isConnected !== false) img.src = full; };
+          pre.src = full;
+        }
       }
     }
 
@@ -1340,7 +1392,7 @@ export class FlightLayer extends Layer {
           color: Cesium.Color.fromCssColorString(color).withAlpha(0.9),
           outlineColor: Cesium.Color.fromCssColorString(color),
           outlineWidth: 2,
-          disableDepthTestDistance: Number.POSITIVE_INFINITY,
+          disableDepthTestDistance: DEPTH_FREE_M,
           heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
         },
         label: {
@@ -1352,7 +1404,7 @@ export class FlightLayer extends Layer {
           outlineColor: Cesium.Color.BLACK.withAlpha(0.85),
           outlineWidth: 3,
           pixelOffset: new Cesium.Cartesian2(0, -22),
-          disableDepthTestDistance: Number.POSITIVE_INFINITY,
+          disableDepthTestDistance: DEPTH_FREE_M,
         },
       });
     }
@@ -1635,7 +1687,7 @@ export class OverpassLayer extends Layer {
     this.coveredBbox = d.covered || null;
     this.trimmed = !!d.trimmed;
     this.remember(d.features);
-    this.redraw();
+    this.redraw();    if (d.partial) throw partialAnswer(d);
   }
 
   /** Cached features are filtered by the currently selected classes here,
@@ -1655,7 +1707,7 @@ export class OverpassLayer extends Layer {
           color: color.withAlpha(0.9),
           outlineColor: Cesium.Color.BLACK.withAlpha(0.6),
           outlineWidth: 1,
-          disableDepthTestDistance: Number.POSITIVE_INFINITY,
+          disableDepthTestDistance: DEPTH_FREE_M,
           heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
           scaleByDistance: new Cesium.NearFarScalar(1e3, 1.5, 3e5, 0.4),
         },
@@ -1779,7 +1831,7 @@ export class AlprLayer extends Layer {
     this.byOperator = data.byOperator;
     this.total = data.total;
     this.remember(data.cameras);
-    this.redraw();
+    this.redraw();    if (data.partial) throw partialAnswer(data);
   }
 
   draw(cameras) {
@@ -1830,7 +1882,7 @@ export class AlprLayer extends Layer {
           // than centring the icon over it.
           verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
           pixelOffset: new Cesium.Cartesian2(0, 2),
-          disableDepthTestDistance: Number.POSITIVE_INFINITY,
+          disableDepthTestDistance: DEPTH_FREE_M,
           heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
           scaleByDistance: new Cesium.NearFarScalar(500, 1.6, 2.5e5, 0.35),
         },
@@ -2007,7 +2059,7 @@ export class EventLayer extends Layer {
           color: color.withAlpha(0.9),
           outlineColor: color,
           outlineWidth: 2,
-          disableDepthTestDistance: Number.POSITIVE_INFINITY,
+          disableDepthTestDistance: DEPTH_FREE_M,
           heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
           scaleByDistance: new Cesium.NearFarScalar(1e4, 1.4, 4e6, 0.55),
         },
@@ -2107,7 +2159,7 @@ export class WebcamLayer extends Layer {
           image: camSprite(CAM_COLOR[c.source] || '#ffd166'),
           width: 22,
           height: 22,
-          disableDepthTestDistance: Number.POSITIVE_INFINITY,
+          disableDepthTestDistance: DEPTH_FREE_M,
           heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
           scaleByDistance: new Cesium.NearFarScalar(1e3, 1.4, 4e5, 0.4),
         },
@@ -2295,7 +2347,7 @@ export class VesselLayer extends Layer {
           width: 22, height: 22,
           rotation: Cesium.Math.toRadians(-bearing),
           alignedAxis: Cesium.Cartesian3.ZERO,
-          disableDepthTestDistance: Number.POSITIVE_INFINITY,
+          disableDepthTestDistance: DEPTH_FREE_M,
           heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
           scaleByDistance: new Cesium.NearFarScalar(1e4, 1.3, 2e6, 0.4),
         },
@@ -2309,7 +2361,7 @@ export class VesselLayer extends Layer {
           outlineWidth: 3,
           pixelOffset: new Cesium.Cartesian2(14, -10),
           horizontalOrigin: Cesium.HorizontalOrigin.LEFT,
-          disableDepthTestDistance: Number.POSITIVE_INFINITY,
+          disableDepthTestDistance: DEPTH_FREE_M,
           distanceDisplayCondition: new Cesium.DistanceDisplayCondition(0, 4e5),
           show: this.showNames,
         },
@@ -2435,7 +2487,7 @@ export class NetInfraLayer extends Layer {
           color: color.withAlpha(0.9),
           outlineColor: color,
           outlineWidth: n.aggregate ? 2 : 1,
-          disableDepthTestDistance: Number.POSITIVE_INFINITY,
+          disableDepthTestDistance: DEPTH_FREE_M,
           heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
           scaleByDistance: new Cesium.NearFarScalar(1e3, 1.4, 3e6, 0.5),
         },
@@ -2527,7 +2579,7 @@ export class IotLayer extends Layer {
           color: color.withAlpha(0.9),
           outlineColor: s.indoor ? Cesium.Color.fromCssColorString('#8b949e') : color,
           outlineWidth: s.indoor ? 1 : 2,
-          disableDepthTestDistance: Number.POSITIVE_INFINITY,
+          disableDepthTestDistance: DEPTH_FREE_M,
           heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
           scaleByDistance: new Cesium.NearFarScalar(1e3, 1.5, 3e5, 0.4),
         },
@@ -2619,7 +2671,7 @@ export class TrafficLayer extends Layer {
           position: Cesium.Cartesian3.fromDegrees(f.lon, f.lat, 0),
           billboard: {
             image: camSprite(css), width: 20, height: 20,
-            disableDepthTestDistance: Number.POSITIVE_INFINITY,
+            disableDepthTestDistance: DEPTH_FREE_M,
             heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
             scaleByDistance: new Cesium.NearFarScalar(1e3, 1.4, 3e5, 0.4),
           },
@@ -2633,7 +2685,7 @@ export class TrafficLayer extends Layer {
             color: Cesium.Color.fromCssColorString(css).withAlpha(0.9),
             outlineColor: Cesium.Color.fromCssColorString(css),
             outlineWidth: 2,
-            disableDepthTestDistance: Number.POSITIVE_INFINITY,
+            disableDepthTestDistance: DEPTH_FREE_M,
             heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
           },
           properties: { layer: 'traffic', record: f },

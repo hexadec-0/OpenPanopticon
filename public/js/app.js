@@ -292,6 +292,14 @@ class OpenPanopticon {
           new Cesium.OpenStreetMapImageryProvider({ url: 'https://tile.openstreetmap.org/' }),
         );
     if (!ionToken) opts.terrainProvider = new Cesium.EllipsoidTerrainProvider();
+    // An invisible, opaque shell 10 km below the surface that hides whatever
+    // is behind it. Cesium draws one at the surface itself when terrain is not
+    // depth tested (as here), and markers more than DEPTH_FREE_M from the
+    // camera are tested against it, so pins on the far side of the planet
+    // stay hidden. At the surface it could also hide a pin in a valley or a
+    // harbour below sea level seen from far off; 10 km down, only the bulk of
+    // the planet is in the way.
+    opts.depthPlaneEllipsoidOffset = -10_000;
 
     this.viewer = new Cesium.Viewer('globe', opts);
     const scene = this.viewer.scene;

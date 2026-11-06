@@ -133,10 +133,17 @@ describe('/api/route and /api/aircraft (adsbdb)', () => {
     const d = (await s.api('/api/aircraft', { icao24: 'A1B2C3' })).json();
     assert.equal(d.registration, 'N12345');
     assert.equal(d.icaoType, 'B738');
-    assert.equal(d.photo, 'https://photos.example/a1b2c3.jpg');
-    s.mock.on('/v0/aircraft/', () => json({ response: { aircraft: { registration: 'X', url_photo_thumbnail: 'javascript:alert(1)' } } }));
+    assert.equal(d.photo, 'https://photos.example/a1b2c3.jpg', 'the full-size photo');
+    assert.equal(d.photoThumb, 'https://photos.example/thumbnails/a1b2c3.jpg');
+    s.mock.on('/v0/aircraft/', () => json({ response: { aircraft: { registration: 'X', url_photo: 'javascript:alert(1)', url_photo_thumbnail: 'javascript:alert(1)' } } }));
     s.mod.cache.clear(); await s.mod.clearDiskCache();
     assert.equal((await s.api('/api/aircraft', { icao24: 'a1b2c3' })).json().photo, null);
+  });
+
+  test('with only a thumbnail, that is the photo', async () => {
+    s.mock.on('/v0/aircraft/', () => json({ response: { aircraft: { registration: 'X', url_photo_thumbnail: 'https://photos.example/t.jpg' } } }));
+    const d = (await s.api('/api/aircraft', { icao24: 'a1b2c4' })).json();
+    assert.equal(d.photo, 'https://photos.example/t.jpg');
   });
 
   test('unknown airframes and bad hex', async () => {

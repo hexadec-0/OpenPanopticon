@@ -1968,12 +1968,13 @@ const overpassLimits = {   // an object so tests can lower it
   maxsize: 128 * 1024 * 1024,
 };
 
-async function overpassCells(box, classes, cap, label = 'Overpass', ttl = RETAIN['overpass.infrastructure']) {
+async function overpassCells(box, classes, cap, label = 'Overpass', ttl = RETAIN['overpass.infrastructure'], centre = null) {
   const byKey = new Map(classes.map((c) => [c.key, c]));
   const chosen = classes.map((c) => c.key);
   const cells = overpassCellsOf(box);
   const held = new Map();   // pair key -> { elements, truncated }
   const missing = [];
+  let partial = null;
   await Promise.all(chosen.flatMap((p) => cells.map(async (c) => {
     const k = overpassCellKey(p, c);
     const v = await peekCached(k, ttl);
@@ -1985,7 +1986,19 @@ async function overpassCells(box, classes, cap, label = 'Overpass', ttl = RETAIN
     const presets = chosen.filter((p) => missing.some((m) => m.p === p));
     const need = [...new Map(missing.map((m) => [m.c.key, m.c])).values()];
     log('info', `${label}: ${need.length} of ${cells.length} cells not cached (${presets.join(', ')}) — querying`);
-    await overpassFetchCells(need, presets, byKey, box.step, label, ttl, held);
+    const at = centre || { lat: (box.south + box.north) / 2, lon: (box.west + box.east) / 2 };
+    try {
+      await overpassFetchCells(need, presets, byKey, box.step, label, ttl, held, at);
+    } catch (e) {
+      // A view is fetched in parts, one after another, and a refusal can
+      // land part-way through. Throwing then discarded every part already in
+      // hand — and the cells that were cached before this request even
+      // started — so a busy Overpass showed nothing at all. Return what there
+      // is, say it is partial, and let the browser ask for the rest later.
+      if (!(e instanceof UpstreamError)) throw e;
+      if (held.size === 0) throw e;
+      partial = { error: e, retryAfter: e.retryAfter ?? 30 };
+    }
   }
 
   // Assemble the view, each element once however many classes or cells
@@ -2006,7 +2019,16 @@ async function overpassCells(box, classes, cap, label = 'Overpass', ttl = RETAIN
       }
     }
   }
-  return { elements, truncated };
+  if (!partial) return { elements, truncated };
+  const pending = cells.filter((c) => chosen.some((p) => !held.has(overpassCellKey(p, c)))).length;
+  return {
+    elements, truncated,
+    partial: true,
+    cells: cells.length,
+    missing: pending,
+    retryAfter: partial.retryAfter,
+    reason: partial.error.message,
+  };
 }
 
 /**
@@ -2054,15 +2076,26 @@ function splitCells(need) {
   return a.length && b.length ? [a, b] : null;
 }
 
-async function overpassFetchCells(need, presets, byKey, step, label, ttl, held) {
+/** Parts nearest a point first: the middle of the view arrives first. */
+function nearestPartsFirst(parts, at) {
+  if (!at) return parts;
+  const d = (part) => {
+    const lat = part.reduce((a, c) => a + (c.south + c.north) / 2, 0) / part.length;
+    const lon = part.reduce((a, c) => a + (c.west + c.east) / 2, 0) / part.length;
+    return (lat - at.lat) ** 2 + ((lon - at.lon) * Math.cos((at.lat * Math.PI) / 180)) ** 2;
+  };
+  return [...parts].sort((a, b) => d(a) - d(b));
+}
+
+async function overpassFetchCells(need, presets, byKey, step, label, ttl, held, at = null) {
   // Split BEFORE asking when the box is bigger than one query should cover,
   // or holds a cell already known to overflow the cap.
   if (need.length > 1
       && (need.length > overpassMaxCells(presets) || need.some((c) => isDense(presets, c)))) {
     const parts = splitCells(need);
     if (parts) {
-      for (const part of parts) {
-        await overpassFetchCells(part, presets, byKey, step, label, ttl, held);
+      for (const part of nearestPartsFirst(parts, at)) {
+        await overpassFetchCells(part, presets, byKey, step, label, ttl, held, at);
       }
       return;
     }
@@ -2094,8 +2127,8 @@ async function overpassFetchCells(need, presets, byKey, step, label, ttl, held) 
     // Degenerate split (all on one side): fall through and store as truncated.
     if (parts) {
       log('info', `${label}: ${need.length} cells came back over ${overpassLimits.queryCap} elements — asking in two parts`);
-      for (const part of parts) {
-        await overpassFetchCells(part, presets, byKey, step, label, ttl, held);
+      for (const part of nearestPartsFirst(parts, at)) {
+        await overpassFetchCells(part, presets, byKey, step, label, ttl, held, at);
       }
       return;
     }
@@ -2133,6 +2166,18 @@ async function overpassFetchCells(need, presets, byKey, step, label, ttl, held) 
     }
     held.set(k, value);
   }
+}
+
+/** What a partly fetched answer tells the browser, or nothing if complete. */
+function partialFields(raw) {
+  if (!raw.partial) return {};
+  return {
+    partial: true,
+    cells: raw.cells,
+    missing: raw.missing,
+    retryAfter: raw.retryAfter,
+    partialReason: raw.reason,
+  };
 }
 
 /**
@@ -2183,7 +2228,8 @@ async function overpass({ bbox, presets, preset, limit }) {
   // on the order of weeks, and Overpass is donated capacity.
   const raw = await overpassCells(q,
     chosen.map((k) => ({ key: k, body: OVERPASS_PRESETS[k].body, match: OVERPASS_PRESETS[k].match })), cap,
-    'Overpass', RETAIN['overpass.infrastructure']);
+    'Overpass', RETAIN['overpass.infrastructure'],
+    { lat: (b.south + b.north) / 2, lon: (b.west + b.east) / 2 });
 
   const byPreset = Object.fromEntries(chosen.map((k) => [k, 0]));
   const features = [];
@@ -2237,7 +2283,10 @@ async function overpass({ bbox, presets, preset, limit }) {
     // not the box the browser asked for. Telling it lets it record coverage
     // from what was fetched instead of guessing from what it requested — and
     // the cell is the larger of the two, so panning stays inside it.
-    covered: bb,
+    // A partial answer covers only some of the cell, so it claims none of
+    // it: the browser must come back for the rest.
+    covered: raw.partial ? null : bb,
+    ...partialFields(raw),
     trimmed: q.trimmed || false,
     features: shown,
   };
@@ -2595,7 +2644,8 @@ async function alpr({ bbox, vendor, limit }) {
       + `nwr["man_made"="surveillance"]["manufacturer"~"flock",i](${box});`
       + `nwr["man_made"="surveillance"]["brand"~"flock",i](${box});`,
     match: () => true,   // the query is the filter
-  }], cap, 'Overpass (ALPR)', RETAIN['overpass.alpr']);
+  }], cap, 'Overpass (ALPR)', RETAIN['overpass.alpr'],
+  { lat: (b.south + b.north) / 2, lon: (b.west + b.east) / 2 });
 
   const seen = new Set();
   let cameras = [];
@@ -2661,7 +2711,8 @@ async function alpr({ bbox, vendor, limit }) {
       Object.entries(byOperator).sort((a, b) => b[1] - a[1]).slice(0, 12)),
     withDirection: cameras.filter((c) => c.directions.length).length,
     vendors: ALPR_VENDORS.map(({ key, label, color }) => ({ key, label, color })),
-    covered: bb,
+    covered: raw.partial ? null : bb,
+    ...partialFields(raw),
     trimmed: q.trimmed || false,
     truncated: raw.truncated || cameras.length < filtered,
     cameras,
@@ -3410,7 +3461,9 @@ async function flightRoute({ callsign }) {
 async function aircraftInfo({ icao24 }) {
   const hex = String(icao24 || '').trim().toLowerCase().replace(/[^0-9a-f]/g, '');
   if (hex.length !== 6) throw new UpstreamError(400, 'icao24 hex required');
-  return cachedPersistent(`ac:${hex}`, RETAIN['aircraft.airframes'], async () => {
+  // v2: answers stored before the full-size photo was kept had only the
+  // thumbnail, and would otherwise serve it for as long as they are retained.
+  return cachedPersistent(`ac:v2:${hex}`, RETAIN['aircraft.airframes'], async () => {
     try {
       const raw = await grab(`https://api.adsbdb.com/v0/aircraft/${hex}`,
         {}, { label: 'adsbdb aircraft', timeoutMs: 15000 });
@@ -3425,7 +3478,11 @@ async function aircraftInfo({ icao24 }) {
         owner: a.registered_owner || null,
         ownerCountry: a.registered_owner_country_name || null,
         ownerOperatorFlag: a.registered_owner_operator_flag_code || null,
-        photo: safeUrl(a.url_photo_thumbnail),
+        // The full-size photo for the panel, and the thumbnail as a stand-in
+        // that arrives quickly while it loads. adsbdb's thumbnails are about
+        // 200 px wide, which looked like a smudge at panel width.
+        photo: safeUrl(a.url_photo) || safeUrl(a.url_photo_thumbnail),
+        photoThumb: safeUrl(a.url_photo_thumbnail),
       };
     } catch (e) {
       if (e.status === 404) return { icao24: hex, known: false };

@@ -8,7 +8,7 @@ import { test, describe, beforeEach, afterEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { installCesium, makeViewer } from '../../helpers/cesium-stub.mjs';
 import { installDom } from '../../helpers/dom-stub.mjs';
-import { api, apiQueueDepth, OverpassLayer, ShodanLayer, AlprLayer } from '../../../public/js/layers.js';
+import { api, apiQueueDepth, OverpassLayer, ShodanLayer, AlprLayer, DEPTH_FREE_M } from '../../../public/js/layers.js';
 
 /** A fetch whose requests stay open until the test releases them. */
 function controlledFetch() {
@@ -231,6 +231,50 @@ describe('a view change while a request is running', () => {
     assert.equal(calls.length, 2);
     assert.equal(calls[1].bbox, RALEIGH);
     calls[1].resolve();
+  });
+});
+
+describe('markers and the far side of the planet', () => {
+  test('skip the depth test only near the camera, so the globe can hide them', () => {
+    assert.ok(Number.isFinite(DEPTH_FREE_M) && DEPTH_FREE_M <= 100_000);
+    const l = new AlprLayer(makeViewer());
+    l.accumulate = true;
+    l.remember([{ id: 'a', lat: 35.77, lon: -78.64, directions: [], vendor: 'flock' }]);
+    l.redraw();
+    const pin = l.source.entities.values.find((e) => e.billboard);
+    assert.equal(pin.billboard.disableDepthTestDistance, DEPTH_FREE_M);
+  });
+});
+
+describe('retry timing', () => {
+  test('a 429 that says when to come back is believed, and never climbs to the hour step', () => {
+    const l = new OverpassLayer(makeViewer());
+    l.setEnabled(true);
+    for (let i = 0; i < 8; i++) l.scheduleRetry(Object.assign(new Error('busy'), { status: 429, retryAfter: 40 }), {});
+    assert.ok(l.retryInSec >= 40 && l.retryInSec < 45, `waits ${l.retryInSec}s`);
+    clearTimeout(l._retryTimer);
+  });
+
+  test('other failures still back off up the ladder', () => {
+    const l = new OverpassLayer(makeViewer());
+    l.setEnabled(true);
+    for (let i = 0; i < 8; i++) l.scheduleRetry(new Error('down'), {});
+    assert.equal(l.retryInSec, 3600);
+    clearTimeout(l._retryTimer);
+  });
+
+  test('a partial OSM answer is drawn, claims no coverage, and books the rest', async () => {
+    const l = new OverpassLayer(makeViewer());
+    l.setEnabled(true);
+    l.fetch = async () => ({ features: [{ id: 'n/1', lat: 35, lon: -79, preset: 'surveillance', tags: {} }],
+      partial: true, cells: 16, missing: 12, retryAfter: 25, covered: null });
+    await l.refresh({ bbox: '35,-79,35.1,-78.9' });
+    assert.equal(l.store.size, 1, 'what came back is kept');
+    assert.equal(l.covered.length, 0);
+    assert.equal(l.status, 'error');
+    assert.match(l.error, /Partly loaded: 4 of 16/);
+    assert.ok(l.retryInSec >= 25 && l.retryInSec < 30);
+    clearTimeout(l._retryTimer);
   });
 });
 

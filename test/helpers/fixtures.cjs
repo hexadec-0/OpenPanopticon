@@ -381,7 +381,9 @@ function adsbdbAircraft({ url }) {
   return json({ response: { aircraft: {
     registration: 'N12345', type: '737-800', icao_type: 'B738', manufacturer: 'Boeing',
     registered_owner: 'Test Air', registered_owner_country_name: 'Testland',
-    registered_owner_operator_flag_code: 'TST', url_photo_thumbnail: 'https://photos.example/a1b2c3.jpg',
+    registered_owner_operator_flag_code: 'TST',
+    url_photo: 'https://photos.example/a1b2c3.jpg',
+    url_photo_thumbnail: 'https://photos.example/thumbnails/a1b2c3.jpg',
   } } });
 }
 

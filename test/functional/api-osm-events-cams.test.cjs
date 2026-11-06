@@ -24,6 +24,48 @@ beforeEach(async () => {
 
 const overpassQl = () => new URLSearchParams(s.mock.callsTo('overpass-api.de').at(-1).body).get('data');
 
+describe('/api/overpass when Overpass refuses part-way', () => {
+  const WIDE = '34.76,-100.24,35.24,-99.76';   // 16 cells, asked in four parts
+  const isQuery = (url, call) => /overpass/.test(url.hostname) && call.method === 'POST';
+  /** One element at the middle of whatever box the query asked for. */
+  const oneInBox = ({ body }) => {
+    const data = new URLSearchParams(String(body)).get('data');
+    const [s1, w, n, e] = /\((-?[\d.]+),(-?[\d.]+),(-?[\d.]+),(-?[\d.]+)\)/.exec(data).slice(1).map(Number);
+    return json({ elements: [{ type: 'node', id: Math.round((s1 + w) * 1000), lat: (s1 + n) / 2, lon: (w + e) / 2,
+      tags: { man_made: 'surveillance' } }] });
+  };
+
+  test('the parts already fetched are returned and drawn, marked partial, with when to ask again', async () => {
+    s.mock.on(isQuery, () => status(429, 'rate limited'));
+    s.mock.once(isQuery, oneInBox);
+    const all = Object.keys(s.mod.OVERPASS_PRESETS).join(',');
+    const r = await s.api('/api/overpass', { bbox: WIDE, presets: all });
+    assert.equal(r.status, 200);
+    const d = r.json();
+    assert.equal(d.partial, true);
+    assert.equal(d.cells, 16);
+    assert.equal(d.missing, 12);
+    assert.equal(d.count, 1, 'the part that came back is in the answer');
+    assert.equal(d.covered, null, 'claims no coverage it does not have');
+    assert.ok(d.retryAfter > 0);
+  });
+
+  test('nothing in hand at all is still an error', async () => {
+    s.mock.on(isQuery, () => status(429, 'rate limited'));
+    const r = await s.api('/api/overpass', { bbox: WIDE, presets: 'surveillance' });
+    assert.equal(r.status, 429);
+  });
+
+  test('cached ground is shown even while Overpass is cooling down', async () => {
+    await s.api('/api/overpass', { bbox: BBOX, presets: 'power' });
+    s.mod.overpassGate.cooldownUntil = Date.now() + 120_000;
+    const d = (await s.api('/api/overpass', { bbox: WIDE, presets: 'power' })).json();
+    assert.equal(d.partial, true);
+    assert.ok(d.count > 0, 'the cached cells are drawn');
+    assert.ok(d.retryAfter >= 100);
+  });
+});
+
 describe('/api/overpass request sizing', () => {
   test('a wide view with every class is asked in small boxes, not one huge one', async () => {
     // 0.5 x 0.5 degrees = 16 cells; ten classes allow 4 cells per query.

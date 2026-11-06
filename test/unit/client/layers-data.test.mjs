@@ -228,7 +228,8 @@ describe('FlightLayer', () => {
     assert.match(route, /Airframe/);
     assert.match(route, /N12345/);
     assert.match(route, /Great-circle<\/th><td>\d+ km/);
-    assert.match(root.querySelector('[data-slot="photo"]').innerHTML, /src="https:\/\/photos\.example\/a1b2c3\.jpg"/);
+    // The thumbnail shows first; the full-size photo replaces it once loaded.
+    assert.match(root.querySelector('[data-slot="photo"]').innerHTML, /src="https:\/\/photos\.example\/thumbnails\/a1b2c3\.jpg"/);
     assert.equal(l.routeSource.entities.values.length, 2, 'departure and arrival markers, no line');
     assert.ok(!l.routeSource.entities.values.some((e) => e.polyline));
     l.clearRoute();
