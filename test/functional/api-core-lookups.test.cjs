@@ -55,7 +55,7 @@ describe('/api/config', () => {
     const strip = (c) => {
       const { tileCache, retention, ...rest } = c;
       assert.ok(Array.isArray(tileCache.hosts));
-      assert.equal(retention.shodan, 3 * 86400_000);
+      assert.equal(retention.shodan, 30 * 86400_000);
       return rest;
     };
     assert.deepEqual(strip((await s.api('/api/config')).json()), { cesiumIonToken: null, cartoLabels: true });
@@ -315,7 +315,7 @@ describe('/tiles/carto (label tiles proxy)', () => {
     assert.equal(r.status, 200);
     assert.equal(r.headers['content-type'], 'image/png');
     assert.deepEqual(r.buffer, PNG_1PX);
-    assert.match(r.headers['cache-control'], /max-age=86400/);
+    assert.match(r.headers['cache-control'], /max-age=2592000/);
     const call = s.mock.callsTo('basemaps.cartocdn.com')[0];
     const u = new URL(call.url);
     assert.equal(u.hostname, `${'abcd'[(7 + 12) % 4]}.basemaps.cartocdn.com`);

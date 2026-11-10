@@ -50,7 +50,11 @@ if (!process.env.OPENPANOPTICON_DATA_DIR) {
   }
 }
 
-loadDotEnv(process.env.OPENPANOPTICON_ENV_FILE || path.join(ROOT, '.env'));
+const ENV_FILE = process.env.OPENPANOPTICON_ENV_FILE || path.join(ROOT, '.env');
+// Variables that took their value from .env rather than the real environment.
+// The settings menu may rewrite these; the rest are fixed from outside.
+const ENV_FROM_FILE = new Set();
+loadDotEnv(ENV_FILE);
 
 const CFG = {
   port: parseInt(process.env.PORT || '8420', 10),
@@ -95,7 +99,7 @@ function loadDotEnv(file) {
     if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
       v = v.slice(1, -1);
     }
-    if (!(m[1] in process.env)) process.env[m[1]] = v;
+    if (!(m[1] in process.env)) { process.env[m[1]] = v; ENV_FROM_FILE.add(m[1]); }
   }
 }
 
@@ -120,19 +124,20 @@ const CACHE_CONF_FILE = process.env.OPENPANOPTICON_CACHE_CONF || path.join(ROOT,
 const CACHE_SCHEMA = [
   ['maps', 'tiles', '30d', 'Map tiles on disk in providers/tiles: aerial imagery, street and vector\n# maps, place labels, NASA imagery, Sentinel-2 scenes. A tile is fetched again\n# this long after it was downloaded, however often it is used.'],
   ['maps', 'tiles_max_size', '4096MB', 'Largest the tile folder may grow. Past it, the oldest tiles go first.'],
-  ['maps', 'browser', '1d', 'How long the browser keeps its own copy of a tile, on top of the disk one.'],
+  ['maps', 'browser', '30d', 'How long the browser keeps its own copy of a tile, on top of the disk one.'],
   ['maps', 'scenes', '3d', 'Sentinel-2 scene searches: which scenes cover a view (not the imagery).'],
-  ['shodan', 'hosts', '3d', 'Shodan search results. Every miss spends a query credit, so this is also\n# how long a view is not paid for twice.'],
+  ['shodan', 'hosts', '30d', 'Shodan search results. Every miss spends a query credit, so this is also\n# how long a view is not paid for twice.'],
   ['shodan', 'credits', '1m', 'The remaining-credit count shown in the sidebar.'],
-  ['overpass', 'infrastructure', '3d', 'OSM infrastructure layer (masts, substations, cameras, military, ...).\n# Overpass is donated capacity and rate-limits hard; mapped things change\n# over weeks.'],
-  ['overpass', 'alpr', '3d', 'ALPR / Flock camera layer.'],
+  ['overpass', 'infrastructure', '30d', 'OSM infrastructure layer (masts, substations, cameras, military, ...).\n# Overpass is donated capacity and rate-limits hard; mapped things change\n# over weeks.'],
+  ['overpass', 'alpr', '30d', 'ALPR / Flock camera layer.'],
   ['overpass', 'truncated', '1h', 'An answer that hit the item cap is incomplete, so it is held in memory\n# only, for this long, and never written to disk.'],
-  ['network', 'infrastructure', '3d', 'RIPE Atlas probes, cell towers (OpenCelliD), WiFi (WiGLE), Tor relays.'],
-  ['cameras', 'directories', '3d', 'Webcam directories: NYC DOT, OpenWebcamDB, ALERTCalifornia.'],
-  ['satellites', 'elements', '1d', 'Orbital elements from CelesTrak. Only accurate near their epoch: older\n# elements put low-orbit objects tens of kilometres from where they are.'],
+  ['network', 'infrastructure', '30d', 'RIPE Atlas probes, cell towers (OpenCelliD), WiFi (WiGLE), Tor relays.'],
+  ['cameras', 'directories', '14d', 'Webcam directories: NYC DOT, OpenWebcamDB, ALERTCalifornia.'],
+  ['satellites', 'elements', '14d', 'Orbital elements from CelesTrak. Only accurate near their epoch: older\n# elements put low-orbit objects tens of kilometres from where they are.'],
   ['aircraft', 'airframes', '3d', 'Aircraft type and registration lookups.'],
   ['vessels', 'photos', '7d', 'Ship photos found on Wikimedia Commons by IMO or MMSI, and the ships\n# found to have none (so they are not asked about again on every click).'],
   ['aircraft', 'routes', '30m', 'Flight routes by callsign. The same flight number flies different legs\n# on different days.'],
+  ['aircraft', 'trails', '4m', 'How long each segment of an aircraft trail stays on screen before it\n# drops off the tail. Longer shows more of the track and more clutter; 0\n# draws no trails. At most 240 fixes are kept per aircraft.'],
   ['places', 'geocode', '3d', 'Place-name searches.'],
   ['places', 'seismic', '3d', 'Seismometer station lists.'],
   ['current', 'events', '1h', 'Hazards and alerts: GDACS, EONET, USGS, NWS, FIRMS, EDIS. An old alert\n# drawn as live is worse than none.'],
@@ -141,7 +146,7 @@ const CACHE_SCHEMA = [
   ['current', 'threats', '1h', 'Feodo botnet command-and-control list.'],
   ['current', 'outages', '1h', 'Internet outages (IODA).'],
   ['current', 'radar', '4m', 'Weather radar frame list.'],
-  ['memory', 'max_entries', '1000', 'Most answers held in memory at once. The disk copies stay; this only\n# bounds memory.'],
+  ['memory', 'max_entries', '5000', 'Most answers held in memory at once. The disk copies stay; this only\n# bounds memory.'],
   ['memory', 'label_tiles', '3000', 'Place-label tiles held in memory, on top of the disk copy.'],
 ];
 
@@ -169,11 +174,14 @@ function parseSetting(name, v) {
 
 /** Current settings, by "section.key": milliseconds, bytes or a count. */
 const RETAIN = {};
+/** The same settings as written (30d, 4096MB), for the settings menu. */
+const RETAIN_TEXT = {};
 let cacheConfProblems = [];
 
 /** Read cache.conf over the defaults. Returns what it could not use. */
 function loadCacheConf(file = CACHE_CONF_FILE) {
   const vals = Object.fromEntries(CACHE_SCHEMA.map(([sec, key, def]) => [`${sec}.${key}`, parseSetting(`${sec}.${key}`, def)]));
+  const texts = Object.fromEntries(CACHE_SCHEMA.map(([sec, key, def]) => [`${sec}.${key}`, def]));
   const problems = [];
   let text = null;
   try { text = fs.readFileSync(file, 'utf8'); } catch { /* none yet: defaults */ }
@@ -192,15 +200,18 @@ function loadCacheConf(file = CACHE_CONF_FILE) {
       const v = parseSetting(name, kv[2]);
       if (v == null) { problems.push(`line ${i + 1}: "${kv[2].trim()}" is not a ${kindOf(name)} (${name})`); return; }
       vals[name] = v;
+      texts[name] = kv[2].trim();
       set.add(name);
     });
   }
   // TILE_CACHE_MAX_MB in .env predates this file; honour it unless the file says otherwise.
   if (!set.has('maps.tiles_max_size') && Number(process.env.TILE_CACHE_MAX_MB) > 0) {
     vals['maps.tiles_max_size'] = Number(process.env.TILE_CACHE_MAX_MB) * 2 ** 20;
+    texts['maps.tiles_max_size'] = `${Number(process.env.TILE_CACHE_MAX_MB)}MB`;
   }
   vals['maps.tiles_max_size'] = Math.max(64 * 2 ** 20, vals['maps.tiles_max_size']);
   Object.assign(RETAIN, vals);
+  Object.assign(RETAIN_TEXT, texts);
   cacheConfProblems = problems;
   return { found: text != null, problems };
 }
@@ -231,6 +242,7 @@ function diskMaxAge() {
   for (const [sec, key] of CACHE_SCHEMA) {
     const name = `${sec}.${key}`;
     if (sec === 'maps' && key !== 'scenes') continue;   // tiles are their own store
+    if (name === 'aircraft.trails') continue;           // drawn in the browser, never on disk
     if (kindOf(name) === 'duration') max = Math.max(max, RETAIN[name] || 0);
   }
   return max;
@@ -250,7 +262,7 @@ const inflight = new Map();  // key -> Promise
 // are swept on a timer (see start()), and this caps what is live at once.
 // Evicting a persistent entry costs a disk read, not an upstream call.
 // memory.max_entries in cache.conf.
-const cacheMaxEntries = () => Math.max(50, RETAIN['memory.max_entries'] || 1000);
+const cacheMaxEntries = () => Math.max(50, RETAIN['memory.max_entries'] || 5000);
 
 /** Drop every expired entry. Returns how many went. */
 function sweepCache(now = Date.now()) {
@@ -4862,6 +4874,359 @@ async function basemap({ provider, bbox, from, to, maxCloud, limit }) {
   throw new UpstreamError(400, `unknown base map provider "${p}"`);
 }
 
+// ---------------------------------------------------------------------------
+// Settings menu: credentials into .env, retention into cache.conf
+// ---------------------------------------------------------------------------
+//
+// The page's settings menu edits the same two files an operator edits by
+// hand, so there is one source of truth and a restart reads back what was
+// saved.
+//
+// Credentials go one way only. The page can replace or clear one, and is told
+// whether each is set, but no route ever sends a stored value back: a key
+// typed here is as private afterwards as one typed into .env.
+//
+// A variable supplied by the real environment (Docker, a shell export) wins
+// over .env at startup, so writing it to .env would look saved and change
+// nothing. Those are reported as fixed and refused.
+
+/** Drop cached tokens and live connections that were made with an old credential. */
+const CREDENTIAL_RESETS = {
+  opensky: () => { openSkyToken = { value: null, expires: 0 }; },
+  gee: () => { geeToken = { value: null, expires: 0 }; },
+  ais: () => {
+    clearTimeout(ais.reconnectTimer);
+    ais.reconnectDelay = 2000;
+    const had = ais.socket;
+    if (!CFG.aisKey) ais.status = 'disabled';
+    // Closing schedules a reconnect with the key now in CFG; with no socket
+    // the next vessel request opens one.
+    try { had?.close(); } catch { /* already closing */ }
+  },
+};
+
+// name: the .env variable. secret: false for identifiers that are not
+// themselves a key (still never sent back). set: put the value in force.
+const CREDENTIALS = [
+  { name: 'SHODAN_API_KEY', group: 'Shodan', label: 'API key', url: 'https://account.shodan.io/',
+    note: 'Needed for the Shodan layer.', set: (v) => { CFG.shodanKey = v; } },
+
+  { name: 'OPENSKY_CLIENT_ID', group: 'Aircraft', label: 'OpenSky client ID', secret: false,
+    url: 'https://opensky-network.org/my-opensky',
+    note: 'Optional. Raises the daily budget from 400 to 4000 credits.',
+    set: (v) => { CFG.openSkyId = v; }, reset: 'opensky' },
+  { name: 'OPENSKY_CLIENT_SECRET', group: 'Aircraft', label: 'OpenSky client secret',
+    set: (v) => { CFG.openSkySecret = v; }, reset: 'opensky' },
+
+  { name: 'AISSTREAM_API_KEY', group: 'Vessels', label: 'AISStream key', url: 'https://aisstream.io/',
+    note: 'Live AIS ship positions.', set: (v) => { CFG.aisKey = v; }, reset: 'ais' },
+
+  { name: 'WINDY_API_KEY', group: 'Webcams', label: 'Windy key', url: 'https://api.windy.com/keys',
+    note: 'Worldwide public webcams.', set: (v) => { CFG.windyKey = v; } },
+  { name: 'OPENWEBCAMDB_API_KEY', group: 'Webcams', label: 'OpenWebcamDB key', url: 'https://openwebcamdb.com/api',
+    set: (v) => { CFG.owcdbKey = v; } },
+
+  { name: 'FIRMS_MAP_KEY', group: 'Hazards', label: 'NASA FIRMS map key',
+    url: 'https://firms.modaps.eosdis.nasa.gov/api/map_key/',
+    note: 'Active-fire detections.', set: (v) => { CFG.firmsKey = v; } },
+  { name: 'EDIS_API_URL', group: 'Hazards', label: 'RSOE EDIS feed URL', secret: false, kind: 'url',
+    note: 'Enterprise feed; needs the URL and the key.', set: (v) => { CFG.edisUrl = v; } },
+  { name: 'EDIS_API_KEY', group: 'Hazards', label: 'RSOE EDIS key', set: (v) => { CFG.edisKey = v; } },
+
+  { name: 'CESIUM_ION_TOKEN', group: 'Maps', label: 'Cesium Ion token', url: 'https://ion.cesium.com/tokens',
+    note: 'Terrain and aerial imagery. This one token is handed to the browser by design, so scope it read-only.',
+    set: (v) => { CFG.cesiumIonToken = v; } },
+  { name: 'CARTO_API_KEY', group: 'Maps', label: 'CARTO key', url: 'https://carto.com/basemaps/apikey',
+    note: 'Place and road labels.', set: (v) => { CFG.cartoKey = v; } },
+  { name: 'GEE_PROJECT', group: 'Maps', label: 'Earth Engine project', secret: false,
+    url: 'https://code.earthengine.google.com',
+    note: 'Earth Engine appears as a base map once project, service account and private key are all set.',
+    set: (v) => { GEE.project = v; }, reset: 'gee' },
+  { name: 'GEE_CLIENT_EMAIL', group: 'Maps', label: 'Earth Engine service account', secret: false,
+    set: (v) => { GEE.clientEmail = v; }, reset: 'gee' },
+  { name: 'GEE_PRIVATE_KEY', group: 'Maps', label: 'Earth Engine private key', kind: 'pem',
+    note: 'The "private_key" field of the service account JSON key.',
+    set: (v) => { GEE.privateKey = v.replace(/\\n/g, '\n'); }, reset: 'gee' },
+
+  { name: 'OPENCELLID_API_KEY', group: 'Network', label: 'OpenCelliD key', url: 'https://opencellid.org/register.php',
+    note: 'Cell towers.', set: (v) => { CFG.openCellIdKey = v; } },
+  { name: 'WIGLE_API_NAME', group: 'Network', label: 'WiGLE API name', secret: false, url: 'https://wigle.net/account',
+    note: 'WiFi networks. Use the API name and token, not the account login.',
+    set: (v) => { CFG.wigleName = v; } },
+  { name: 'WIGLE_API_TOKEN', group: 'Network', label: 'WiGLE API token', set: (v) => { CFG.wigleToken = v; } },
+  { name: 'GREYNOISE_API_KEY', group: 'Network', label: 'GreyNoise key', url: 'https://viz.greynoise.io/signup',
+    note: 'Optional. Without it, 10 lookups a day.', set: (v) => { CFG.greyNoiseKey = v; } },
+  { name: 'CLOUDFLARE_API_TOKEN', group: 'Network', label: 'Cloudflare Radar token',
+    url: 'https://dash.cloudflare.com/profile/api-tokens',
+    note: 'Needs the Radar:Read permission.', set: (v) => { CFG.cloudflareToken = v; } },
+
+  { name: 'EIA_API_KEY', group: 'Regional signals', label: 'EIA key', url: 'https://www.eia.gov/opendata/register.php',
+    note: 'US grid demand.', set: (v) => { CFG.eiaKey = v; } },
+  { name: 'FIVE_ELEVEN_KEYS', group: 'Regional signals', label: '511 traffic keys', kind: 'pairs',
+    note: 'One key per state, as STATE:key pairs separated by commas, e.g. TX:abc,GA:def.',
+    set: (v) => { CFG.fiveElevenKeys = parse511(v); } },
+];
+const CREDENTIAL_BY_NAME = new Map(CREDENTIALS.map((c) => [c.name, c]));
+
+const SETTING_MAX_CHARS = 8192;
+
+/** Fixed by the real environment, so .env cannot change it. */
+const envFixed = (name) => name in process.env && !ENV_FROM_FILE.has(name);
+
+/**
+ * A submitted credential as it will sit on one line of .env, or an error.
+ * '' clears it. Returns { value } or { error }.
+ */
+function cleanCredential(c, raw) {
+  if (typeof raw !== 'string') return { error: 'must be text' };
+  let v = raw.trim();
+  // A PEM key pasted as it appears in a file: fold it onto one line with the
+  // \n escapes .env uses.
+  if (c.kind === 'pem') v = v.replace(/\r?\n/g, '\\n');
+  if (v.length > SETTING_MAX_CHARS) return { error: 'too long' };
+  // One line, printable: anything else would break out of its line in .env.
+  if (/[\x00-\x1f\x7f]/.test(v)) return { error: 'must be a single line with no control characters' };
+  if (v && c.kind === 'url' && !safeUrl(v)) return { error: 'must be an http(s) URL' };
+  if (v && c.kind === 'pairs' && !Object.keys(parse511(v)).length) return { error: 'expected STATE:key pairs, e.g. TX:abc,GA:def' };
+  return { value: v };
+}
+
+/** NAME=value as loadDotEnv() reads it back. */
+function envLine(name, v) {
+  // loadDotEnv strips one pair of matching outer quotes, so a value that
+  // itself starts and ends with a quote is wrapped in the other kind.
+  const quoted = (c) => v.startsWith(c) && v.endsWith(c);
+  const q = quoted('"') ? "'" : quoted("'") ? '"' : '';
+  return `${name}=${q}${v}${q}`;
+}
+
+/** .env text with the given variables set, everything else left as written. */
+function mergeEnvText(text, updates) {
+  const eol = text.includes('\r\n') ? '\r\n' : '\n';
+  const lines = text.length ? text.split(/\r?\n/) : [];
+  const left = new Map(updates);
+  // The first assignment is the one loadDotEnv() honours.
+  for (let i = 0; i < lines.length && left.size; i++) {
+    const m = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=/.exec(lines[i]);
+    if (m && left.has(m[1])) { lines[i] = envLine(m[1], left.get(m[1])); left.delete(m[1]); }
+  }
+  // Then a commented-out placeholder, as .env.example has for optional ones.
+  for (let i = 0; i < lines.length && left.size; i++) {
+    const m = /^\s*#\s*([A-Za-z_][A-Za-z0-9_]*)\s*=/.exec(lines[i]);
+    if (m && left.has(m[1])) { lines[i] = envLine(m[1], left.get(m[1])); left.delete(m[1]); }
+  }
+  if (left.size) {
+    while (lines.length && lines[lines.length - 1].trim() === '') lines.pop();
+    if (lines.length) lines.push('');
+    lines.push('# Set from the settings menu.');
+    for (const [name, v] of left) lines.push(envLine(name, v));
+  }
+  if (lines[lines.length - 1] !== '') lines.push('');
+  return lines.join(eol);
+}
+
+/** cache.conf text with the given "section.key" settings changed in place. */
+function mergeCacheConfText(text, updates) {
+  const eol = text.includes('\r\n') ? '\r\n' : '\n';
+  const lines = text.split(/\r?\n/);
+  const done = new Set();
+  const sectionEnd = new Map();   // section -> index of its last line that holds something
+  let sec = '';
+  lines.forEach((raw, i) => {
+    const tail = /\s+[#;].*$/.exec(raw)?.[0] || '';
+    const line = raw.replace(/\s+[#;].*$/, '').trim();
+    if (!line || line.startsWith('#') || line.startsWith(';')) return;
+    const head = /^\[([\w.-]+)\]$/.exec(line);
+    if (head) { sec = head[1].toLowerCase(); sectionEnd.set(sec, i); return; }
+    sectionEnd.set(sec, i);
+    const kv = /^([\w.-]+)\s*[=:]/.exec(line);
+    if (!kv) return;
+    const name = sec ? `${sec}.${kv[1].toLowerCase()}` : kv[1].toLowerCase();
+    // Every occurrence: the last one is the one loadCacheConf() honours.
+    if (updates.has(name)) { lines[i] = `${kv[1]} = ${updates.get(name)}${tail}`; done.add(name); }
+  });
+
+  // Settings the file does not mention yet go into their section, or into a
+  // new one at the end. Work from the bottom up so earlier indexes hold.
+  const missing = [...updates.keys()].filter((n) => !done.has(n));
+  const helpOf = (name) => CACHE_SCHEMA.find(([s, k]) => `${s}.${k}` === name)?.[3];
+  const inPlace = missing.filter((n) => sectionEnd.has(n.split('.')[0]))
+    .sort((a, b) => sectionEnd.get(b.split('.')[0]) - sectionEnd.get(a.split('.')[0]));
+  for (const name of inPlace) {
+    const [s, key] = name.split('.');
+    lines.splice(sectionEnd.get(s) + 1, 0, '', `# ${helpOf(name)}`, `${key} = ${updates.get(name)}`);
+  }
+  const fresh = missing.filter((n) => !sectionEnd.has(n.split('.')[0]));
+  if (fresh.length) {
+    while (lines.length && lines[lines.length - 1].trim() === '') lines.pop();
+    let open = null;
+    for (const name of fresh) {
+      const [s, key] = name.split('.');
+      if (s !== open) { lines.push('', `[${s}]`); open = s; }
+      lines.push('', `# ${helpOf(name)}`, `${key} = ${updates.get(name)}`);
+    }
+  }
+  if (lines[lines.length - 1] !== '') lines.push('');
+  return lines.join(eol);
+}
+
+/**
+ * Replace a file's contents in one step, so a crash mid-write cannot leave
+ * half a .env behind. A file bind-mounted on its own cannot be renamed over,
+ * so that case falls back to writing it directly.
+ */
+function writeConfigFile(file, text, newMode) {
+  let target = file;
+  let mode = newMode;
+  try { target = fs.realpathSync(file); mode = fs.statSync(target).mode & 0o777; } catch { /* new file */ }
+  const tmp = `${target}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(tmp, text, { encoding: 'utf8', mode });
+    fs.renameSync(tmp, target);
+  } catch {
+    try { fs.unlinkSync(tmp); } catch { /* never written */ }
+    fs.writeFileSync(target, text, { encoding: 'utf8', mode });
+  }
+}
+
+const readTextOr = (file, fallback) => {
+  try { return fs.readFileSync(file, 'utf8'); } catch { return fallback(); }
+};
+
+/** What the settings menu shows. Carries no credential values. */
+function settingsView() {
+  return {
+    envFile: path.basename(ENV_FILE),
+    cacheFile: path.basename(CACHE_CONF_FILE),
+    credentials: CREDENTIALS.map((c) => ({
+      name: c.name,
+      group: c.group,
+      label: c.label,
+      url: c.url || null,
+      note: c.note || null,
+      secret: c.secret !== false,
+      multiline: c.kind === 'pem',
+      set: !!(process.env[c.name] || '').trim(),
+      fixed: envFixed(c.name),
+    })),
+    cache: CACHE_SCHEMA.map(([section, key, def, help]) => {
+      const name = `${section}.${key}`;
+      return {
+        name, section, key, kind: kindOf(name),
+        value: RETAIN_TEXT[name] ?? def,
+        default: def,
+        help: help.replace(/\n# /g, ' '),
+      };
+    }),
+    cacheProblems: cacheConfProblems,
+  };
+}
+
+/** Thrown for a submission that cannot be used; `fields` says which and why. */
+class SettingsError extends UpstreamError {
+  constructor(status, message, fields = null) {
+    super(status, message);
+    this.fields = fields;
+  }
+}
+
+/**
+ * Apply { credentials: { NAME: value }, cache: { "section.key": value } }.
+ * Everything is checked before anything is written, so a bad field never
+ * leaves the two files half-updated.
+ */
+function saveSettings(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) throw new SettingsError(400, 'expected a JSON object');
+  const isMap = (o) => o && typeof o === 'object' && !Array.isArray(o);
+  if (body.credentials != null && !isMap(body.credentials)) throw new SettingsError(400, '"credentials" must be an object');
+  if (body.cache != null && !isMap(body.cache)) throw new SettingsError(400, '"cache" must be an object');
+
+  const fields = {};
+  const creds = new Map();
+  for (const [name, raw] of Object.entries(body.credentials || {})) {
+    const c = CREDENTIAL_BY_NAME.get(name);
+    if (!c) { fields[name] = 'no such setting'; continue; }
+    if (envFixed(name)) { fields[name] = 'fixed by the environment the server was started with'; continue; }
+    const r = cleanCredential(c, raw);
+    if (r.error) fields[name] = r.error; else creds.set(name, r.value);
+  }
+  const cacheVals = new Map();
+  const known = new Set(CACHE_SCHEMA.map(([s, k]) => `${s}.${k}`));
+  for (const [name, raw] of Object.entries(body.cache || {})) {
+    if (!known.has(name)) { fields[name] = 'no such setting'; continue; }
+    const v = typeof raw === 'string' ? raw.trim() : '';
+    if (!v || v.length > 24 || parseSetting(name, v) == null) { fields[name] = `not a ${kindOf(name)}`; continue; }
+    cacheVals.set(name, v);
+  }
+  if (Object.keys(fields).length) throw new SettingsError(400, 'some settings could not be used', fields);
+
+  if (creds.size) {
+    const example = path.join(path.dirname(ENV_FILE), '.env.example');
+    const text = readTextOr(ENV_FILE, () => readTextOr(example, () => ''));
+    try { writeConfigFile(ENV_FILE, mergeEnvText(text, creds), 0o600); }
+    catch (e) { throw new SettingsError(500, `could not write ${path.basename(ENV_FILE)}: ${e.code || e.message}`); }
+    const resets = new Set();
+    for (const [name, v] of creds) {
+      const c = CREDENTIAL_BY_NAME.get(name);
+      process.env[name] = v;
+      ENV_FROM_FILE.add(name);
+      c.set(v);
+      if (c.reset) resets.add(c.reset);
+    }
+    for (const r of resets) CREDENTIAL_RESETS[r]();
+    // Names only: a value never reaches the log.
+    log('info', `settings: ${[...creds.keys()].join(', ')} written to ${path.basename(ENV_FILE)}`);
+  }
+
+  if (cacheVals.size) {
+    const text = readTextOr(CACHE_CONF_FILE, cacheConfText);
+    try { writeConfigFile(CACHE_CONF_FILE, mergeCacheConfText(text, cacheVals), 0o644); }
+    catch (e) { throw new SettingsError(500, `could not write ${path.basename(CACHE_CONF_FILE)}: ${e.code || e.message}`); }
+    loadCacheConf();
+    log('info', `settings: ${[...cacheVals.keys()].join(', ')} written to ${path.basename(CACHE_CONF_FILE)}`);
+  }
+
+  return { saved: { credentials: [...creds.keys()], cache: [...cacheVals.keys()] }, ...settingsView() };
+}
+
+/** A small JSON request body. */
+function readJsonBody(req, maxBytes = 64 * 1024) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > maxBytes) { reject(new SettingsError(413, 'request body too large')); req.destroy(); return; }
+      chunks.push(c);
+    });
+    req.on('end', () => {
+      try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); }
+      catch { reject(new SettingsError(400, 'request body is not JSON')); }
+    });
+    req.on('error', reject);
+  });
+}
+
+/**
+ * GET reads the menu, POST saves it. On top of the gate and the X-Panopticon
+ * header, a save must be JSON (a cross-site form cannot send that without a
+ * preflight this server never approves) and, when the browser names an
+ * origin, it must be this server's own.
+ */
+async function handleSettings(req) {
+  if (req.method !== 'POST') return settingsView();
+  if (!/^application\/json\b/i.test(String(req.headers['content-type'] || ''))) {
+    throw new SettingsError(415, 'settings must be sent as application/json');
+  }
+  const origin = req.headers.origin;
+  if (origin) {
+    let host = null;
+    try { host = new URL(origin).host.toLowerCase(); } catch { /* "null" or malformed */ }
+    if (host !== String(req.headers.host || '').toLowerCase()) throw new SettingsError(403, 'cross-origin request refused');
+  }
+  return saveSettings(await readJsonBody(req));
+}
+
 const ROUTES = {
   '/api/health': async () => ({
     ok: true,
@@ -4939,6 +5304,8 @@ const ROUTES = {
       events: RETAIN['current.events'],
       iot: RETAIN['current.sensors'],
       traffic: RETAIN['current.traffic'],
+      // Not a cache: how long the browser draws each aircraft trail segment.
+      flightTrails: RETAIN['aircraft.trails'],
     },
   }),
   // A free-form query (q=) is accepted only by POST — see apiAllowed().
@@ -5480,6 +5847,14 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (pathname === '/api/settings') {
+      const payload = await handleSettings(req);
+      done();
+      sendJson(res, 200, payload);
+      log('req', `${req.method} ${pathname} -> 200 (${Date.now() - started}ms)`);
+      return;
+    }
+
     const handler = ROUTES[pathname];
     if (handler) {
       const fresh = url.searchParams.get('fresh') === '1';
@@ -5505,6 +5880,7 @@ const server = http.createServer(async (req, res) => {
       detail: err.detail || null,
       // Lets the browser schedule its own retry instead of failing outright.
       retryAfter: err.retryAfter ?? null,
+      fields: err.fields || undefined,
       source: pathname,
     });
   }
@@ -5628,7 +6004,8 @@ module.exports = {
   server, start, CFG, TTL, ROUTES, PROVIDERS_DIR, DISK_CACHE_DIR, TLE_DIR,
   cache, inflight, cached, sweepCache, cachedPersistent, readDiskCache, writeDiskCache, clearDiskCache,
   pruneDiskCache, diskName, diskKeyHash,
-  RETAIN, CACHE_SCHEMA, loadCacheConf, cacheConfText, parseDuration, parseSize, diskMaxAge,
+  RETAIN, RETAIN_TEXT, CACHE_SCHEMA, loadCacheConf, ENV_FILE, CACHE_CONF_FILE,
+  CREDENTIALS, settingsView, saveSettings, mergeEnvText, mergeCacheConfText, envLine, cacheConfText, parseDuration, parseSize, diskMaxAge,
   reqCtx, wantsFresh, isCached, peekCached, overpassCellsOf, overpassBackoffMs, overpassLimits, nearestFirst,
   parse511, loadDotEnv, clip, htmlText, refusalReason, UpstreamError, grab, USER_AGENT,
   parseBbox, clamp, bboxCenter, bboxRadiusKm, snapFixed, viewCell, VIEW_CELL_DEG, VIEW_MAX_DEG,

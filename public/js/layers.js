@@ -138,16 +138,26 @@ const DR_MAX_SEC = 45;
 /**
  * How long a trail segment stays on screen, in milliseconds.
  *
- * Capped by age rather than point count: at a 7-second poll, 40 points is most
- * of ten minutes of history, and with the aircraft box snapped to a whole
- * degree the globe carries a few hundred contacts. Two minutes of track is
- * enough to read a heading and a turn, and it bounds the line to the distance
- * an aircraft covers in that time rather than to a number of fixes.
+ * Capped by age rather than point count, and with the aircraft box snapped to
+ * a whole degree the globe carries a few hundred contacts. Four minutes of
+ * track shows a heading, a turn and most of an approach, and it bounds the
+ * line to the distance an aircraft covers in that time rather than to a
+ * number of fixes.
+ *
+ * The default only: at boot the flight layer takes aircraft.trails from the
+ * server's cache.conf (see app.js, cfg.retention.flightTrails).
  */
-const TRAIL_MAX_AGE_MS = 120_000;
+const TRAIL_MAX_AGE_MS = 240_000;
 
-/** A hard ceiling on points per contact, whatever the poll rate does. */
-const TRAIL_MAX_POINTS = 40;
+/**
+ * A hard ceiling on points per contact, whatever the poll rate and the
+ * configured age: a trail set to hours must not grow without bound across a
+ * few hundred aircraft.
+ */
+const TRAIL_MAX_POINTS = 240;
+
+/** The fastest the feed is polled, for sizing a trail's point budget. */
+const TRAIL_MIN_POLL_MS = 5000;
 
 /** Shared empty positions array, so a contact with no history allocates none. */
 const EMPTY_TRAIL = Object.freeze([]);
@@ -950,6 +960,7 @@ export class FlightLayer extends Layer {
     this.showLabels = true;
     this.showTrails = true;
     this.trails = new Map();   // icao24 -> { pos: Cartesian3[], at: number[] }
+    this.trailMaxAgeMs = TRAIL_MAX_AGE_MS;   // aircraft.trails in cache.conf
     // Dead-reckoning anchors: icao24 -> the last reported fix plus the motion
     // to carry it forward with. See deadReckon().
     this.dr = new Map();
@@ -1003,10 +1014,10 @@ export class FlightLayer extends Layer {
     if (!t || !t.pos.length) return EMPTY_TRAIL;
 
     // Trimmed here rather than at poll time: this runs every frame, so a
-    // segment disappears when it is actually two minutes old instead of at
+    // segment disappears when it actually reaches the age limit instead of at
     // the next fetch, which could be seven seconds later or — with the feed
     // paused — never. The loop almost always does nothing.
-    const cutoff = Date.now() - TRAIL_MAX_AGE_MS;
+    const cutoff = Date.now() - this.trailMaxAgeMs;
     let drop = 0;
     while (drop < t.at.length && t.at[drop] < cutoff) drop++;
     if (drop) { t.pos.splice(0, drop); t.at.splice(0, drop); }
@@ -1112,8 +1123,10 @@ export class FlightLayer extends Layer {
           t.pos.push(pos);
           t.at.push(Date.now());
         }
-        // The count ceiling is only a backstop now; age is what governs.
-        while (t.pos.length > TRAIL_MAX_POINTS) { t.pos.shift(); t.at.shift(); }
+        // The count ceiling is only a backstop; age is what governs. It is
+        // sized so the configured age fits at the fastest poll.
+        const maxPoints = Math.min(TRAIL_MAX_POINTS, Math.ceil(this.trailMaxAgeMs / TRAIL_MIN_POLL_MS) + 2);
+        while (t.pos.length > maxPoints) { t.pos.shift(); t.at.shift(); }
       }
 
       const emergency = !!a.alert;

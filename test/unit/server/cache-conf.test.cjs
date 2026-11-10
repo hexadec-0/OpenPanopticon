@@ -17,9 +17,10 @@ describe('cache.conf', () => {
   test('defaults with no file', () => {
     S.loadCacheConf(path.join(dataDir, 'none.conf'));
     assert.equal(S.RETAIN['maps.tiles'], 30 * D);
-    assert.equal(S.RETAIN['shodan.hosts'], 3 * D);
-    assert.equal(S.RETAIN['overpass.infrastructure'], 3 * D);
+    assert.equal(S.RETAIN['shodan.hosts'], 30 * D);
+    assert.equal(S.RETAIN['overpass.infrastructure'], 30 * D);
     assert.equal(S.RETAIN['current.events'], H);
+    assert.equal(S.RETAIN['aircraft.trails'], 4 * 60_000);
     assert.equal(S.RETAIN['maps.tiles_max_size'], 4096 * 2 ** 20);
   });
 
@@ -49,7 +50,12 @@ describe('cache.conf', () => {
     assert.equal(S.CACHE_MAX_ENTRIES, 5000);
     assert.equal(S.TILE_MAX_AGE, 14 * D);
     // Pruning keeps anything still in force: the longest retention on disk.
-    assert.equal(S.DISK_MAX_AGE, 10 * D);
+    assert.equal(S.DISK_MAX_AGE, 30 * D);
+    // A trail length is drawn in the browser; it never keeps disk files alive.
+    fs.writeFileSync(conf, '[aircraft]\ntrails = 90d\n');
+    S.loadCacheConf(conf);
+    assert.equal(S.RETAIN['aircraft.trails'], 90 * D);
+    assert.equal(S.DISK_MAX_AGE, 30 * D);
   });
 
   test('bad lines keep their default and are reported', () => {
@@ -58,7 +64,7 @@ describe('cache.conf', () => {
     assert.equal(r.problems.length, 3);
     assert.match(r.problems[0], /"forever" is not a duration/);
     assert.match(r.problems[1], /no setting called "shodan.credit"/);
-    assert.equal(S.RETAIN['shodan.hosts'], 3 * D);
+    assert.equal(S.RETAIN['shodan.hosts'], 30 * D);
     assert.equal(S.RETAIN['maps.tiles'], 30 * D);
   });
 

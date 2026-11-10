@@ -14,6 +14,8 @@ on a Cesium globe. `npm start` runs it on http://127.0.0.1:8420.
   devDependency for the browser tests and must never be required by the app.)
 - Every credential stays in `server.js` (`CFG`). The browser never gets a key,
   except the Cesium Ion token via `/api/config`, which is browser-side by design.
+  `/api/settings` takes new keys from the settings menu and writes them to
+  `.env`; it reports whether each is set and must never return a value.
 - Cache keys must use snapped grid cells: `viewCell(b, kind)` with a
   `VIEW_CELL_DEG` entry, never the raw bbox.
 - `TTL.static` is for inventories of fixed things; `TTL.hazard` for current
@@ -43,7 +45,8 @@ Changes in these areas need a security review before they count as done:
   `href`, or iframe `src`.
 - **Browser policy**: the `CSP` and `SECURITY_HEADERS` in `server.js`.
 - **Network exposure**: the `HOST` binding, `ALLOWED_HOSTS`, the access key,
-  the `X-Panopticon` header check, and `/api/shodan`.
+  the `X-Panopticon` header check, `/api/shodan`, and `/api/settings`
+  (it writes `.env` and `cache.conf`).
 
 ## Checks
 

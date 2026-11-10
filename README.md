@@ -275,12 +275,20 @@ tiles = 30d            # map tiles on disk
 tiles_max_size = 4096MB
 
 [shodan]
-hosts = 3d             # every miss spends a query credit
+hosts = 30d            # every miss spends a query credit
 
 [overpass]
-infrastructure = 3d
-alpr = 3d
+infrastructure = 30d
+alpr = 30d
 ```
+
+The same settings, and the API keys in `.env`, can be changed from **SETTINGS**
+in the top bar. The menu writes to those two files in place, keeping their
+comments, and what it saves is in force on the server at once; reload the page
+so the browser follows. Keys go one way: the menu shows whether each is set
+and takes a replacement, but a stored key is never sent back to the browser.
+A variable supplied by the real environment (Docker, a shell export) overrides
+`.env`, so the menu shows it as fixed.
 
 Durations take a unit (`90s`, `30m`, `6h`, `3d`, `2w`; `0` keeps nothing),
 sizes `MB` or `GB`. Save the file and the server picks the change up within a
@@ -341,7 +349,7 @@ are kept short or not kept at all:
 
 - **Live positions** aren't cached on the server: aircraft follow OpenSky's
   5 s or 10 s cadence and vessels arrive over the AIS stream. The browser keeps
-  the last two minutes as trails. Only the radar frame index is held, for
+  the last four minutes as aircraft trails (`aircraft.trails` in `cache.conf`). Only the radar frame index is held, for
   4 minutes (`live`).
 - **Warnings and alerts** (NWS, USGS, GDACS, EONET, FIRMS, EDIS, IODA, and
   traffic incidents) are held for 1 hour (`hazard`). A tornado warning from

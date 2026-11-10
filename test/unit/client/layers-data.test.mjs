@@ -207,7 +207,12 @@ describe('FlightLayer', () => {
     await l.refresh(ctx());
     const trail = l.trailWithHead('a1b2c3');
     assert.ok(trail.length >= 1);
-    l.trails.get('a1b2c3').at = l.trails.get('a1b2c3').at.map(() => Date.now() - 10 * 60_000);
+    // Four minutes by default: a three-minute-old segment is still drawn.
+    assert.equal(l.trailMaxAgeMs, 4 * 60_000);
+    l.trails.get('a1b2c3').at = l.trails.get('a1b2c3').at.map(() => Date.now() - 3 * 60_000);
+    assert.ok(l.trailWithHead('a1b2c3').length >= 1);
+    // The limit is the layer's own, set from cache.conf at boot.
+    l.trailMaxAgeMs = 60_000;
     assert.equal(l.trailWithHead('a1b2c3').length, 0);
     assert.equal(l.trailWithHead('nobody').length, 0);
   });

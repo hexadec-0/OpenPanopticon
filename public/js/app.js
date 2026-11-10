@@ -14,6 +14,7 @@ import { ShortbreadImageryProvider } from './shortbread.js';
 import { NightOverlay } from './night.js';
 import { UniformDetail } from './uniform.js';
 import { installTileCache } from './tilecache.js';
+import { installConfigMenu } from './config.js';
 import {
   ShodanLayer, FlightLayer, SatelliteLayer, OverpassLayer, WebcamLayer,
   EventLayer, AlprLayer, VesselLayer, NetInfraLayer, IotLayer, TrafficLayer,
@@ -143,6 +144,8 @@ class OpenPanopticon {
     for (const id of ['events', 'iot']) {
       if (this.layers[id] && Number.isFinite(keep[id])) this.layers[id].cacheTtlMs = keep[id];
     }
+    // The same file sets how long an aircraft trail segment stays drawn.
+    if (Number.isFinite(keep.flightTrails)) this.layers.flights.trailMaxAgeMs = keep.flightTrails;
 
     this.weather = new WeatherOverlay(this.viewer);
     this.imagery = new ImageryOverlay(this.viewer);
@@ -1043,6 +1046,8 @@ class OpenPanopticon {
       setTimeout(() => location.reload(), 700);
     };
 
+    installConfigMenu({ toast: (msg) => this.toast(msg) });
+
     $('#flush-cache').onclick = async () => {
       let dropped = 0;
       for (const l of Object.values(this.layers)) {
@@ -1060,6 +1065,9 @@ class OpenPanopticon {
 
     document.addEventListener('keydown', (e) => {
       if (e.target.tagName === 'INPUT') return;
+      // The settings dialog is modal: a letter typed while one of its buttons
+      // has focus is not a shortcut for the globe behind it.
+      if ($('#config')?.open) return;
       // Derived from the mode table rather than hard-coded, so adding or
       // removing an optic never leaves a shortcut pointing at nothing.
       const modeKeys = Object.keys(OPTICAL_MODES);

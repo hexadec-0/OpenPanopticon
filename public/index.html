@@ -119,6 +119,7 @@
     <button id="auto-toggle" class="tgl active" title="Auto-refresh layers when the camera settles"><span>AUTO</span></button>
     <button id="refresh-now" class="tgl" title="Refresh all layers now (R)"><span>SYNC</span></button>
     <button id="flush-cache" class="tgl" title="Drop every cached feature and refetch"><span>FLUSH</span></button>
+    <button id="open-config" class="tgl" aria-haspopup="dialog" title="API keys and cache retention"><span>SETTINGS</span></button>
   </div>
 </header>
 
@@ -228,6 +229,31 @@
   <div id="detail-body"></div>
 </aside>
 <div id="detail-resize" role="separator" aria-orientation="vertical" aria-label="Resize detail panel" title="Drag to resize · double-click to reset"></div>
+
+<!-- settings menu: API keys (.env) and cache retention (cache.conf). The rows
+     are built by js/config.js from what the server reports. -->
+<dialog id="config" aria-labelledby="config-title">
+  <form id="config-form" autocomplete="off">
+    <header class="cfg-head">
+      <h2 id="config-title">Settings</h2>
+      <div class="cfg-tabs" role="tablist">
+        <button type="button" class="cfg-tab active" data-tab="keys" role="tab" aria-selected="true">API keys</button>
+        <button type="button" class="cfg-tab" data-tab="cache" role="tab" aria-selected="false">Cache</button>
+      </div>
+      <button type="button" id="config-close" aria-label="close">×</button>
+    </header>
+    <div class="cfg-body">
+      <section id="cfg-keys" data-pane="keys"></section>
+      <section id="cfg-cache" data-pane="cache" hidden></section>
+    </div>
+    <footer class="cfg-foot">
+      <p class="hm-note" id="config-note" role="status"></p>
+      <button type="button" id="config-reload" class="hm-btn" hidden>Reload page</button>
+      <button type="button" id="config-cancel" class="hm-btn">Close</button>
+      <button type="submit" id="config-save" class="hm-btn cfg-primary">Save</button>
+    </footer>
+  </form>
+</dialog>
 
 <!-- boot screen -->
 <div id="boot">

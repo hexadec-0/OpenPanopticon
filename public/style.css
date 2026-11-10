@@ -910,3 +910,99 @@ body.resizing-detail #detail { transition: none; }
 /* With cones, the marker shrinks to a pin at the apex so it doesn't hide them. */
 .inset-frame.has-cones .inset-mark { width: 16px; height: 16px; margin: -8px; border-width: 2px; }
 .inset-frame.has-cones .inset-mark::after { width: 4px; height: 4px; margin: -2px; }
+
+/* ---------------------------------------------------------------- */
+/* Settings menu                                                     */
+/* ---------------------------------------------------------------- */
+
+/* A modal <dialog>: it sits in the top layer, above the boot screen's
+   z-index and everything else, and traps focus without any script. */
+#config {
+  width: min(760px, calc(100vw - 32px)); height: min(820px, calc(100vh - 48px));
+  padding: 0; overflow: hidden;
+  background: var(--panel-solid); color: var(--text);
+  border: 1px solid var(--line); border-radius: 4px;
+  font: 400 12px/1.5 var(--mono);
+  box-shadow: 0 18px 60px rgba(0,0,0,.6);
+}
+#config::backdrop { background: rgba(2, 4, 6, .62); }
+#config-form { display: flex; flex-direction: column; height: 100%; margin: 0; }
+
+.cfg-head {
+  display: flex; align-items: center; gap: 16px;
+  padding: 11px 14px; border-bottom: 1px solid var(--line);
+}
+.cfg-head h2 {
+  margin: 0; font: 700 12px var(--mono); letter-spacing: .16em;
+  text-transform: uppercase; color: #eaf5f0;
+}
+.cfg-tabs { display: flex; gap: 4px; flex: 1; }
+.cfg-tab {
+  padding: 6px 12px; background: rgba(255,255,255,.03); color: var(--dim);
+  border: 1px solid var(--line); border-radius: 3px; cursor: pointer;
+  font: 500 10px/1 var(--mono); letter-spacing: .12em; text-transform: uppercase;
+}
+.cfg-tab:hover { color: var(--text); }
+.cfg-tab.active { color: var(--hud); border-color: rgba(57,255,136,.5); background: rgba(57,255,136,.08); }
+#config-close {
+  width: 26px; height: 26px; padding: 0; font: 400 16px/1 var(--mono);
+  background: none; color: var(--dim); border: 1px solid var(--line); border-radius: 3px; cursor: pointer;
+}
+#config-close:hover { color: var(--text); border-color: var(--dim); }
+
+.cfg-body { flex: 1; min-height: 0; overflow-y: auto; padding: 12px 14px 4px; }
+.cfg-body::-webkit-scrollbar { width: 6px; }
+.cfg-body::-webkit-scrollbar-thumb { background: rgba(120,160,150,.25); border-radius: 3px; }
+.cfg-intro { margin: 0 0 12px; font-size: 11px; color: var(--dim); }
+.cfg-intro.bad { color: var(--danger); }
+
+.cfg-group { margin: 0 0 14px; padding: 4px 12px 2px; border: 1px solid var(--line); border-radius: 3px; min-width: 0; }
+.cfg-group legend {
+  padding: 0 6px; font-size: 10px; letter-spacing: .14em; text-transform: uppercase; color: var(--hud);
+}
+/* Label and state on the left, the field on the right, help underneath. */
+.cfg-row {
+  display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr);
+  gap: 3px 14px; align-items: center; padding: 9px 0;
+}
+.cfg-row + .cfg-row { border-top: 1px solid rgba(120,160,150,.12); }
+.cfg-label { grid-column: 1; color: var(--text); font-size: 11.5px; overflow-wrap: anywhere; }
+.cfg-var { display: block; font-size: 9.5px; letter-spacing: .04em; color: var(--dim); }
+.cfg-state {
+  grid-column: 1; font-size: 9.5px; letter-spacing: .1em; text-transform: uppercase; color: var(--dim);
+}
+.cfg-state:empty { display: none; }
+.cfg-state.set { color: var(--hud); }
+.cfg-state.clearing { color: var(--danger); }
+.cfg-field { grid-column: 2; grid-row: 1 / span 2; display: flex; gap: 6px; align-items: flex-start; min-width: 0; }
+.cfg-input {
+  flex: 1; min-width: 0; padding: 5px 8px; resize: vertical;
+  font: 400 11.5px var(--mono); background: rgba(0,0,0,.4); color: var(--text);
+  border: 1px solid var(--line); border-radius: 3px; outline: none;
+}
+.cfg-input.short { flex: 0 1 110px; }
+.cfg-input:focus { border-color: rgba(57,255,136,.45); }
+.cfg-input:disabled { opacity: .45; cursor: not-allowed; }
+.cfg-input.bad { border-color: rgba(255,45,85,.6); }
+/* A multi-line key cannot be a password field, so it is masked here. */
+.cfg-input.masked { -webkit-text-security: disc; }
+.cfg-row.changed .cfg-input:not(.bad) { border-color: rgba(57,255,136,.45); }
+.cfg-help { grid-column: 1 / -1; margin: 0; font-size: 10.5px; color: var(--dim); }
+.cfg-help:empty { display: none; }
+.cfg-help a { color: var(--hud); text-decoration: none; white-space: nowrap; }
+.cfg-help a:hover { text-decoration: underline; }
+.cfg-error { color: var(--danger); }
+
+.cfg-foot {
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 14px; border-top: 1px solid var(--line);
+}
+.cfg-foot .hm-note { flex: 1; max-width: none; }
+.cfg-primary { color: var(--hud); border-color: rgba(57,255,136,.5); background: rgba(57,255,136,.08); }
+.cfg-primary:disabled { opacity: .5; cursor: default; }
+
+@media (max-width: 620px) {
+  .cfg-row { grid-template-columns: minmax(0, 1fr); }
+  .cfg-field { grid-column: 1; grid-row: auto; }
+  .cfg-head { flex-wrap: wrap; }
+}
