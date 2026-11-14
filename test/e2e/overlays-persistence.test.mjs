@@ -99,7 +99,7 @@ e2e('overlays', () => {
 
   test('base map menu lists every provider, unavailable ones disabled', async () => {
     const opts = await page.$$eval('#bm-provider option', (os) => os.map((o) => [o.value, o.disabled]));
-    assert.deepEqual(opts, [['osm', false], ['cesium', true], ['shortbread', false], ['sentinel2', false], ['gee', true]]);
+    assert.deepEqual(opts, [['osm', false], ['cesium', true], ['wayback', false], ['shortbread', false], ['sentinel2', false], ['gee', true]]);
     assert.equal(await page.$eval('#bm-provider', (n) => n.value), 'osm');
     assert.match(await text$(page, '#bm-note'), /Street map/);
   });

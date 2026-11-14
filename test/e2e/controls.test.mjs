@@ -317,8 +317,8 @@ e2e('auto-cycle', () => {
 
   test('lists a checkbox per layer that opens a detail panel', async () => {
     const types = await page.$$eval('#cycle-types .cycle-type', (rs) => rs.map((r) => r.dataset.layer));
-    assert.equal(types.length, 11);
-    assert.ok(types.includes('events') && types.includes('satellites'));
+    assert.equal(types.length, 12);
+    assert.ok(types.includes('events') && types.includes('satellites') && types.includes('youtube'));
     assert.equal(await hasClass(page, '#cycle-types .cycle-type[data-layer="shodan"]', 'layer-off'), true);
   });
 
@@ -337,7 +337,7 @@ e2e('auto-cycle', () => {
     await page.$eval('#cycle-none', (b) => b.click());
     assert.equal(await page.$$eval('#cycle-types input:checked', (cs) => cs.length), 0);
     await page.$eval('#cycle-all', (b) => b.click());
-    assert.equal(await page.$$eval('#cycle-types input:checked', (cs) => cs.length), 11);
+    assert.equal(await page.$$eval('#cycle-types input:checked', (cs) => cs.length), 12);
   });
 
   test('C stops it', async () => {
