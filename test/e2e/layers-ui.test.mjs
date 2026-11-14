@@ -43,7 +43,7 @@ e2e('layers and the detail panel', () => {
 
   test('every layer has a row with a switch, a name and a count', async () => {
     const ids = await page.$$eval('#layers .layer', (ns) => ns.map((n) => n.dataset.layer));
-    assert.deepEqual(ids, ['shodan', 'flights', 'satellites', 'overpass', 'alpr', 'events', 'vessels', 'netinfra', 'iot', 'traffic', 'webcams']);
+    assert.deepEqual(ids, ['shodan', 'flights', 'satellites', 'overpass', 'alpr', 'events', 'vessels', 'netinfra', 'iot', 'traffic', 'webcams', 'youtube']);
     for (const id of ids) {
       assert.ok(await page.$(`${row(id)} .switch`), id);
       assert.ok(await page.$(`${row(id)} .layer-name`), id);

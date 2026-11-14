@@ -32,6 +32,8 @@ const API_TIMEOUTS = {
   '/api/alpr': 180000,
   // Fan out across many upstreams at 25-30s each.
   '/api/webcams': 90000,
+  // Up to three search pages, then the video lookups, one after another.
+  '/api/youtube': 60000,
   '/api/events': 90000,
   '/api/netinfra': 90000,
   '/api/traffic': 90000,
@@ -471,7 +473,14 @@ class Layer {
       // Evict least-recently-seen first, so the area you're working in stays.
       const byAge = [...this.store.entries()].sort((a, b) => a[1].seen - b[1].seen);
       const excess = this.store.size - this.cacheCap;
-      for (let i = 0; i < excess; i++) this.store.delete(byAge[i][0]);
+      const evicted = [];
+      for (let i = 0; i < excess; i++) {
+        evicted.push(byAge[i][1].rec);
+        this.store.delete(byAge[i][0]);
+      }
+      // Ground that has lost features is no longer fully held, so a layer
+      // that tracks coverage finely can give it up and fetch it again.
+      this.onEvict?.(evicted);
     }
   }
 
@@ -567,7 +576,7 @@ class Layer {
     (this.covered ||= []).push({
       south: p[0], west: p[1], north: p[2], east: p[3], at: Date.now(),
     });
-    if (this.covered.length > 40) this.covered.shift();
+    while (this.covered.length > (this.coverMax || 40)) this.covered.shift();
   }
 
   /** Fetch a little wider than the view so small pans stay inside cover. */
@@ -727,7 +736,8 @@ class Layer {
       // outward to a whole cell, so the answer covers more ground than was
       // asked for. Recording the request instead threw that away and made
       // the next small pan refetch ground already in hand.
-      if (this.accumulate && ctx.bbox) {
+      // `false` means load() recorded coverage itself, piece by piece.
+      if (this.accumulate && ctx.bbox && this.coveredBbox !== false) {
         this.markCovered(this.coveredBbox || this.lastFetchedBbox || ctx.bbox);
       }
       this.status = 'ok';
@@ -1550,6 +1560,9 @@ export class SatelliteLayer extends Layer {
     // ones — the refusal is how CelesTrak says so — but worth showing.
     this.stale = !!data.stale;
     this.elementsAt = data.elementsAt || null;
+    // 'spacetrack' when CelesTrak could not answer and the server fell back.
+    this.elementsSource = data.source || 'celestrak';
+    this.approximate = !!data.approximate;
     this.tick(Cesium.JulianDate.now());
   }
 
@@ -1664,43 +1677,173 @@ function orbitColor(s) {
 /* OVERPASS — OSM infrastructure                                       */
 /* ================================================================== */
 
+// The server's VIEW_CELL_DEG.overpass. Tiles must sit on the same grid, or
+// each request would straddle cells and pay for its neighbours.
+const OSM_CELL_DEG = 0.125;
+const OSM_TILE_DEG = 0.25;     // 2 x 2 cells per request
+const OSM_TILE_LIMIT = 3000;   // the most the server sends per answer
+// Widest view filled tile by tile. Each tile is its own short request, so
+// the browser's timeout no longer bounds this; Overpass load does.
+const OSM_MAX_SPAN = 1.0;
+const OSM_REDRAW_MS = 800;     // repaint at most this often while tiles arrive
+const OSM_PAD = 0.25;          // margin beyond each edge of the view, as a share of its span
+
 export class OverpassLayer extends Layer {
   constructor(viewer) {
     super(viewer, 'overpass', 'OSM infrastructure');
     // Mapped infrastructure changes over weeks. Held for 72 hours, refreshed on demand.
     this.coverageTtlMs = INVENTORY_COVERAGE_MS;
-    // Modest, unlike Shodan's: the server snaps this outward onto a fixed
-    // grid anyway, so the slack that keeps small pans inside coverage comes
-    // from the cell rather than from padding. At 0.6 the padded box was 2.2x
-    // the view in each axis — nearly five times the area — and for an
-    // Overpass query that is paid for in seconds, not credits.
-    this.padFactor = 0.15;
+    // The view plus 25% of its span beyond each edge: enough slack that a
+    // small pan stays inside what is held. Requests are clipped to this box
+    // rather than snapped out to whole tiles, which over a wide view loaded
+    // thousands of features nobody could see.
+    this.padFactor = OSM_PAD;
     this.accumulate = true;
     this.presets = new Set(['surveillance']);
     this.available = {};
     this.byPreset = {};
     this.labels = {};
     this.truncated = false;
+    // Coverage is recorded per tile, so a dense city needs far more entries
+    // than the 40 whole-view boxes other layers keep, and far more features
+    // than the default store holds: evicting from ground marked as fetched
+    // left holes that were never asked for again.
+    this.coverMax = 600;
+    this.cacheCap = 40000;
   }
 
   settingsSig() { return [...this.presets].sort().join(','); }
 
-  async load({ bbox }) {
+  /**
+   * The box as tiles of the server's fixed grid, each clipped to the box,
+   * nearest the middle first, trimmed to OSM_MAX_SPAN around the centre.
+   *
+   * One answer for the whole view was cut to the features nearest its
+   * middle, yet the whole view was marked as fetched, so the rest of it was
+   * never asked for: a dense city showed one blob and nothing pending.
+   * Asking tile by tile keeps every answer small enough to arrive complete,
+   * and lets coverage be claimed only for tiles that actually did.
+   */
+  tilesFor(bbox) {
+    const p = String(bbox).split(',').map(Number);
+    if (p.length !== 4 || p.some((v) => !Number.isFinite(v))) return { tiles: [], trimmed: false };
+    let [s, w, n, e] = p;
+    const r = (v) => Number(v.toFixed(4));
+    const lat = (s + n) / 2, lon = (w + e) / 2;
+    let trimmed = false;
+    if (n - s > OSM_MAX_SPAN) { s = lat - OSM_MAX_SPAN / 2; n = lat + OSM_MAX_SPAN / 2; trimmed = true; }
+    if (e - w > OSM_MAX_SPAN) { w = lon - OSM_MAX_SPAN / 2; e = lon + OSM_MAX_SPAN / 2; trimmed = true; }
+    const t = OSM_TILE_DEG;
+    const tiles = [];
+    for (let ty = Math.floor(s / t); ty * t < n; ty++) {
+      for (let tx = Math.floor(w / t); tx * t < e; tx++) {
+        const south = r(Math.max(-85, s, ty * t)), north = r(Math.min(85, n, (ty + 1) * t));
+        const west = r(Math.max(-180, w, tx * t)), east = r(Math.min(180, e, (tx + 1) * t));
+        if (north <= south || east <= west) continue;
+        tiles.push({ south, west, north, east, key: `${south},${west},${north},${east}` });
+      }
+    }
+    const k = Math.cos((lat * Math.PI) / 180);
+    const d = (c) => ((c.south + c.north) / 2 - lat) ** 2 + (((c.west + c.east) / 2 - lon) * k) ** 2;
+    tiles.sort((a, b) => d(a) - d(b));
+    return { tiles, trimmed, view: { south: s, west: w, north: n, east: e } };
+  }
+
+  /**
+   * Covered when the part of every grid cell inside the view is. Checked
+   * per cell because a dense tile is recorded as its cells.
+   */
+  isCovered(bbox) {
+    const { tiles } = this.tilesFor(bbox);
+    return tiles.length > 0 && tiles.every((t) => this.partCovered(t));
+  }
+
+  /** A tile or cell held whole, or as all of its cells. */
+  partCovered(part) {
+    if (super.isCovered(part.key)) return true;
+    const cells = OverpassLayer.cellsOf(part);
+    return cells.length > 1 && cells.every((c) => super.isCovered(c.key));
+  }
+
+  /** Features evicted from the store: their tiles are no longer complete. */
+  onEvict(recs) {
+    if (!recs.length || !this.covered?.length) return;
+    this.covered = this.covered.filter((c) => !recs.some((f) =>
+      f && f.lat >= c.south && f.lat <= c.north && f.lon >= c.west && f.lon <= c.east));
+  }
+
+  /** Split a (clipped) tile into the server grid cells it touches, clipped the same way. */
+  static cellsOf(tile) {
+    const r = (v) => Number(v.toFixed(4));
+    const g = OSM_CELL_DEG;
+    const out = [];
+    for (let y = Math.floor(tile.south / g + 1e-9); y * g < tile.north - 1e-9; y++) {
+      for (let x = Math.floor(tile.west / g + 1e-9); x * g < tile.east - 1e-9; x++) {
+        const c = {
+          south: r(Math.max(tile.south, y * g)), north: r(Math.min(tile.north, (y + 1) * g)),
+          west: r(Math.max(tile.west, x * g)), east: r(Math.min(tile.east, (x + 1) * g)),
+        };
+        if (c.north <= c.south || c.east <= c.west) continue;
+        c.key = `${c.south},${c.west},${c.north},${c.east}`;
+        out.push(c);
+      }
+    }
+    return out;
+  }
+
+  async load(ctx) {
     if (!this.presets.size) { this.clear(); this.count = 0; this.byPreset = {}; return; }
 
-    // One request covering every selected class. Overpass allows ~2 slots per
-    // IP, so fanning out one request per class is what caused 429s.
-    const box = this.padBbox(bbox);
+    const box = this.padBbox(ctx.bbox);
     this.lastFetchedBbox = box;
-    const d = await this.fetch('/api/overpass', {
-      bbox: box, presets: [...this.presets].join(','), limit: 800,
-    });
+    this.coveredBbox = false;   // recorded per tile below
+    const { tiles, trimmed } = this.tilesFor(box);
+    this.trimmed = trimmed;
+    let truncated = false;
+    let lastDraw = 0;
+    const draw = (final) => {
+      if (!final && Date.now() - lastDraw < OSM_REDRAW_MS) return;
+      lastDraw = Date.now();
+      this.redraw();
+      ctx.onStatus?.();
+    };
 
-    this.truncated = !!d.truncated;
-    this.coveredBbox = d.covered || null;
-    this.trimmed = !!d.trimmed;
-    this.remember(d.features);
-    this.redraw();    if (d.partial) throw partialAnswer(d);
+    // Tiles one at a time, nearest the middle first: Overpass allows ~2
+    // slots per IP and the server queues behind them anyway, so parallel
+    // requests would only wait in line and time out together.
+    const fetchPart = async (part) => {
+      if (this.partCovered(part)) return;
+      const d = await this.fetch('/api/overpass', {
+        bbox: part.key, presets: [...this.presets].join(','), limit: OSM_TILE_LIMIT,
+      });
+      // The server answers for whole grid cells; keep only what falls in
+      // the part asked for, so nothing past the padded view is loaded.
+      this.remember((d.features || []).filter((f) => f.lat >= part.south && f.lat <= part.north
+        && f.lon >= part.west && f.lon <= part.east));
+      if (d.partial) { draw(true); throw partialAnswer(d); }
+      // Cut to the draw limit: the server holds the rest, so ask for it
+      // cell by cell. A single cell over the limit is as fine as it gets.
+      const cells = OverpassLayer.cellsOf(part);
+      if (d.capped && cells.length > 1) {
+        for (const c of cells) await fetchPart(c);
+      } else {
+        if (d.truncated) truncated = true;
+        this.markCovered(part.key);
+      }
+      draw(false);
+    };
+
+    try {
+      for (const tile of tiles) {
+        // The camera has moved on: stop here. What is in hand stays, and
+        // refresh() asks for the new view as soon as this returns.
+        if (this._viewBbox !== ctx.bbox) break;
+        await fetchPart(tile);
+      }
+    } finally {
+      this.truncated = truncated;
+      draw(true);
+    }
   }
 
   /** Cached features are filtered by the currently selected classes here,
@@ -2351,6 +2494,170 @@ function camSprite(color) {
     <circle cx="9" cy="16" r="2.2" fill="rgba(0,0,0,.55)"/></svg>`;
   const uri = `data:image/svg+xml;base64,${btoa(svg)}`;
   camCache.set(color, uri);
+  return uri;
+}
+
+/* ================================================================== */
+/* YOUTUBE — geotagged uploads                                         */
+/* ================================================================== */
+
+/** "PT1H2M3S" as 1:02:03. */
+function ytDuration(iso) {
+  const m = /^P(?:(\d+)D)?T?(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/.exec(String(iso || ''));
+  if (!m || iso === 'P0D') return null;
+  const h = Number(m[1] || 0) * 24 + Number(m[2] || 0);
+  const mm = Number(m[3] || 0);
+  const ss = String(Number(m[4] || 0)).padStart(2, '0');
+  return h ? `${h}:${String(mm).padStart(2, '0')}:${ss}` : `${mm}:${ss}`;
+}
+
+const YT_COLOR = { none: '#ff3b30', live: '#ff2d95', upcoming: '#ffd166' };
+const YT_LIVE_LABEL = { live: 'Live now', upcoming: 'Upcoming stream' };
+
+export class YoutubeLayer extends Layer {
+  constructor(viewer) {
+    super(viewer, 'youtube', 'YouTube geotags');
+    // Each search is paid for in API quota and the server holds it for
+    // 72 hours (cache.conf [youtube] videos); the browser follows that from
+    // /api/config so it does not re-ask about ground the server still holds.
+    this.coverageTtlMs = 72 * 60 * 60_000;
+    this.accumulate = true;
+    this.window = null;
+    this.after = null;
+    this.found = 0;
+  }
+
+  async load({ bbox }) {
+    const box = this.padBbox(bbox);
+    this.lastFetchedBbox = box;
+    const data = await this.fetch('/api/youtube', { bbox: box });
+    this.window = data.window || this.window;
+    this.after = data.after || this.after;
+    this.found = data.found ?? 0;
+    this.remember(data.videos || []);
+    this.redraw();
+  }
+
+  draw(videos) {
+    for (const v of videos) {
+      this.source.entities.add({
+        position: Cesium.Cartesian3.fromDegrees(v.lon, v.lat, 0),
+        billboard: {
+          image: ytSprite(YT_COLOR[v.live] || YT_COLOR.none),
+          width: 22,
+          height: 16,
+          disableDepthTestDistance: DEPTH_FREE_M,
+          heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+          scaleByDistance: new Cesium.NearFarScalar(1e3, 1.4, 4e5, 0.4),
+        },
+        properties: { layer: 'youtube', record: v },
+      });
+    }
+    return videos.length;
+  }
+
+  /**
+   * Show the thumbnail, and load YouTube's player only when asked to. The
+   * player is third-party script and a connection to Google, so opening the
+   * panel to read the details must not be what starts it.
+   */
+  async enrich(rec, root) {
+    const stage = root.querySelector('[data-slot="ytstage"]');
+    if (!stage) return;
+    this.stopLive();
+    const thumb = safeUrl(rec.thumb, { httpsOnly: true });
+    const embed = safeUrl(rec.embed, { httpsOnly: true });
+
+    const shown = [];
+    if (thumb) {
+      const img = document.createElement('img');
+      img.className = 'cam-live';
+      img.alt = `${rec.title || 'Video'} thumbnail`;
+      img.referrerPolicy = 'no-referrer';
+      img.setAttribute('data-hide-on-error', '');
+      img.src = thumb;
+      stage.append(img);
+      shown.push(img);
+    }
+    this.liveEls = shown;
+    if (!embed) return;
+    const play = document.createElement('button');
+    play.type = 'button';
+    play.className = 'yt-play';
+    play.textContent = '\u25B6 Play here';
+    stage.append(play);
+    shown.push(play);
+
+    play.onclick = () => {
+      play.onclick = null;
+      for (const el of shown) el.remove();
+      const frame = document.createElement('iframe');
+      frame.className = 'cam-frame';
+      frame.src = `${embed}?autoplay=1&rel=0`;
+      // Sandboxed like the webcam players. YouTube refuses to play an embed
+      // that sends no referrer, so this one sends the origin and no more.
+      frame.setAttribute('sandbox',
+        'allow-scripts allow-same-origin allow-presentation allow-popups');
+      frame.setAttribute('referrerpolicy', 'strict-origin');
+      frame.setAttribute('allow', 'autoplay; encrypted-media; fullscreen; picture-in-picture');
+      frame.setAttribute('allowfullscreen', '');
+      stage.append(frame);
+      this.liveEls = [frame];
+    };
+  }
+
+  /** Take the player off the page, so a closed panel stops playing. */
+  stopLive() {
+    const els = this.liveEls || [];
+    this.liveEls = null;
+    for (const el of els) {
+      el.onclick = null;
+      if (el.tagName === 'IFRAME') el.src = 'about:blank';
+      el.remove();
+    }
+  }
+
+  detail(rec) {
+    const ago = relTime(rec.published);
+    const link = safeUrl(rec.link);
+    const channel = safeUrl(rec.channelLink);
+    return {
+      kind: 'YOUTUBE VIDEO',
+      title: rec.title || rec.videoId,
+      accent: YT_COLOR[rec.live] || YT_COLOR.none,
+      html: `
+        ${YT_LIVE_LABEL[rec.live] ? `<div class="alarm">${esc(YT_LIVE_LABEL[rec.live])}</div>` : ''}
+        <div class="cam-stage" data-slot="ytstage"></div>
+        <div data-slot="inset"></div>
+        <table>${rows([
+          ['Channel', rec.channel],
+          ['Published', rec.published ? `${rec.published}${ago ? ` (${ago})` : ''}` : null],
+          ['Recorded', rec.recorded],
+          ['Length', ytDuration(rec.duration)],
+          ['Views', rec.views != null ? rec.views.toLocaleString() : null],
+          ['Likes', rec.likes != null ? rec.likes.toLocaleString() : null],
+          ['Comments', rec.comments != null ? rec.comments.toLocaleString() : null],
+          ['Location', rec.place],
+          ['Geotag', `${rec.lat.toFixed(5)}, ${rec.lon.toFixed(5)}`],
+        ])}</table>
+        ${rec.description ? `<p class="yt-desc">${esc(rec.description)}</p>` : ''}
+        ${link ? `<a class="ext" href="${esc(link)}" target="_blank" rel="noopener noreferrer">Watch on YouTube ↗</a>` : ''}
+        ${channel ? `<a class="ext" href="${esc(channel)}" target="_blank" rel="noopener noreferrer">Channel ↗</a>` : ''}
+        <p class="hint">The geotag is whatever the uploader set, not a measured
+        position. Only uploads that carry one are found.</p>`,
+    };
+  }
+}
+
+const ytSpriteCache = new Map();
+function ytSprite(color) {
+  if (ytSpriteCache.has(color)) return ytSpriteCache.get(color);
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 44 32">
+    <rect x="2" y="2" width="40" height="28" rx="8" fill="${color}"
+          stroke="rgba(0,0,0,.6)" stroke-width="1.5"/>
+    <path d="M18 10 L30 16 L18 22 Z" fill="#fff"/></svg>`;
+  const uri = `data:image/svg+xml;base64,${btoa(svg)}`;
+  ytSpriteCache.set(color, uri);
   return uri;
 }
 
@@ -3261,7 +3568,10 @@ export { api };
 const BUILTIN_BASEMAPS = new Set(['osm', 'cesium']);
 
 /** Providers whose imagery is a dated scene over a particular place. */
-const SCENE_BASED = new Set(['sentinel2', 'gee']);
+const SCENE_BASED = new Set(['sentinel2', 'gee', 'wayback']);
+
+/** Scene searches narrowed by a date window and a cloud limit. */
+const WINDOWED = new Set(['sentinel2', 'gee']);
 
 export class BasemapOverlay {
   constructor(viewer) {
@@ -3300,6 +3610,9 @@ export class BasemapOverlay {
    * would keep declaring itself empty.
    */
   get active() { return SCENE_BASED.has(this.provider); }
+
+  /** Whether the date window and cloud limit apply to this provider. */
+  get windowed() { return WINDOWED.has(this.provider); }
 
   /** Default window: the last month, which is 2-6 Sentinel-2 passes. */
   defaultWindow() {

@@ -20,6 +20,15 @@ describe('map tile disk cache', () => {
   after(() => s.close());
   beforeEach(() => { mock.reset(); mock.routes = []; });
 
+  test('Esri Wayback tiles are cached; other paths on that host are refused', async () => {
+    mock.on('wayback.maptiles.arcgis.com', () => png());
+    const ok = 'https://wayback.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/WMTS/1.0.0/default028mm/MapServer/tile/90/12/1600/900';
+    assert.equal((await s.request(tileUrl(ok))).status, 200);
+    assert.equal((await s.request(tileUrl(ok))).headers['x-tile-cache'], 'hit');
+    const bad = 'https://wayback.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/tilemap/90/12/1600/900';
+    assert.notEqual((await s.request(tileUrl(bad))).status, 200);
+  });
+
   test('fetches a tile once, then serves it from disk', async () => {
     mock.on('virtualearth.net', () => png());
     const a = await s.request(tileUrl(BING));

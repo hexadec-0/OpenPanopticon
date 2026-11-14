@@ -25,6 +25,7 @@ const HOME = Object.freeze({
 const TEST_KEYS = Object.freeze({
   SHODAN_API_KEY: 'test-shodan-SECRET-1111',
   WINDY_API_KEY: 'test-windy-SECRET-2222',
+  YOUTUBE_API_KEY: 'test-youtube-SECRET-eeee',
   OPENWEBCAMDB_API_KEY: 'test-owcdb-SECRET-3333',
   FIRMS_MAP_KEY: 'test-firms-SECRET-4444',
   AISSTREAM_API_KEY: 'test-ais-SECRET-5555',
@@ -399,6 +400,100 @@ function rainviewer() {
   });
 }
 
+// YouTube Data API: two search pages, then the videos.list lookup. Of the
+// three ids found, one has no geotag and one is a live stream.
+function youtubeSearch({ params }) {
+  const second = params.get('pageToken') === 'p2';
+  return json({
+    items: second
+      ? [{ id: { kind: 'youtube#video', videoId: 'cccccccccc3' } }]
+      : [{ id: { kind: 'youtube#video', videoId: 'aaaaaaaaaa1' } },
+        { id: { kind: 'youtube#video', videoId: 'bbbbbbbbbb2' } },
+        // Not a video id: must be ignored rather than looked up.
+        { id: { kind: 'youtube#video', videoId: 'bad id"><' } }],
+    ...(second ? {} : { nextPageToken: 'p2' }),
+  });
+}
+
+function youtubeVideos({ params }) {
+  const p = near(0.01, 0.01);
+  const all = {
+    aaaaaaaaaa1: {
+      id: 'aaaaaaaaaa1',
+      snippet: { title: 'Storm over Testville', channelTitle: 'Test Channel', channelId: 'UCtest',
+        publishedAt: new Date(Date.now() - 3600e3).toISOString(), description: 'Shot from the ridge.',
+        liveBroadcastContent: 'none',
+        thumbnails: { medium: { url: 'https://i.ytimg.com/vi/aaaaaaaaaa1/mqdefault.jpg' } } },
+      recordingDetails: { location: { latitude: p.lat, longitude: p.lon }, locationDescription: 'Testville' },
+      contentDetails: { duration: 'PT4M13S' },
+      statistics: { viewCount: '1234', likeCount: '56', commentCount: '7' },
+    },
+    bbbbbbbbbb2: {
+      id: 'bbbbbbbbbb2',
+      snippet: { title: 'No geotag', channelTitle: 'Other', publishedAt: new Date().toISOString(),
+        thumbnails: { default: { url: 'http://insecure.example/x.jpg' } } },
+      recordingDetails: {},
+    },
+    cccccccccc3: {
+      id: 'cccccccccc3',
+      snippet: { title: 'Live from the harbour', channelTitle: 'Harbour Cam', channelId: 'UCharbour',
+        publishedAt: new Date().toISOString(), liveBroadcastContent: 'live',
+        thumbnails: { default: { url: 'http://insecure.example/live.jpg' } } },
+      recordingDetails: { location: { latitude: p.lat + 0.01, longitude: p.lon } },
+      contentDetails: { duration: 'P0D' },
+    },
+  };
+  const ids = String(params.get('id') || '').split(',');
+  return json({ items: ids.map((id) => all[id]).filter(Boolean) });
+}
+
+// Esri World Imagery Wayback. Four releases, one entry pointing elsewhere
+// (dropped). Over the test tile, 100 re-published 90's imagery, and 80 is
+// the same picture as 70 (identical tile size), so the versions are 90, 70.
+const WAYBACK_TILE = (r) => `https://wayback.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/WMTS/1.0.0/default028mm/MapServer/tile/${r}/{level}/{row}/{col}`;
+const WAYBACK_META = (n) => `https://metadata.maptiles.arcgis.com/arcgis/rest/services/World_Imagery_Metadata_${n}/MapServer`;
+function waybackConfig() {
+  const item = (r, date) => ({ itemID: `id${r}`, itemTitle: `World Imagery (Wayback ${date})`, itemURL: WAYBACK_TILE(r),
+    metadataLayerUrl: WAYBACK_META(r), metadataLayerItemID: `m${r}`, layerIdentifier: `WB_${r}` });
+  return json({
+    100: item(100, '2026-10-30'), 90: item(90, '2026-06-01'), 80: item(80, '2025-01-15'), 70: item(70, '2024-03-02'),
+    66: { ...item(66, '2023-01-01'), itemURL: 'https://evil.example/tile/{level}/{row}/{col}' },
+  });
+}
+function waybackTilemap({ url }) {
+  const rel = Number(url.pathname.split('/tilemap/')[1].split('/')[0]);
+  const answer = { 100: [90, 5000], 80: [80, 4000], 70: [70, 4000] }[rel];
+  return json(answer ? { data: [1], select: [answer[0]], size: [answer[1]], valid: true } : { data: [0], select: [], size: [] });
+}
+function waybackMetadata({ url }) {
+  const rel = /Metadata_(\d+)/.exec(url.pathname)?.[1];
+  const when = { 90: Date.UTC(2026, 3, 12), 70: Date.UTC(2023, 10, 5), 80: Date.UTC(2023, 10, 5) }[rel];
+  return json({ features: [{ attributes: { SRC_DATE2: when, NICE_DESC: 'Maxar', SRC_DESC: 'WV03', SAMP_RES: 0.3, SRC_ACC: 4.1 } }] });
+}
+
+// Space-Track: a cookie on login, then the catalogue as JSON.
+function spaceTrackLogin({ body }) {
+  const p = new URLSearchParams(String(body || ''));
+  if (p.get('password') !== 'test-spacetrack-SECRET-ffff') return json({ Login: 'Failed' });
+  return status(200, '""', { 'content-type': 'text/plain', 'set-cookie': 'chocolatechip=st-session; path=/; secure' });
+}
+function spaceTrackCatalog({ call }) {
+  if (!String(call.headers?.cookie || '').includes('chocolatechip=st-session')) return status(401, '{"error":"You must be logged in"}');
+  const row = (name, type, l1, l2, extra = {}) => ({ OBJECT_NAME: name, OBJECT_TYPE: type, TLE_LINE0: `0 ${name}`,
+    TLE_LINE1: l1, TLE_LINE2: l2, RCS_SIZE: 'LARGE', LAUNCH_DATE: '1998-11-20', MEAN_MOTION: '15.72', ECCENTRICITY: '0.0006', ...extra });
+  return json([
+    row('ISS (ZARYA)', 'PAYLOAD',
+      '1 25544U 98067A   24001.50000000  .00016717  00000-0  10270-3 0  9005',
+      '2 25544  51.6416 247.4627 0006703 130.5360 325.0288 15.72125391563537'),
+    row('STARLINK-1007', 'PAYLOAD',
+      '1 44713U 19074A   24001.50000000  .00001000  00000-0  80000-4 0  9991',
+      '2 44713  53.0540 100.0000 0001400  90.0000 270.0000 15.06400000 12345', { MEAN_MOTION: '15.064' }),
+    row('STARLINK DEB', 'DEBRIS',
+      '1 99999U 19074ZZ  24001.50000000  .00001000  00000-0  80000-4 0  9991',
+      '2 99999  53.0540 100.0000 0001400  90.0000 270.0000 15.06400000 12345'),
+  ]);
+}
+
 function windy({ params }) {
   const [n, e, s, w] = String(params.get('bbox') || '').split(',').map(Number);
   const p = place({ south: s, west: w, north: n, east: e }, 0.003, 0.0);
@@ -583,6 +678,8 @@ function registerDefaults(mock) {
   mock.on(host('opensky-network.org', '/api/states/all'), openSkyStates);
 
   mock.on(host('celestrak.org', '/NORAD/elements/gp.php'), () => text(stationsTle()));
+  mock.on(host('www.space-track.org', '/ajaxauth/login'), spaceTrackLogin);
+  mock.on(host('www.space-track.org', '/basicspacedata/query/class/gp/'), spaceTrackCatalog);
 
   mock.on((url) => OVERPASS_HOSTS.includes(url.hostname), overpass);
 
@@ -637,6 +734,8 @@ function registerDefaults(mock) {
   mock.on(host('webcams.nyctmc.org', '/api/cameras'), nycDot);
   mock.on(host('openwebcamdb.com', '/api/v1/webcams'), owcdb);
   mock.on(host('services8.arcgis.com'), alertCa);
+  mock.on(host('www.googleapis.com', '/youtube/v3/search'), youtubeSearch);
+  mock.on(host('www.googleapis.com', '/youtube/v3/videos'), youtubeVideos);
 
   mock.on(host('www.gdacs.org'), gdacs);
   mock.on(host('eonet.gsfc.nasa.gov'), eonet);
@@ -647,6 +746,9 @@ function registerDefaults(mock) {
 
   mock.on(host('nominatim.openstreetmap.org', '/search'), nominatim);
   mock.on(host('earth-search.aws.element84.com', '/v1/search'), stac);
+  mock.on(host('s3-us-west-2.amazonaws.com', '/config.maptiles.arcgis.com/waybackconfig.json'), waybackConfig);
+  mock.on(host('wayback.maptiles.arcgis.com', '/arcgis/rest/services/World_Imagery/MapServer/tilemap/'), waybackTilemap);
+  mock.on(host('metadata.maptiles.arcgis.com'), waybackMetadata);
   mock.on(host('oauth2.googleapis.com', '/token'), () => json({ access_token: 'ya29.test', expires_in: 3600 }));
   mock.on(host('earthengine.googleapis.com'), () => json({ name: 'projects/test-project/maps/abc123' }));
 

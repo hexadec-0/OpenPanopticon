@@ -329,6 +329,7 @@ describe('Layer base class', () => {
   });
 
   test('coverage keeps at most 40 regions', () => {
+    layer.coverMax = undefined;   // the base default; the OSM layer keeps more
     for (let i = 0; i < 45; i++) layer.markCovered(`${i},0,${i + 1},1`);
     assert.equal(layer.covered.length, 40);
     assert.equal(layer.covered[0].south, 5);
@@ -518,5 +519,125 @@ describe('Layer base class', () => {
     assert.equal(s.lastFetchedBbox, '1,2,3,4');
     assert.equal(s.isCovered('1.1,2.1,2.9,3.9'), true);
     assert.equal(s.count, 2);
+  });
+});
+
+describe('OSM layer fetches the view tile by tile', () => {
+  // The fake server: every tile holds `perCell` features per 0.125° cell,
+  // and an answer over `limit` is cut, like the real draw limit.
+  function osmLayer({ perCell = 1, limit = 3000, dense = new Set() } = {}) {
+    const l = new OverpassLayer(makeViewer());
+    l.setEnabled(true);
+    l.padFactor = 0;
+    const asked = [];
+    l.fetch = async (path, params) => {
+      asked.push(params.bbox);
+      const [s, w, n, e] = params.bbox.split(',').map(Number);
+      const feats = [];
+      for (let y = s; y < n - 1e-9; y += 0.125) {
+        for (let x = w; x < e - 1e-9; x += 0.125) {
+          const k = `${y.toFixed(4)},${x.toFixed(4)}`;
+          const count = dense.has(k) ? limit + 1 : perCell;
+          for (let i = 0; i < count; i++) {
+            feats.push({ id: `${k}:${i}`, lat: y + 0.06, lon: x + 0.06, preset: 'surveillance' });
+          }
+        }
+      }
+      const shown = feats.slice(0, limit);
+      return { features: shown, count: shown.length, capped: shown.length < feats.length,
+        truncated: shown.length < feats.length, covered: params.bbox };
+    };
+    return { l, asked };
+  }
+  const VIEW = '35.5,139.5,36.0,140.0';   // 2 x 2 tiles
+
+  test('one request per tile, and the view is covered only when all of them are in', async () => {
+    const { l, asked } = osmLayer();
+    await l.refresh({ bbox: VIEW });
+    assert.equal(asked.length, 4);
+    assert.equal(l.status, 'ok');
+    assert.equal(l.isCovered(VIEW), true);
+    assert.equal(l.isCovered('35.4,139.5,36.0,140.0'), false, 'ground outside was never fetched');
+    assert.equal(l.store.size, 16);
+  });
+
+  test('a tile cut to the draw limit is asked for again cell by cell, not marked as covered whole', async () => {
+    const { l, asked } = osmLayer({ perCell: 2, limit: 5 });
+    await l.refresh({ bbox: '35.5,139.5,35.75,139.75' });
+    assert.deepEqual(asked.length, 5, 'the tile, then its four cells');
+    assert.equal(l.store.size, 8, 'every feature arrived');
+    assert.equal(l.truncated, false);
+    assert.equal(l.isCovered('35.5,139.5,35.75,139.75'), true);
+  });
+
+  test('a single cell over the limit is kept and flagged, not asked for forever', async () => {
+    const { l, asked } = osmLayer({ limit: 5, dense: new Set(['35.5000,139.5000']) });
+    await l.refresh({ bbox: '35.5,139.5,35.75,139.75' });
+    assert.equal(l.truncated, true);
+    assert.equal(l.isCovered('35.5,139.5,35.75,139.75'), true);
+    const n = asked.length;
+    await l.refresh({ bbox: '35.5,139.5,35.75,139.75' });
+    assert.equal(asked.length, n, 'no second round');
+  });
+
+  test('a pan only asks for the tiles it has not seen', async () => {
+    const { l, asked } = osmLayer();
+    await l.refresh({ bbox: VIEW });
+    await l.refresh({ bbox: '35.5,139.75,36.0,140.25' });
+    assert.equal(asked.length, 6);
+  });
+
+  test('evicted features give their ground back', async () => {
+    const { l } = osmLayer();
+    await l.refresh({ bbox: VIEW });
+    l.cacheCap = 12;
+    l.remember([{ id: 'x', lat: 10, lon: 10, preset: 'surveillance' }]);
+    assert.equal(l.isCovered(VIEW), false);
+  });
+
+  test('a view wider than the limit is trimmed to its middle and says so', () => {
+    const l = new OverpassLayer(makeViewer());
+    const { tiles, trimmed } = l.tilesFor('34,138,38,142');
+    assert.equal(trimmed, true);
+    assert.equal(tiles.length, 16);
+    assert.equal(tiles[0].key.split(',').map(Number).every((v) => Math.abs(v - 36) <= 0.25 || Math.abs(v - 140) <= 0.25), true,
+      'nearest the middle first');
+  });
+});
+
+describe('OSM layer loads only the view and a 25% margin', () => {
+  test('requests are clipped to the padded view, and features past it are dropped', async () => {
+    const l = new OverpassLayer(makeViewer());
+    l.setEnabled(true);
+    const asked = [];
+    // Like the real server: answers for the whole 0.125° cells the box touches.
+    l.fetch = async (path, params) => {
+      asked.push(params.bbox);
+      const [s, w, n, e] = params.bbox.split(',').map(Number);
+      const g = 0.125;
+      const feats = [];
+      for (let y = Math.floor(s / g) * g; y < n - 1e-9; y += g) {
+        for (let x = Math.floor(w / g) * g; x < e - 1e-9; x += g) {
+          for (let i = 0; i < 4; i++) {
+            feats.push({ id: `${y},${x},${i}`, lat: y + 0.01 + i * 0.03, lon: x + 0.01 + i * 0.03, preset: 'surveillance' });
+          }
+        }
+      }
+      return { features: feats, count: feats.length, capped: false, truncated: false };
+    };
+    const VIEW = '35.6,139.6,35.7,139.7';
+    await l.refresh({ bbox: VIEW });
+    const [S, W, N, E] = [35.575, 139.575, 35.725, 139.725];   // + 25% of the span each side
+    assert.ok(asked.length > 0);
+    for (const b of asked) {
+      const [s, w, n, e] = b.split(',').map(Number);
+      assert.ok(s >= S && w >= W && n <= N && e <= E, `request ${b} stays inside the padded view`);
+    }
+    for (const f of l.records()) {
+      assert.ok(f.lat >= S && f.lat <= N && f.lon >= W && f.lon <= E, `feature ${f.id} is inside`);
+    }
+    assert.equal(l.isCovered(VIEW), true);
+    assert.equal(asked.length, (await (async () => { await l.refresh({ bbox: '35.61,139.61,35.69,139.69' }); return asked.length; })()),
+      'a small pan inside the margin needs no request');
   });
 });

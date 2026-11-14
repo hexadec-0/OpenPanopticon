@@ -45,7 +45,7 @@ describe('/api/health', () => {
       assert.equal(d.presets.netinfra.cell.available, false);
       assert.equal(d.presets.netinfra.atlas.available, true);
       const bm = Object.fromEntries(d.presets.basemaps.map((b) => [b.key, b.available]));
-      assert.deepEqual(bm, { osm: true, cesium: false, shortbread: true, sentinel2: true, gee: false });
+      assert.deepEqual(bm, { osm: true, cesium: false, wayback: true, shortbread: true, sentinel2: true, gee: false });
     } finally { await t.close(); }
   });
 });
@@ -214,6 +214,41 @@ describe('/api/basemap', () => {
     const days = (Date.parse(d.window.to) - Date.parse(d.window.from)) / 86400_000;
     assert.equal(days, 30);
     assert.equal((await s.api('/api/basemap', { provider: 'sentinel2' })).status, 400);
+  });
+
+  test('Esri Wayback: only the versions that changed here, with capture dates', async () => {
+    const d = (await s.api('/api/basemap', { provider: 'wayback', bbox: BBOX })).json();
+    assert.equal(d.provider, 'wayback');
+    assert.equal(d.releases, 4, 'the entry pointing off Esri is dropped');
+    assert.deepEqual(d.scenes.map((x) => x.id), ['90', '70'], 're-published and same-size duplicates collapse to the oldest');
+    assert.equal(d.scenes[0].url,
+      'https://wayback.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/WMTS/1.0.0/default028mm/MapServer/tile/90/{z}/{y}/{x}');
+    assert.equal(d.scenes[0].date, '2026-06-01');
+    assert.equal(d.scenes[0].captured, '2026-04-12');
+    assert.equal(d.scenes[0].provider, 'Maxar');
+    assert.equal(d.scenes[0].resolutionM, 0.3);
+    assert.equal(d.maxLevel, 19);
+    assert.match(d.attribution, /Esri/);
+    // The walk: 100 -> selected 90, then the release after 90 (80) -> 80, then 70 -> 70, then nothing older.
+    const walked = s.mock.callsTo('/tilemap/').map((c) => Number(new URL(c.url).pathname.split('/tilemap/')[1].split('/')[0]));
+    assert.deepEqual(walked, [100, 80, 70]);
+    const meta = new URL(s.mock.callsTo('metadata.maptiles')[0].url);
+    assert.match(meta.pathname, /\/MapServer\/\d+\/query$/);
+    assert.equal(meta.searchParams.get('outFields'), 'SRC_DATE2,NICE_DESC,SRC_DESC,SAMP_RES,SRC_ACC');
+  });
+
+  test('Esri Wayback: a view in the same tile is served from the cache, and a bbox is required', async () => {
+    await s.api('/api/basemap', { provider: 'wayback', bbox: BBOX });
+    const n = s.mock.calls.length;
+    await s.api('/api/basemap', { provider: 'wayback', bbox: BBOX });
+    assert.equal(s.mock.calls.length, n);
+    assert.equal((await s.api('/api/basemap', { provider: 'wayback' })).status, 400);
+  });
+
+  test('Esri Wayback: nothing recorded for the tile still offers the current mosaic', async () => {
+    s.mock.on('/MapServer/tilemap/', () => json({ data: [0], select: [], size: [] }));
+    const d = (await s.api('/api/basemap', { provider: 'wayback', bbox: '10,-30.1,10.1,-30' })).json();
+    assert.deepEqual(d.scenes.map((x) => x.id), ['100']);
   });
 
   test('builtins and the vector map', async () => {

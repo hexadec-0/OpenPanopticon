@@ -475,6 +475,79 @@ describe('/api/webcams', () => {
   });
 });
 
+describe('/api/youtube', () => {
+  test('searches around the snapped cell for the last 72h and keeps geotagged videos', async () => {
+    const d = (await s.api('/api/youtube', { bbox: BBOX })).json();
+    assert.equal(d.configured, true);
+    assert.equal(d.window, '72h');
+    assert.deepEqual(d.videos.map((v) => v.id).sort(), ['yt:aaaaaaaaaa1', 'yt:cccccccccc3']);
+    assert.equal(d.found, 3, 'the malformed id is never looked up');
+
+    const searches = s.mock.callsTo('/youtube/v3/search');
+    assert.equal(searches.length, 2, 'follows nextPageToken, stops when there is none');
+    const q = new URL(searches[0].url).searchParams;
+    assert.equal(q.get('type'), 'video');
+    assert.equal(q.get('order'), 'date');
+    assert.equal(q.get('location'), '35.00000,-100.00000', 'centre of the 0.5° cell box');
+    assert.match(q.get('locationRadius'), /^\d+km$/);
+    const ageH = (Date.now() - Date.parse(q.get('publishedAfter'))) / 3600e3;
+    assert.ok(ageH > 71.9 && ageH < 72.1, `publishedAfter is 72h back (got ${ageH}h)`);
+    assert.equal(q.get('key'), null, 'the key is not in the URL');
+    assert.equal(searches[0].headers['x-goog-api-key'], TEST_KEYS.YOUTUBE_API_KEY);
+    const lookups = s.mock.callsTo('/youtube/v3/videos');
+    assert.equal(lookups.length, 1);
+    assert.match(new URL(lookups[0].url).searchParams.get('part'), /recordingDetails/);
+  });
+
+  test('records: links built from the id, http thumbnails dropped', async () => {
+    const d = (await s.api('/api/youtube', { bbox: BBOX })).json();
+    const v = d.videos.find((x) => x.id === 'yt:aaaaaaaaaa1');
+    assert.equal(v.link, 'https://www.youtube.com/watch?v=aaaaaaaaaa1');
+    assert.equal(v.embed, 'https://www.youtube-nocookie.com/embed/aaaaaaaaaa1');
+    assert.equal(v.thumb, 'https://i.ytimg.com/vi/aaaaaaaaaa1/mqdefault.jpg');
+    assert.equal(v.channelLink, 'https://www.youtube.com/channel/UCtest');
+    assert.equal(v.views, 1234);
+    assert.equal(v.place, 'Testville');
+    const live = d.videos.find((x) => x.id === 'yt:cccccccccc3');
+    assert.equal(live.live, 'live');
+    assert.equal(live.thumb, null);
+  });
+
+  test('a repeat view in the same cell is served from the cache, also after a restart of memory', async () => {
+    await s.api('/api/youtube', { bbox: BBOX });
+    await s.api('/api/youtube', { bbox: '34.96,-100.04,35.04,-99.96' });
+    assert.equal(s.mock.callsTo('/youtube/v3/search').length, 2, 'one search (two pages), not two');
+    s.mod.cache.clear();
+    await s.api('/api/youtube', { bbox: BBOX });
+    assert.equal(s.mock.callsTo('/youtube/v3/search').length, 2, 'served from disk');
+  });
+
+  test('retention defaults: kept 72 hours, sent to the browser', async () => {
+    assert.equal(s.mod.RETAIN['youtube.videos'], 72 * 3600e3);
+    assert.equal(s.mod.RETAIN['youtube.window'], 72 * 3600e3);
+    assert.equal((await s.api('/api/config')).json().retention.youtube, 72 * 3600e3);
+  });
+
+  test('a quota refusal is reported', async () => {
+    s.mock.fail('/youtube/v3/search', 403,
+      '{"error":{"code":403,"message":"The request cannot be completed because you have exceeded your quota."}}');
+    const r = await s.api('/api/youtube', { bbox: BBOX });
+    assert.equal(r.status, 403);
+    assert.match(r.text, /quota/);
+  });
+
+  test('without a key it returns nothing and calls nothing', async () => {
+    const t = await startServer();
+    try {
+      const d = (await t.api('/api/youtube', { bbox: BBOX })).json();
+      assert.equal(d.configured, false);
+      assert.equal(d.count, 0);
+      assert.equal(t.mock.calls.length, 0);
+      assert.match((await t.api('/api/health')).json().sources.youtube, /missing YOUTUBE_API_KEY/);
+    } finally { await t.close(); }
+  });
+});
+
 describe('/api/traffic', () => {
   test('cameras and incidents from each configured state, inside the view', async () => {
     const d = (await s.api('/api/traffic', { bbox: BBOX })).json();

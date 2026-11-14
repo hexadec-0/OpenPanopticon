@@ -257,6 +257,7 @@ describe('CelesTrak elements and their local copy', () => {
 
   test('a refusal falls back to the saved copy, marked stale', async () => {
     await S.fetchTle('stations');
+    const old = new Date(Date.now() - 3 * 3600e3); fs.utimesSync(S.tleCachePath('stations'), old, old);
     mock.fail('celestrak.org', 403, 'GP data has not updated since your last successful download of GROUP=stations at 2026-10-21 10:00:00 UTC.');
     const r = await S.fetchTle('stations');
     assert.equal(r.stale, true);
@@ -266,6 +267,7 @@ describe('CelesTrak elements and their local copy', () => {
 
   test('a "no data" answer falls back to the saved copy too', async () => {
     await S.fetchTle('stations');
+    const old = new Date(Date.now() - 3 * 3600e3); fs.utimesSync(S.tleCachePath('stations'), old, old);
     mock.on('celestrak.org', () => text('No GP data found'));
     const r = await S.fetchTle('stations');
     assert.equal(r.stale, true);
@@ -295,6 +297,28 @@ describe('CelesTrak elements and their local copy', () => {
     await assert.rejects(S.fetchTle('stations'), (e) => e.status === 504);
   });
 
+  test('a copy saved within the two-hour cycle is served without asking', async () => {
+    await S.fetchTle('stations');
+    mock.reset();
+    const r = await S.fetchTle('stations');
+    assert.equal(r.stale, true);
+    assert.equal(mock.callsTo('celestrak.org').length, 0);
+  });
+
+  test('after a failure CelesTrak is left alone for a cycle, across groups and restarts', async () => {
+    mock.unreachable('celestrak.org');
+    await assert.rejects(S.fetchTle('stations'), (e) => e.status === 504);
+    mock.reset();                                  // CelesTrak "back"
+    await assert.rejects(S.fetchTle('starlink'), (e) => {
+      assert.equal(e.status, 503);
+      assert.match(e.message, /not being asked again until \d\d:\d\d UTC/);
+      assert.ok(e.retryAfter > 7000);
+      return true;
+    });
+    assert.equal(mock.callsTo('celestrak.org').length, 0);
+    assert.ok(fs.existsSync(require('node:path').join(S.TLE_DIR, '_celestrak-hold.json')), 'kept on disk');
+  });
+
   test('cache file names cannot escape the TLE folder', () => {
     const p = S.tleCachePath('../../etc/passwd');
     assert.ok(p.startsWith(S.TLE_DIR));
@@ -303,6 +327,63 @@ describe('CelesTrak elements and their local copy', () => {
 
   test('the fixture itself parses into satellites', () => {
     assert.match(stationsTle(), /^ISS/);
+  });
+});
+
+describe('Space-Track fallback', () => {
+  const creds = { spaceTrackUser: 'me@example.com', spaceTrackPassword: 'test-spacetrack-SECRET-ffff' };
+  beforeEach(async () => {
+    fs.rmSync(S.TLE_DIR, { recursive: true, force: true });
+    S.cache.clear();
+    await S.clearDiskCache();
+    mock.reset();
+  });
+  after(() => Object.assign(S.CFG, { spaceTrackUser: '', spaceTrackPassword: '' }));
+
+  test('every CelesTrak group has a Space-Track selection', () => {
+    assert.deepEqual(Object.keys(S.SPACETRACK_GROUPS).sort(), Object.keys(S.SAT_GROUPS).sort());
+  });
+
+  test('without a login, a CelesTrak failure says how to add one', async () => {
+    Object.assign(S.CFG, { spaceTrackUser: '', spaceTrackPassword: '' });
+    mock.unreachable('celestrak.org');
+    await assert.rejects(S.orbitalElements('starlink'), /SPACETRACK_USER/);
+    assert.equal(mock.callsTo('space-track.org').length, 0);
+  });
+
+  test('with a login, Space-Track answers when CelesTrak cannot', async () => {
+    Object.assign(S.CFG, creds);
+    mock.unreachable('celestrak.org');
+    const r = await S.orbitalElements('starlink');
+    assert.equal(r.source, 'spacetrack');
+    assert.equal(r.approximate, false);
+    assert.match(r.text, /^STARLINK-1007\n1 44713U/);
+    assert.ok(!r.text.includes('DEB'), 'debris is not a Starlink satellite');
+    const login = mock.callsTo('/ajaxauth/login')[0];
+    assert.equal(login.method, 'POST');
+    assert.equal(new URLSearchParams(login.body).get('identity'), 'me@example.com');
+    assert.match(mock.callsTo('/class/gp/')[0].headers.cookie, /chocolatechip=st-session/);
+    // The catalogue is downloaded once and every other group is picked from it.
+    const st = await S.orbitalElements('stations');
+    assert.match(st.text, /^ISS \(ZARYA\)/);
+    assert.equal(st.approximate, true);
+    assert.equal(mock.callsTo('/class/gp/').length, 1);
+  });
+
+  test('a recent CelesTrak copy is still preferred over Space-Track', async () => {
+    Object.assign(S.CFG, creds);
+    await S.fetchTle('stations');
+    mock.unreachable('celestrak.org');
+    const r = await S.orbitalElements('stations');
+    assert.equal(r.source, 'celestrak');
+    assert.equal(mock.callsTo('space-track.org').length, 0);
+  });
+
+  test('a wrong password is reported as such', async () => {
+    Object.assign(S.CFG, { ...creds, spaceTrackPassword: 'wrong' });
+    S.CREDENTIAL_RESETS.spacetrack();   // what saving a new password in settings does
+    mock.unreachable('celestrak.org');
+    await assert.rejects(S.orbitalElements('starlink'), /Space-Track login failed/);
   });
 });
 

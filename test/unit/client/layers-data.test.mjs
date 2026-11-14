@@ -535,6 +535,56 @@ describe('WebcamLayer', () => {
   });
 });
 
+describe('YoutubeLayer', () => {
+  test('draws the geotagged videos found for the view', async () => {
+    const l = on(new L.YoutubeLayer(viewer));
+    await l.refresh(ctx('34.9,-100.1,35.1,-99.9'));
+    assert.equal(l.status, 'ok', l.error);
+    assert.equal(l.count, 2);
+    assert.equal(l.window, '72h');
+  });
+
+  test('the player loads only on request, sandboxed, and stops when closed', async () => {
+    const l = new L.YoutubeLayer(viewer);
+    const root = new FakeElement('div');
+    await l.enrich({ title: 't', thumb: 'https://i.ytimg.com/vi/x/mqdefault.jpg',
+      embed: 'https://www.youtube-nocookie.com/embed/aaaaaaaaaa1' }, root);
+    const stage = root.querySelector('[data-slot="ytstage"]');
+    assert.ok(!stage.children.some((c) => c.tagName === 'IFRAME'), 'no player before play');
+    const play = stage.children.find((c) => c.tagName === 'BUTTON');
+    play.onclick();
+    const frame = stage.children.find((c) => c.tagName === 'IFRAME');
+    assert.equal(frame.src, 'https://www.youtube-nocookie.com/embed/aaaaaaaaaa1?autoplay=1&rel=0');
+    assert.equal(frame.getAttribute('sandbox'), 'allow-scripts allow-same-origin allow-presentation allow-popups');
+    l.stopLive();
+    assert.equal(frame.src, 'about:blank');
+    assert.ok(frame.removed);
+  });
+
+  test('an http or javascript: embed gets no play button', async () => {
+    const l = new L.YoutubeLayer(viewer);
+    for (const embed of ['http://insecure.example/p', 'javascript:alert(1)']) {
+      const root = new FakeElement('div');
+      await l.enrich({ title: 't', embed }, root);
+      assert.ok(!root.querySelector('[data-slot="ytstage"]').children.some((c) => c.tagName === 'BUTTON'), embed);
+    }
+  });
+
+  test('detail escapes upstream text and links only to safe URLs', () => {
+    const l = new L.YoutubeLayer(viewer);
+    const ok = l.detail({ title: 'Storm', lat: 1, lon: 1, duration: 'PT1H2M3S', views: 1234,
+      link: 'https://www.youtube.com/watch?v=aaaaaaaaaa1', live: 'live' });
+    assert.match(ok.html, /Watch on YouTube/);
+    assert.match(ok.html, /1:02:03/);
+    assert.match(ok.html, /Live now/);
+    const bad = l.detail({ title: XSS, channel: XSS, description: XSS, place: XSS, lat: 1, lon: 1,
+      link: 'javascript:alert(1)', channelLink: 'javascript:alert(1)' });
+    assertInert(bad.html);
+    assert.ok(!bad.html.includes('Watch on YouTube'));
+    assert.ok(!bad.html.includes('Channel ↗'));
+  });
+});
+
 describe('VesselLayer', () => {
   test('draws vessels from the stream, honouring "moving only"', async () => {
     const { FakeWebSocket, positionReport, staticData } = require('../../helpers/fake-websocket.cjs');

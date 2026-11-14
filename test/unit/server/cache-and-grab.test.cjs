@@ -284,6 +284,17 @@ describe('grab()', () => {
     });
   });
 
+  test('an unreachable host names the network reason Node hides in err.cause', async () => {
+    const fail = (cause) => () => { throw Object.assign(new TypeError('fetch failed'), { cause }); };
+    mock.on('reset.example', fail(Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' })));
+    await assert.rejects(S.grab('https://reset.example/x', {}, { label: 'CelesTrak' }),
+      /CelesTrak unreachable: connection reset .*\[ECONNRESET\]$/);
+    mock.on('dns.example', fail(new AggregateError([Object.assign(new Error('x'), { code: 'ENOTFOUND' })])));
+    await assert.rejects(S.grab('https://dns.example/x', {}, { label: 'X' }), /no DNS answer for the host \[ENOTFOUND\]/);
+    mock.on('tls.example', fail(Object.assign(new Error('self-signed certificate in certificate chain'), { code: 'SELF_SIGNED_CERT_IN_CHAIN' })));
+    await assert.rejects(S.grab('https://tls.example/x', {}, { label: 'X' }), /TLS certificate not trusted/);
+  });
+
   test('a hung upstream times out as a 504', async () => {
     mock.hang('a.example');
     await assert.rejects(S.grab('https://a.example/x', {}, { label: 'Slow', timeoutMs: 50 }), (e) => {

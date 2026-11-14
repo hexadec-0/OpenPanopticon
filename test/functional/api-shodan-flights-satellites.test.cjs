@@ -263,6 +263,7 @@ describe('/api/satellites', () => {
   });
 
   test('an unknown group falls back to stations', async () => {
+    require('node:fs').rmSync(s.mod.TLE_DIR, { recursive: true, force: true });
     const d = (await s.api('/api/satellites', { group: '../../etc' })).json();
     assert.equal(d.group, 'stations');
     assert.equal(new URL(s.mock.callsTo('celestrak.org').at(-1).url).searchParams.get('GROUP'), 'stations');

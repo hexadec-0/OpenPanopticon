@@ -17,7 +17,7 @@ import { installTileCache } from './tilecache.js';
 import { installConfigMenu } from './config.js';
 import {
   ShodanLayer, FlightLayer, SatelliteLayer, OverpassLayer, WebcamLayer,
-  EventLayer, AlprLayer, VesselLayer, NetInfraLayer, IotLayer, TrafficLayer,
+  EventLayer, AlprLayer, VesselLayer, NetInfraLayer, IotLayer, TrafficLayer, YoutubeLayer,
   WeatherOverlay, ImageryOverlay, LabelsOverlay, BasemapOverlay, api,
 } from './layers.js';
 
@@ -105,6 +105,7 @@ class OpenPanopticon {
       netinfra: new NetInfraLayer(this.viewer),
       iot: new IotLayer(this.viewer),
       traffic: new TrafficLayer(this.viewer),
+      youtube: new YoutubeLayer(this.viewer),
     };
     // Layers that cannot work without a key in .env. They are locked off:
     // nothing — a click, a saved session, a shortcut — can switch them on.
@@ -114,6 +115,7 @@ class OpenPanopticon {
       shodan: src.shodan !== 'configured' && 'SHODAN_API_KEY',
       vessels: !String(src.ais || '').startsWith('configured') && 'AISSTREAM_API_KEY',
       traffic: String(src.fiveEleven || '').startsWith('no states') && 'FIVE_ELEVEN_KEYS',
+      youtube: src.youtube !== 'configured' && 'YOUTUBE_API_KEY',
     };
     const reasons = {};
     for (const [id, envVar] of Object.entries(needs)) {
@@ -138,7 +140,7 @@ class OpenPanopticon {
     // already fetched, so the browser does not re-ask about what the server
     // is still holding, nor go on trusting what it has let go.
     const keep = cfg.retention || {};
-    for (const id of ['shodan', 'overpass', 'alpr', 'webcams', 'netinfra']) {
+    for (const id of ['shodan', 'overpass', 'alpr', 'webcams', 'netinfra', 'youtube']) {
       if (this.layers[id] && Number.isFinite(keep[id])) this.layers[id].coverageTtlMs = keep[id];
     }
     for (const id of ['events', 'iot']) {
@@ -879,6 +881,7 @@ class OpenPanopticon {
     const layer = this.layers[meta.layer];
     if (!layer?.detail) return false;
     this.layers?.webcams?.stopLive();
+    this.layers?.youtube?.stopLive();
     const detail = layer.detail(meta.record);
     this.openDetail(detail);
     this.markSelected(layer, meta.record, picked, detail.accent);
@@ -993,6 +996,7 @@ class OpenPanopticon {
     this.selection?.clear();
     this.layers?.flights?.clearRoute();
     this.layers?.webcams?.stopLive();
+    this.layers?.youtube?.stopLive();
   }
 
   /* ---------------------------------------------------------------- */
@@ -1592,6 +1596,16 @@ class OpenPanopticon {
       'Cameras their operators publish for public viewing. Add WINDY_API_KEY and '
       + 'OPENWEBCAMDB_API_KEY in .env to widen coverage.'));
     mk('webcams', 'Public cameras', camCtl);
+
+    /* --- YouTube -------------------------------------------------- */
+    const ytCtl = el('div', 'layer-body');
+    const ytNote = el('p', 'note', this.health.sources.youtube === 'configured'
+      ? 'Geotagged uploads near the view, newest first. Each search is held for 72 hours.'
+      : 'Add YOUTUBE_API_KEY in .env (YouTube Data API v3) to search geotagged uploads.');
+    ytCtl.append(ytNote);
+    const yBox = mk('youtube', 'YouTube geotags', ytCtl);
+    if (this.health.sources.youtube !== 'configured') yBox.classList.add('unavailable');
+    this.youtubeNote = ytNote;
   }
 
   buildWeatherBar() {
@@ -1933,17 +1947,28 @@ class OpenPanopticon {
       const satellite = bm.provider !== 'osm';
       btn.classList.toggle('active', satellite);
       // Dates and cloud cover only mean something for the scene searches.
-      $('#bm-window').style.display = bm.active ? '' : 'none';
-      $('#bm-scene-row').style.display = bm.provider === 'sentinel2' ? '' : 'none';
+      $('#bm-window').style.display = bm.windowed ? '' : 'none';
+      const wayback = bm.provider === 'wayback';
+      $('#bm-scene-row').style.display = bm.provider === 'sentinel2' || wayback ? '' : 'none';
+      // Wayback has no cloud cover to rank by; every version listed differs.
+      $('#bm-clearest').style.display = wayback ? 'none' : '';
       $('#bm-uniform-row').style.display = bm.provider === 'cesium' ? '' : 'none';
       // The base layer may have just changed under the pinned aerial layer.
       this.uniform?.update();
 
       scene.innerHTML = '';
       for (const sc of bm.scenes) {
-        const o = el('option', null,
-          `${sc.date}  ·  ${sc.cloud}% cloud${sc.id === bm.meta?.clearest ? '  ★' : ''}`);
+        // For Wayback the capture date is what matters; the release date is
+        // only when Esri published it, and can be years later.
+        const o = el('option', null, wayback
+          ? [sc.captured ? `captured ${sc.captured}` : `released ${sc.date}`,
+            sc.resolutionM != null ? `${sc.resolutionM} m` : null, sc.provider].filter(Boolean).join('  ·  ')
+          : `${sc.date}  ·  ${sc.cloud}% cloud${sc.id === bm.meta?.clearest ? '  ★' : ''}`);
         o.value = sc.id;
+        if (wayback) {
+          o.title = [`Esri release ${sc.date}`, sc.source, sc.accuracyM != null ? `±${sc.accuracyM} m` : null]
+            .filter(Boolean).join(' · ');
+        }
         scene.append(o);
       }
       if (bm.sceneId) scene.value = bm.sceneId;
@@ -1951,7 +1976,12 @@ class OpenPanopticon {
       note.classList.toggle('bad', bm.status === 'error' || bm.status === 'empty');
       if (bm.status === 'loading') note.textContent = 'Searching for imagery over this view…';
       else if (bm.error) note.textContent = bm.error;
-      else if (satellite && bm.meta?.matched != null) {
+      else if (wayback && bm.meta?.provider === 'wayback') {
+        const n = bm.scenes.length;
+        note.textContent = `${n} version${n === 1 ? '' : 's'} of the imagery here, newest first, `
+          + `out of ${bm.meta.releases} Esri releases. Capture date, source and resolution are for `
+          + `the centre of the view. ${bm.meta.attribution}.`;
+      } else if (satellite && bm.meta?.matched != null) {
         note.textContent = `${bm.meta.returned} of ${bm.meta.matched} scenes in `
           + `${bm.from} – ${bm.to}. ${bm.meta.attribution}.`;
       } else if (satellite && bm.meta?.provider === bm.provider) {
@@ -2284,6 +2314,13 @@ class OpenPanopticon {
               + 'UTC day — SYNC still forces an update.');
           }
           cnt.title = bits.join('\n');
+        } else if (id === 'satellites' && layer.elementsSource === 'spacetrack') {
+          cnt.title = `${layer.count.toLocaleString()} tracked · ${layer.groupLabel || ''}`
+            + '\nElements from Space-Track: CelesTrak could not answer.'
+            + (layer.approximate
+              ? '\nSpace-Track has no groups, so this one is picked out by name and orbit, and'
+                + ' only approximates CelesTrak\'s list.'
+              : '');
         } else if (id === 'satellites' && layer.elementsAt) {
           const age = Date.now() - Date.parse(layer.elementsAt);
           const mins = Number.isFinite(age) ? Math.round(age / 60_000) : null;
@@ -2368,6 +2405,14 @@ class OpenPanopticon {
           add(m, n);
         }
       }
+    }
+
+    if (this.youtubeNote && this.layers.youtube?.enabled && this.layers.youtube.status === 'ok') {
+      const y = this.layers.youtube;
+      const since = y.after ? new Date(y.after).toLocaleString() : null;
+      this.youtubeNote.textContent = `Uploads from the last ${y.window || '72h'}`
+        + `${since ? ` (since ${since} when this view was searched)` : ''}, held for 72 hours. `
+        + `${y.count.toLocaleString()} geotagged in view.`;
     }
 
     if (this.trafficNote && this.layers.traffic.enabled) {

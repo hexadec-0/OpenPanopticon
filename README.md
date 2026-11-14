@@ -118,7 +118,7 @@ ceilings use more API credits. See [Altitude gate](#altitude-gate).
 > `.env.example` is optional. Some upgrade a layer that already works without
 > one (OpenSky, GreyNoise, Cesium Ion); the rest switch on a layer that
 > otherwise stays off and says so (AIS, OpenCelliD, WiGLE, Windy,
-> OpenWebcamDB, FIRMS, 511, EIA, Cloudflare Radar, CARTO labels). Two more
+> OpenWebcamDB, YouTube, FIRMS, 511, EIA, Cloudflare Radar, CARTO labels). Two more
 > are optional and specialised: `EDIS_API_URL` / `EDIS_API_KEY` for a licensed
 > RSOE EDIS feed, and a Google service account for an optional Earth Engine
 > basemap composite (see `.env.example`).
@@ -168,11 +168,12 @@ ceilings use more API credits. See [Altitude gate](#altitude-gate).
 | **Shodan exposure** | Shodan `host/search` | Every host Shodan has indexed in view, with no filter. Colour by service category (web, remote, database, ICS, camera, network…) or by known CVEs, with a live legend. |
 | **Live aircraft** | OpenSky + adsbdb | Positions, callsigns, altitude, heading, vertical rate, motion trails, emergency squawk flagging (7500/7600/7700). Click one to resolve its **departure and destination airports**, airline, and airframe. Trails are trimmed to the last two minutes. |
 | **Weather** | RainViewer + NASA GIBS | Precipitation radar (RainViewer) and cloud imagery as toggleable globe overlays, with a frame scrubber and animation across the last ~2 hours plus nowcast. Cloud imagery is GOES-East GeoColor from NASA GIBS, which covers the Americas and the Atlantic; see [Overlay resolution limits](#overlay-resolution-limits). |
-| **Orbital assets** | CelesTrak | 24 catalogue groups. Real SGP4 propagation in the browser via satellite.js. Click a satellite to draw its ground track for one full revolution. |
+| **Orbital assets** | CelesTrak, Space-Track as fallback | 24 catalogue groups. Real SGP4 propagation in the browser via satellite.js. Click a satellite to draw its ground track for one full revolution. CelesTrak asks for one download per group per two-hour cycle and firewalls clients that retry; the server serves a copy saved within the cycle without asking, and after any failure leaves CelesTrak alone for two hours (kept across restarts). With an optional free Space-Track login (`SPACETRACK_USER` / `SPACETRACK_PASSWORD`), the catalogue comes from Space-Track instead when CelesTrak cannot answer; groups CelesTrak curates by hand are then approximated, and the layer says so. |
 | **OSM infrastructure** | Overpass API | 10 toggleable feature classes: surveillance cameras, military sites, comms towers, power plants and substations, airfields, ports, government and diplomatic, emergency services, data centres, fuel storage. |
 | **ALPR / Flock** | DeFlock via OpenStreetMap | License-plate readers, coloured by vendor, each drawn with a field-of-view cone from its tagged bearing. Filter by vendor, or to only cameras whose facing is known. |
 | **Situational awareness** | GDACS, NASA EONET, USGS, NWS, NASA FIRMS | Live hazard and disaster events for the current view, normalised into one record shape and colour-graded by severity. Red-level events pulse on the globe; events that carry an affected area are drawn as polygons. |
 | **Public cameras** | NYC DOT + ALERTCalifornia + Windy + OpenWebcamDB | Click one to watch it live in the side panel: an embedded player where the operator provides one, otherwise the still frame refreshed on a timer. ALERTCalifornia adds ~1,290 wildfire-detection PTZ cameras, keyless. |
+| **YouTube geotags** | YouTube Data API v3 (`YOUTUBE_API_KEY`) | Videos uploaded in the last 72 hours whose uploader geotagged them near the view, the same search as [YouTube Geofind](https://mattw.io/youtube-geofind/location). Live streams are pink, upcoming ones yellow. Click for details; the player loads only when you press play. |
 | **Vessels (AIS)** | AISStream | Live ship positions, heading, speed, navigation status, destination, and dimensions. The server holds the WebSocket; the browser never sees the key. |
 | **Network infrastructure** | RIPE Atlas, OpenCelliD, WiGLE, Onionoo | Geolocated network and wireless hardware: measurement probes with ASN, cell towers drawn at their estimated range, WiFi/Bluetooth survey points, and Tor relay capacity by country. |
 | **IoT sensors** | Sensor.Community | Citizen-run air-quality and noise hardware with live readings, coloured by WHO PM2.5 bands or measured dB(A). |
@@ -512,6 +513,15 @@ including, for Sentinel-2, the date of the scene you are looking at.
 - **Sentinel-2 (10 m)**: recent Copernicus imagery, no key needed. Pick a
   date window and cloud-cover ceiling; the scene list refreshes for whatever
   is in view when the camera settles.
+- **Aerial history (Esri Wayback)**: Esri World Imagery and every past
+  release since 2014, no key needed. Usually the sharpest and most recent
+  aerial picture available for free (sub-metre, often Maxar). The scene list
+  holds only the versions that actually changed over the view, newest first,
+  each labelled with its *capture* date, source and resolution at the view
+  centre. That date can be years older than the Esri release that published
+  it. The list is worked out the same way as Esri's own
+  [Wayback app](https://livingatlas.arcgis.com/wayback/), and kept for
+  `[maps] scenes` in `cache.conf`.
 - **Shortbread (OSM vector)**: OpenStreetMap drawn in the terminal's own
   palette, from VersaTiles by default. Override the tile source with `SHORTBREAD_URL`.
 
@@ -623,6 +633,7 @@ under [Caching](#caching).
 - **NWS**: about 85% of active alerts reference forecast zones instead of carrying a polygon. Resolving each zone would be hundreds of extra requests, so those are counted in the layer note but not drawn. The layer says how many.
 - **OpenWebcamDB**: free for non-commercial use only, and the documented list route has no spatial filter, so the whole catalogue (~1,500 cameras) is paged once and cached (`static`, 72 hours), then filtered locally.
 - **Overpass**: a donated, shared service with roughly two execution slots per IP. Every selected feature class goes out as **one** unioned query, not one query per class, and all Overpass-backed layers (infrastructure and ALPR) share a single serial queue with a minimum gap between requests. On a 429 the three mirrors rotate, then a cooldown applies and the layer schedules its own retry, and the sidebar shows the countdown rather than just failing.
+- **YouTube**: 10,000 quota units a day on the free tier. A new view costs up to three search pages at 100 units each, plus 1 unit per 50 videos looked up, so roughly 30 new views a day. Searches run on a fixed 0.5° grid (up to 2° across) and are kept for 72 hours on disk (`[youtube] videos = 72h`), looking back `[youtube] window = 72h` from when they ran. A held search keeps the window it was asked for; FLUSH or a shorter `videos` setting makes it look again.
 - **Nominatim**: 1 request/second; searches are debounced and cached in memory for 72 hours (`static`), never on disk.
 
 ---

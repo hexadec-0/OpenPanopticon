@@ -76,7 +76,9 @@ All are optional. Anything unset stays switched off, just like an empty line in
 | Access | `ACCESS_KEY`, `ALLOWED_HOSTS` |
 | Core | `SHODAN_API_KEY`, `CESIUM_ION_TOKEN`, `CARTO_API_KEY` |
 | Flights | `OPENSKY_CLIENT_ID`, `OPENSKY_CLIENT_SECRET`, `OPENSKY_CREDIT_FLOOR` |
+| Satellites | `SPACETRACK_USER`, `SPACETRACK_PASSWORD` |
 | Webcams | `WINDY_API_KEY`, `OPENWEBCAMDB_API_KEY`, `FIVE_ELEVEN_KEYS` |
+| Video | `YOUTUBE_API_KEY` |
 | Hazards | `FIRMS_MAP_KEY`, `EDIS_API_URL`, `EDIS_API_KEY` |
 | Vessels and devices | `AISSTREAM_API_KEY`, `OPENCELLID_API_KEY`, `WIGLE_API_NAME`, `WIGLE_API_TOKEN`, `GREYNOISE_API_KEY` |
 | Infrastructure | `EIA_API_KEY`, `CLOUDFLARE_API_TOKEN` |

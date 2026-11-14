@@ -153,7 +153,7 @@ describe('loopback server', () => {
     test('nor in any API response', async () => {
       const bbox = '34.95,-100.05,35.05,-99.95';
       const routes = [
-        ['/api/shodan', { bbox }], ['/api/flights', { bbox }], ['/api/webcams', { bbox }],
+        ['/api/shodan', { bbox }], ['/api/flights', { bbox }], ['/api/webcams', { bbox }], ['/api/youtube', { bbox }],
         ['/api/events', { bbox, sources: 'gdacs,eonet,usgs,nws,firms' }], ['/api/netinfra', { bbox, sources: 'atlas,cell,wigle,tor' }],
         ['/api/signals', { bbox }], ['/api/traffic', { bbox }], ['/api/enrich', { ip: '203.0.113.66' }],
       ];

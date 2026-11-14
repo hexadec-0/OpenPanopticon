@@ -1006,3 +1006,15 @@ body.resizing-detail #detail { transition: none; }
   .cfg-field { grid-column: 1; grid-row: auto; }
   .cfg-head { flex-wrap: wrap; }
 }
+
+/* YouTube: the player is loaded on request, over the thumbnail. */
+.yt-play {
+  display: block; margin: 6px 0; padding: 6px 12px; cursor: pointer;
+  background: #ff3b30; color: #fff; border: 0; border-radius: 4px;
+  font: inherit; font-weight: 600;
+}
+.yt-play:hover { filter: brightness(1.15); }
+.yt-desc {
+  white-space: pre-line; max-height: 9em; overflow: auto;
+  font-size: 12px; opacity: .85; margin: 6px 0;
+}

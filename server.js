@@ -61,9 +61,12 @@ const CFG = {
   host: process.env.HOST || '127.0.0.1',
   shodanKey: (process.env.SHODAN_API_KEY || '').trim(),
   windyKey: (process.env.WINDY_API_KEY || '').trim(),
+  youtubeKey: (process.env.YOUTUBE_API_KEY || '').trim(),
   cesiumIonToken: (process.env.CESIUM_ION_TOKEN || '').trim(),
   openSkyId: (process.env.OPENSKY_CLIENT_ID || '').trim(),
   openSkySecret: (process.env.OPENSKY_CLIENT_SECRET || '').trim(),
+  spaceTrackUser: (process.env.SPACETRACK_USER || '').trim(),
+  spaceTrackPassword: (process.env.SPACETRACK_PASSWORD || '').trim(),
   owcdbKey: (process.env.OPENWEBCAMDB_API_KEY || '').trim(),
   firmsKey: (process.env.FIRMS_MAP_KEY || '').trim(),
   edisUrl: (process.env.EDIS_API_URL || '').trim(),
@@ -133,6 +136,8 @@ const CACHE_SCHEMA = [
   ['overpass', 'truncated', '1h', 'An answer that hit the item cap is incomplete, so it is held in memory\n# only, for this long, and never written to disk.'],
   ['network', 'infrastructure', '30d', 'RIPE Atlas probes, cell towers (OpenCelliD), WiFi (WiGLE), Tor relays.'],
   ['cameras', 'directories', '14d', 'Webcam directories: NYC DOT, OpenWebcamDB, ALERTCalifornia.'],
+  ['youtube', 'videos', '72h', 'YouTube geotagged-video searches. A search spends 100-300 units of the\n# 10,000-unit daily YouTube Data API quota, so a view is not paid for twice.'],
+  ['youtube', 'window', '72h', 'How far back each YouTube search looks for uploads, counted from when\n# the search runs. A held search keeps showing the window it was asked for.'],
   ['satellites', 'elements', '14d', 'Orbital elements from CelesTrak. Only accurate near their epoch: older\n# elements put low-orbit objects tens of kilometres from where they are.'],
   ['aircraft', 'airframes', '3d', 'Aircraft type and registration lookups.'],
   ['vessels', 'photos', '7d', 'Ship photos found on Wikimedia Commons by IMO or MMSI, and the ships\n# found to have none (so they are not asked about again on every click).'],
@@ -243,6 +248,7 @@ function diskMaxAge() {
     const name = `${sec}.${key}`;
     if (sec === 'maps' && key !== 'scenes') continue;   // tiles are their own store
     if (name === 'aircraft.trails') continue;           // drawn in the browser, never on disk
+    if (name === 'youtube.window') continue;            // a search parameter, not a lifetime
     if (kindOf(name) === 'duration') max = Math.max(max, RETAIN[name] || 0);
   }
   return max;
@@ -438,6 +444,9 @@ const VIEW_CELL_DEG = {
   iot: 0.25,
   cell: 0.05,
   wigle: 0.05,
+  // YouTube charges 100 quota units per search page whatever the radius, so
+  // a coarse cell lets panning around a city reuse one paid answer.
+  youtube: 0.5,
 };
 
 /**
@@ -463,6 +472,10 @@ const VIEW_MAX_DEG = {
   iot: 2,
   cell: 0.5,
   wigle: 0.5,
+  // 2 degrees is a ~160km search radius. Wider, the 150 newest uploads a
+  // search returns are spread so thin over a region that a city in view
+  // gets a handful of them.
+  youtube: 2,
 };
 
 /**
@@ -761,6 +774,41 @@ class UpstreamError extends Error {
  */
 const USER_AGENT = `OpenPanopticon (self-hosted OSINT viewer; +${PKG.homepage})`;
 
+/**
+ * Why a request never got an answer, in words.
+ *
+ * Node's fetch reports every network failure as the same "fetch failed" and
+ * keeps the real reason (no DNS answer, refused, reset, a certificate it will
+ * not trust) in err.cause, sometimes one level further down. Those need
+ * different fixes, so the message names the one that happened.
+ */
+const NET_REASONS = {
+  __proto__: null,
+  ENOTFOUND: 'no DNS answer for the host',
+  EAI_AGAIN: 'DNS lookup timed out',
+  ECONNREFUSED: 'connection refused',
+  ECONNRESET: 'connection reset (often a firewall, filter or block on this IP)',
+  ETIMEDOUT: 'connection timed out',
+  EHOSTUNREACH: 'host unreachable',
+  ENETUNREACH: 'network unreachable',
+  UND_ERR_CONNECT_TIMEOUT: 'connection timed out',
+  UND_ERR_SOCKET: 'connection dropped',
+  CERT_HAS_EXPIRED: 'its TLS certificate has expired',
+  UNABLE_TO_GET_ISSUER_CERT_LOCALLY: 'TLS certificate not trusted (an antivirus or proxy intercepting HTTPS?)',
+  SELF_SIGNED_CERT_IN_CHAIN: 'TLS certificate not trusted (an antivirus or proxy intercepting HTTPS?)',
+  DEPTH_ZERO_SELF_SIGNED_CERT: 'TLS certificate not trusted (an antivirus or proxy intercepting HTTPS?)',
+  UNABLE_TO_VERIFY_LEAF_SIGNATURE: 'TLS certificate not trusted (an antivirus or proxy intercepting HTTPS?)',
+};
+function networkReason(err) {
+  let c = err?.cause;
+  // AggregateError (IPv4 and IPv6 both tried) and nested causes.
+  if (c?.errors?.length) c = c.errors[0];
+  if (c?.cause && !c.code) c = c.cause;
+  const code = c?.code;
+  if (!code) return c?.message || err?.message || 'unknown network error';
+  return `${NET_REASONS[code] || c.message || 'network error'} [${code}]`;
+}
+
 async function grab(url, opts = {}, { as = 'json', timeoutMs = 25000, label = 'upstream', onHeaders } = {}) {
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), timeoutMs);
@@ -775,7 +823,7 @@ async function grab(url, opts = {}, { as = 'json', timeoutMs = 25000, label = 'u
     clearTimeout(timer);
     const why = err.name === 'AbortError'
       ? `${label} timed out after ${timeoutMs / 1000}s`
-      : `${label} unreachable: ${err.message}`;
+      : `${label} unreachable: ${networkReason(err)}`;
     throw new UpstreamError(504, why);
   }
   clearTimeout(timer);
@@ -1484,10 +1532,52 @@ async function writeCachedTle(group, text) {
  * re-send and this came off disk — normal, and the elements are still the
  * current ones, since a refusal is precisely their way of saying so.
  */
+// CelesTrak publishes each group every two hours and asks clients to fetch
+// no more often than that, and to stop at once when a request fails: a
+// client that keeps retrying is what gets an address firewalled. So a copy
+// saved within the cycle is served without asking, and after a failure the
+// server leaves CelesTrak alone for a full cycle. The hold is kept on disk
+// so that restarting the server does not reset it.
+const CELESTRAK_CYCLE_MS = 2 * 60 * 60_000;
+const celestrakHoldFile = () => path.join(TLE_DIR, '_celestrak-hold.json');
+
+async function celestrakHold(now = Date.now()) {
+  try {
+    const h = JSON.parse(await fsp.readFile(celestrakHoldFile(), 'utf8'));
+    return Number(h.until) > now ? { until: Number(h.until), reason: String(h.reason || '') } : null;
+  } catch {
+    return null;
+  }
+}
+
+async function holdCelestrak(reason) {
+  try {
+    await fsp.mkdir(TLE_DIR, { recursive: true });
+    await fsp.writeFile(celestrakHoldFile(),
+      JSON.stringify({ until: Date.now() + CELESTRAK_CYCLE_MS, reason }), 'utf8');
+  } catch (e) {
+    log('warn', `could not record the CelesTrak hold: ${e.message}`);
+  }
+}
+
 async function fetchTle(group) {
   const url = new URL('https://celestrak.org/NORAD/elements/gp.php');
   url.searchParams.set('GROUP', group);
   url.searchParams.set('FORMAT', 'tle');
+
+  const saved = await readCachedTle(group);
+  if (saved && Date.now() - Date.parse(saved.savedAt) < CELESTRAK_CYCLE_MS) {
+    return { text: saved.text, stale: true, savedAt: saved.savedAt };
+  }
+  const hold = await celestrakHold();
+  if (hold) {
+    if (saved) return { text: saved.text, stale: true, savedAt: saved.savedAt };
+    const e = new UpstreamError(503,
+      `CelesTrak is not being asked again until ${new Date(hold.until).toISOString().slice(11, 16)} UTC: `
+      + `the last request failed (${hold.reason}). Retrying sooner is what gets an address blocked.`);
+    e.retryAfter = Math.max(60, Math.round((hold.until - Date.now()) / 1000));
+    throw e;
+  }
 
   try {
     const text = await grab(url, {}, { as: 'text', label: 'CelesTrak', timeoutMs: 30000 });
@@ -1505,10 +1595,14 @@ async function fetchTle(group) {
     const refusedAsUnchanged = err.status === 403
       && (TLE_STALE_RE.test(err.message || '') || TLE_STALE_RE.test(err.detail || ''));
 
+    // A "nothing new yet" refusal is CelesTrak working as intended. Anything
+    // else (unreachable, blocked, broken) stops all CelesTrak requests for a
+    // cycle.
+    if (!refusedAsUnchanged) {
+      log('warn', `CelesTrak failed (${err.message}); holding off for two hours`);
+      await holdCelestrak(err.message);
+    }
     if (disk) {
-      if (!refusedAsUnchanged) {
-        log('warn', `CelesTrak unavailable (${err.message}); serving cached ${group} elements`);
-      }
       return { text: disk.text, stale: true, savedAt: disk.savedAt };
     }
     // Nothing on disk: a throttle refusal with no cache is genuinely useless
@@ -1539,6 +1633,146 @@ async function fetchTle(group) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// SPACE-TRACK — the source CelesTrak redistributes, as a fallback
+// ---------------------------------------------------------------------------
+//
+// Space-Track.org (US Space Force, 18th Space Defense Squadron) needs a free
+// account and has no groups: CelesTrak curates those. Space-Track's guidance
+// is to take the whole current catalogue in one request, at most hourly, and
+// select from it locally, which is what this does. Constellations that are
+// named consistently (Starlink, GPS, Galileo...) come out the same as
+// CelesTrak's groups; curated ones (brightest, military, science) are
+// approximated from names, orbits and radar size, and are labelled so.
+
+const SPACETRACK = 'https://www.space-track.org';
+const SPACETRACK_CATALOG = `${SPACETRACK}/basicspacedata/query/class/gp/decay_date/null-val/epoch/%3Enow-30/orderby/norad_cat_id/format/json`;
+let spaceTrackCookie = null;
+
+const spaceTrackConfigured = () => !!(CFG.spaceTrackUser && CFG.spaceTrackPassword);
+
+async function spaceTrackLogin() {
+  let cookies = [];
+  const body = await grab(`${SPACETRACK}/ajaxauth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ identity: CFG.spaceTrackUser, password: CFG.spaceTrackPassword }).toString(),
+  }, {
+    as: 'text', label: 'Space-Track login', timeoutMs: 30000,
+    onHeaders: (h) => { cookies = h.getSetCookie?.() || []; },
+  });
+  if (/"Login"\s*:\s*"Failed"/i.test(body) || !cookies.length) {
+    throw new UpstreamError(401, 'Space-Track login failed: check SPACETRACK_USER and SPACETRACK_PASSWORD');
+  }
+  spaceTrackCookie = cookies.map((c) => c.split(';')[0]).join('; ');
+}
+
+/** The current catalogue, slimmed to what the groups and the globe need. */
+async function spaceTrackCatalog() {
+  // At least an hour between downloads (Space-Track's rule), at most half a
+  // day (elements older than that put low-orbit objects visibly off).
+  const ttl = clamp(RETAIN['satellites.elements'], 3600e3, 12 * 3600e3);
+  return cachedPersistent('spacetrack:catalog:v1', ttl, async () => {
+    if (!spaceTrackCookie) await spaceTrackLogin();
+    const get = () => grab(SPACETRACK_CATALOG, { headers: { Cookie: spaceTrackCookie } },
+      { label: 'Space-Track', timeoutMs: 120000 });
+    let rows;
+    try {
+      rows = await get();
+    } catch (e) {
+      if (e.status !== 401) throw e;
+      await spaceTrackLogin();           // the session expired; once more
+      rows = await get();
+    }
+    if (!Array.isArray(rows)) throw new UpstreamError(502, 'Space-Track returned no catalogue');
+    return rows.filter((r) => r?.TLE_LINE1 && r?.TLE_LINE2).map((r) => ({
+      name: String(r.OBJECT_NAME || r.TLE_LINE0 || '').replace(/^0 /, '').trim(),
+      type: r.OBJECT_TYPE || null,
+      rcs: r.RCS_SIZE || null,
+      launch: r.LAUNCH_DATE || null,
+      mm: Number(r.MEAN_MOTION),
+      ecc: Number(r.ECCENTRICITY),
+      l1: r.TLE_LINE1,
+      l2: r.TLE_LINE2,
+    }));
+  });
+}
+
+const payload = (r) => r.type === 'PAYLOAD';
+const named = (re) => (r) => payload(r) && re.test(r.name);
+const between = (v, lo, hi) => Number.isFinite(v) && v >= lo && v <= hi;
+
+/** How each CelesTrak group is picked out of the Space-Track catalogue. */
+const SPACETRACK_GROUPS = {
+  __proto__: null,
+  'stations': { approx: true, pick: named(/^(ISS|CSS|TIANGONG|SOYUZ[- ]MS|PROGRESS[- ]MS|CREW DRAGON|DRAGON|CYGNUS|SHENZHOU|TIANZHOU|HTV|STARLINER|AXIOM)/) },
+  'visual': { approx: true, pick: (r) => r.type !== 'DEBRIS' && r.rcs === 'LARGE' && r.mm > 11 },
+  'last-30-days': { approx: false, pick: (r) => r.launch && Date.parse(r.launch) >= Date.now() - 30 * 86400e3 },
+  'gps-ops': { approx: true, pick: (r) => named(/^NAVSTAR/)(r) && between(r.mm, 1.95, 2.05) },
+  'galileo': { approx: false, pick: named(/^GALILEO/) },
+  'glo-ops': { approx: true, pick: (r) => named(/^COSMOS/)(r) && between(r.mm, 2.10, 2.16) && r.ecc < 0.01 },
+  'beidou': { approx: false, pick: named(/^BEIDOU/) },
+  'starlink': { approx: false, pick: named(/^STARLINK/) },
+  'oneweb': { approx: false, pick: named(/^ONEWEB/) },
+  'planet': { approx: false, pick: named(/^(FLOCK|SKYSAT|PELICAN|TANAGER|DOVE)/) },
+  'spire': { approx: false, pick: named(/^LEMUR/) },
+  'weather': { approx: true, pick: named(/^(NOAA \d|GOES|METEOSAT|MSG|METOP|FENGYUN|FY-|HIMAWARI|DMSP|METEOR|ELEKTRO|INSAT-3D|GEO-KOMPSAT|SUOMI NPP|NPP|JPSS|ARKTIKA-M)/) },
+  'noaa': { approx: false, pick: named(/^NOAA \d/) },
+  'goes': { approx: false, pick: named(/^GOES/) },
+  'resource': { approx: true, pick: named(/^(LANDSAT|SENTINEL|TERRA|AQUA|SPOT|PLEIADES|WORLDVIEW|RESURS|CBERS|ZIYUAN|GAOFEN|KOMPSAT|RADARSAT|CARTOSAT|RESOURCESAT|ALOS|KANOPUS|TERRASAR|TANDEM|COSMO-SKYMED|ICEYE|CAPELLA)/) },
+  'sarsat': { approx: true, pick: named(/^(NOAA \d|METOP|GOES|MSG|METEOSAT|ELEKTRO|LUCH|INSAT-3D)/) },
+  'dmc': { approx: true, pick: named(/^(DMC|UK-DMC|NIGERIASAT|ALSAT|DEIMOS|BEIJING-1|TSINGHUA)/) },
+  'tdrss': { approx: false, pick: named(/^TDRS/) },
+  'geo': { approx: true, pick: (r) => payload(r) && between(r.mm, 0.98, 1.02) && r.ecc < 0.01 },
+  'military': { approx: true, pick: named(/^(USA \d|NROL|COSMOS|YAOGAN|SHIYAN|OFEQ|SKYNET|SICRAL|SYRACUSE|MUOS|WGS|AEHF|MILSTAR|DSP|SBIRS|GSSAP|CSO|HELIOS|SAR-LUPE|SARAH|IGS)/) },
+  'radar': { approx: true, pick: (r) => /^(CALSPHERE|LCS|RADAR CAL|STARSHINE|PAGEOS|TEMPSAT|SURCAL)/.test(r.name) },
+  'cubesat': { approx: true, pick: (r) => payload(r) && r.rcs === 'SMALL' },
+  'science': { approx: true, pick: named(/^(HST|CHANDRA|FERMI|SWIFT|NUSTAR|TESS|XMM|INTEGRAL|GAIA|SPEKTR|ICESAT|GRACE|CRYOSAT|SMAP|OCO|CALIPSO|CLOUDSAT|IXPE|AGILE|ASTROSAT|HXMT|EINSTEIN PROBE|SVOM|NEOWISE|AIM|IRIS|HINODE|PROBA|SDO|THEMIS|MMS|VAN ALLEN|CHEOPS|XRISM|AQUARIUS|SWOT|PACE)/) },
+  // Space-Track has no notion of "active": every payload still in orbit,
+  // working or not.
+  'active': { approx: true, pick: payload },
+};
+
+/** One group from Space-Track, as the same 3LE text CelesTrak would send. */
+async function spaceTrackGroup(group) {
+  const rule = SPACETRACK_GROUPS[group];
+  if (!rule) throw new UpstreamError(404, `no Space-Track selection for group "${group}"`);
+  const rows = await spaceTrackCatalog();
+  const text = rows.filter(rule.pick).map((r) => `${r.name}\n${r.l1}\n${r.l2}`).join('\n');
+  return { text, approximate: rule.approx };
+}
+
+/**
+ * Elements for a group: CelesTrak, or its saved copy, and Space-Track when
+ * CelesTrak cannot answer. A saved CelesTrak copy is preferred while it is
+ * young (it is CelesTrak's exact group); once it is days old, Space-Track's
+ * fresh elements are worth more than CelesTrak's curation.
+ */
+const SAVED_COPY_MAX_MS = 3 * 86400e3;
+async function orbitalElements(group) {
+  let first;
+  try {
+    const r = await fetchTle(group);
+    const old = r.stale && r.savedAt && Date.now() - Date.parse(r.savedAt) > SAVED_COPY_MAX_MS;
+    if (!old || !spaceTrackConfigured()) return { ...r, source: 'celestrak', approximate: false };
+    first = new Error('saved copy is over three days old');
+  } catch (e) {
+    if (!spaceTrackConfigured()) {
+      if (e.status >= 500 || e.status === 403) {
+        e.message += '. Add a free Space-Track.org login (SPACETRACK_USER / SPACETRACK_PASSWORD) in settings as a fallback.';
+      }
+      throw e;
+    }
+    first = e;
+  }
+  try {
+    const st = await spaceTrackGroup(group);
+    return { text: st.text, stale: false, savedAt: new Date().toISOString(), source: 'spacetrack', approximate: st.approximate };
+  } catch (e) {
+    throw new UpstreamError(e.status || 502, `CelesTrak: ${first.message}; Space-Track: ${e.message}`);
+  }
+}
+
 async function satellites({ group, limit }) {
   const g = SAT_GROUPS[group] ? group : 'stations';
   const cap = clamp(parseInt(limit || '300', 10) || 300, 1, 2000);
@@ -1547,8 +1781,8 @@ async function satellites({ group, limit }) {
   // providers/tle, which does something cachedPersistent cannot: when CelesTrak
   // refuses a repeat download it serves the stored elements back and says
   // they are stale. A second disk tier on top would shadow that.
-  const { text, stale, savedAt } = await cached(`sat:${g}`, RETAIN['satellites.elements'],
-    () => fetchTle(g));
+  const { text, stale, savedAt, source, approximate } = await cached(`sat:${g}`, RETAIN['satellites.elements'],
+    () => orbitalElements(g));
 
   if (/^\s*(No GP data found|Invalid query)/i.test(text)) {
     throw new UpstreamError(404, `CelesTrak has no group "${g}"`);
@@ -1584,6 +1818,8 @@ async function satellites({ group, limit }) {
     returned: sats.length,
     stale,
     elementsAt: savedAt,
+    source,
+    approximate,
     satellites: sats,
   };
 }
@@ -2292,6 +2528,11 @@ async function overpass({ bbox, presets, preset, limit }) {
     labels: Object.fromEntries(chosen.map((k) => [k, OVERPASS_PRESETS[k].label])),
     count: shown.length,
     truncated: raw.truncated || shown.length < features.length,
+    // Cut to the draw limit here, as opposed to by Overpass's own cap. The
+    // cache holds the rest, so the browser can ask for it in smaller tiles;
+    // without this the two cases look the same from outside.
+    capped: shown.length < features.length,
+    total: features.length,
     // The ground this answer actually covers, which is the snapped cell and
     // not the box the browser asked for. Telling it lets it record coverage
     // from what was fetched instead of guessing from what it requested — and
@@ -3933,6 +4174,135 @@ async function webcams({ bbox }) {
 }
 
 // ---------------------------------------------------------------------------
+// YOUTUBE — geotagged uploads near the view
+// ---------------------------------------------------------------------------
+//
+// The search mattw.io/youtube-geofind runs: YouTube Data API search.list
+// with a location and radius, newest first, limited to recent uploads, then
+// videos.list for the recording coordinates that search.list leaves out.
+// Only videos their uploaders geotagged come back, and the tag is whatever
+// the uploader typed, so the pin is a claim rather than a measurement.
+
+const YT_API = 'https://www.googleapis.com/youtube/v3';
+// Pages of 50 per search, as geofind defaults to. Each page is 100 quota
+// units; the videos.list lookups behind them are 1 unit per 50.
+const YT_PAGES = 3;
+const YT_ID = /^[\w-]{11}$/;
+
+/** The parts of a videos.list item worth keeping on disk. */
+function slimYoutubeVideo(v) {
+  const sn = v.snippet || {};
+  const loc = v.recordingDetails?.location || {};
+  const th = sn.thumbnails || {};
+  return {
+    id: v.id,
+    title: sn.title || null,
+    channel: sn.channelTitle || null,
+    channelId: sn.channelId || null,
+    published: sn.publishedAt || null,
+    description: sn.description ? clip(String(sn.description), 600) : null,
+    live: sn.liveBroadcastContent || 'none',
+    thumb: (th.medium || th.high || th.default || {}).url || null,
+    lat: Number(loc.latitude), lon: Number(loc.longitude),
+    place: v.recordingDetails?.locationDescription || null,
+    recorded: v.recordingDetails?.recordingDate || null,
+    duration: v.contentDetails?.duration || null,
+    views: v.statistics?.viewCount != null ? Number(v.statistics.viewCount) : null,
+    likes: v.statistics?.likeCount != null ? Number(v.statistics.likeCount) : null,
+    comments: v.statistics?.commentCount != null ? Number(v.statistics.commentCount) : null,
+  };
+}
+
+async function youtubeVideos({ bbox }) {
+  const raw_b = parseBbox(bbox);
+  if (!raw_b) throw new UpstreamError(400, 'bbox required as south,west,north,east');
+  const windowMs = RETAIN['youtube.window'];
+  const base = { configured: !!CFG.youtubeKey, window: RETAIN_TEXT['youtube.window'] };
+  if (!CFG.youtubeKey) return { ...base, count: 0, videos: [] };
+
+  const b = viewCell(raw_b, 'youtube');
+  // The window is part of the question, so a changed window is a new search
+  // rather than a week of answers to the old one.
+  const key = `yt:v1:${windowMs}:${b.key}`;
+  const raw = await cachedPersistent(key, RETAIN['youtube.videos'], async () => {
+    const c = bboxCenter(b);
+    // Half the diagonal, so the circle covers the corners of the cell box.
+    const dLat = (b.north - b.south) / 2 * 111.32;
+    const dLon = (b.east - b.west) / 2 * 111.32 * Math.cos(c.lat * Math.PI / 180);
+    const radiusKm = Math.min(1000, Math.max(1, Math.ceil(Math.hypot(dLat, dLon))));
+    const after = new Date(Date.now() - windowMs).toISOString().replace(/\.\d{3}Z$/, 'Z');
+    // The key travels as a header, so it is never part of a URL that could
+    // end up in a log or an error message.
+    const headers = { 'X-Goog-Api-Key': CFG.youtubeKey, Accept: 'application/json' };
+
+    const ids = [];
+    let pageToken = '';
+    for (let i = 0; i < YT_PAGES; i++) {
+      const url = new URL(`${YT_API}/search`);
+      url.searchParams.set('part', 'id');
+      url.searchParams.set('type', 'video');
+      url.searchParams.set('location', `${c.lat.toFixed(5)},${c.lon.toFixed(5)}`);
+      url.searchParams.set('locationRadius', `${radiusKm}km`);
+      url.searchParams.set('publishedAfter', after);
+      url.searchParams.set('order', 'date');
+      url.searchParams.set('maxResults', '50');
+      if (pageToken) url.searchParams.set('pageToken', pageToken);
+      const page = await grab(url, { headers }, { label: 'YouTube search' });
+      for (const it of page.items || []) {
+        const id = it.id?.videoId;
+        if (YT_ID.test(id || '') && !ids.includes(id)) ids.push(id);
+      }
+      pageToken = page.nextPageToken;
+      if (!pageToken) break;
+    }
+
+    const items = [];
+    for (let i = 0; i < ids.length; i += 50) {
+      const url = new URL(`${YT_API}/videos`);
+      url.searchParams.set('part', 'snippet,recordingDetails,statistics,contentDetails');
+      url.searchParams.set('id', ids.slice(i, i + 50).join(','));
+      url.searchParams.set('maxResults', '50');
+      const page = await grab(url, { headers }, { label: 'YouTube videos' });
+      items.push(...(page.items || []).map(slimYoutubeVideo));
+    }
+    return { fetchedAt: new Date().toISOString(), after, radiusKm, found: ids.length, items };
+  });
+
+  const videos = (raw.items || [])
+    .filter((v) => YT_ID.test(v.id || '') && Number.isFinite(v.lat) && Number.isFinite(v.lon))
+    .map((v) => ({
+      source: 'youtube',
+      id: `yt:${v.id}`,
+      videoId: v.id,
+      title: v.title,
+      channel: v.channel,
+      published: v.published,
+      recorded: v.recorded,
+      description: v.description,
+      live: v.live,
+      duration: v.duration,
+      views: v.views, likes: v.likes, comments: v.comments,
+      lat: v.lat, lon: v.lon,
+      place: v.place,
+      thumb: safeUrl(v.thumb, { httpsOnly: true }),
+      link: `https://www.youtube.com/watch?v=${v.id}`,
+      channelLink: /^[\w-]+$/.test(v.channelId || '') ? `https://www.youtube.com/channel/${v.channelId}` : null,
+      // youtube-nocookie: the player sets no tracking cookies until it is played.
+      embed: `https://www.youtube-nocookie.com/embed/${v.id}`,
+    }));
+
+  return {
+    ...base,
+    count: videos.length,
+    found: raw.found ?? videos.length,
+    after: raw.after,
+    fetchedAt: raw.fetchedAt,
+    radiusKm: raw.radiusKm,
+    videos,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // SITUATIONAL AWARENESS — live hazard and disaster events
 //
 // Five independent feeds normalised into one record shape. Each is fetched
@@ -4811,6 +5181,189 @@ async function geeComposite({ bbox, from, to, maxCloud }) {
 }
 
 /** What the client may offer in the base-map menu. */
+// ---------------------------------------------------------------------------
+// ESRI WORLD IMAGERY WAYBACK — every release of Esri's aerial mosaic
+// ---------------------------------------------------------------------------
+//
+// Esri publishes each version of World Imagery since 2014 as its own tile
+// set, listed in one config file. Most releases change nothing over a given
+// place, so offering all of them would be a list of identical pictures. The
+// tilemap endpoint answers "which release last changed this tile", which
+// walks back through only the versions that differ here: the same method
+// Esri's own Wayback app uses (github.com/Esri/wayback-core).
+//
+// A release date is when Esri published the mosaic, not when the picture was
+// taken, and the gap can be years. The metadata layers say when, by whom and
+// at what resolution the imagery under a point was captured, so each version
+// carries that for the centre of the view.
+
+const WAYBACK_CONFIG = 'https://s3-us-west-2.amazonaws.com/config.maptiles.arcgis.com/waybackconfig.json';
+const WAYBACK_HOST = 'wayback.maptiles.arcgis.com';
+const WAYBACK_METADATA_HOST = 'metadata.maptiles.arcgis.com';
+const WAYBACK_MAPSERVER = `https://${WAYBACK_HOST}/arcgis/rest/services/World_Imagery/MapServer`;
+const WAYBACK_TILE_PREFIX = '/arcgis/rest/services/World_Imagery/WMTS/1.0.0/default028mm/MapServer/tile/';
+const WAYBACK_ATTRIBUTION = 'Esri World Imagery Wayback: Esri, Maxar, Earthstar Geographics, and the GIS User Community';
+// A walk back through releases is one request per distinct version. Over a
+// busy city that is a few dozen; the cap only stops a malformed answer from
+// walking forever.
+const WAYBACK_MAX_STEPS = 80;
+
+/** A release's tile URL as Cesium wants it, or null if it is not Esri's. */
+function waybackTemplate(itemURL) {
+  if (typeof itemURL !== 'string' || !/\{level\}.*\{row\}.*\{col\}/.test(itemURL)) return null;
+  let u;
+  try { u = new URL(itemURL.replace(/\{(level|row|col)\}/g, '0')); } catch { return null; }
+  if (u.protocol !== 'https:' || u.host !== WAYBACK_HOST || !u.pathname.startsWith(WAYBACK_TILE_PREFIX)) return null;
+  if (u.search || u.hash || u.username || u.password) return null;
+  return itemURL.replace('{level}', '{z}').replace('{row}', '{y}').replace('{col}', '{x}');
+}
+
+/** Every published release, newest first. Esri adds one every few weeks. */
+async function waybackReleases() {
+  return cachedPersistent('wayback:releases:v1', RETAIN['maps.scenes'], async () => {
+    const raw = await grab(WAYBACK_CONFIG, {}, { label: 'Esri Wayback' });
+    const out = [];
+    for (const [k, v] of Object.entries(raw && typeof raw === 'object' ? raw : {})) {
+      const release = Number(k);
+      if (!Number.isInteger(release) || !v || typeof v !== 'object') continue;
+      const date = /\d{4}-\d{2}-\d{2}/.exec(String(v.itemTitle || ''))?.[0];
+      const url = waybackTemplate(v.itemURL);
+      if (!date || !url) continue;
+      let metadataUrl = null;
+      try {
+        const m = new URL(String(v.metadataLayerUrl || ''));
+        if (m.protocol === 'https:' && m.host === WAYBACK_METADATA_HOST && !m.search) {
+          metadataUrl = m.href.replace(/\/+$/, '');
+        }
+      } catch { /* no metadata for this release */ }
+      out.push({ release, date, url, metadataUrl });
+    }
+    out.sort((a, b) => b.date.localeCompare(a.date) || b.release - a.release);
+    return out;
+  });
+}
+
+const lon2tile = (lon, z) => Math.floor(((lon + 180) / 360) * 2 ** z);
+const lat2tile = (lat, z) => {
+  const r = lat * Math.PI / 180;
+  return Math.floor(((1 - Math.log(Math.tan(r) + 1 / Math.cos(r)) / Math.PI) / 2) * 2 ** z);
+};
+const tile2lon = (x, z) => (x / 2 ** z) * 360 - 180;
+const tile2lat = (y, z) => {
+  const n = Math.PI - (2 * Math.PI * y) / 2 ** z;
+  return (180 / Math.PI) * Math.atan(0.5 * (Math.exp(n) - Math.exp(-n)));
+};
+
+/**
+ * The map zoom a view is seen at, roughly: a 1000-pixel-wide screen of
+ * 256-pixel tiles. Clamped to where the metadata layers answer (10 and up)
+ * and where change detection still means a neighbourhood rather than a roof.
+ */
+function waybackZoom(b) {
+  const span = Math.max(1e-6, b.east - b.west);
+  return clamp(Math.round(Math.log2(360 / span) + 2), 10, 18);
+}
+
+/** The releases that changed one tile, newest first, duplicates dropped. */
+async function waybackLocalChanges(releases, z, row, col) {
+  const index = new Map(releases.map((r, i) => [r.release, i]));
+  const found = [];
+  const seen = new Set();
+  let rel = releases[0]?.release;
+  for (let step = 0; rel != null && step < WAYBACK_MAX_STEPS; step++) {
+    const tm = await grab(`${WAYBACK_MAPSERVER}/tilemap/${rel}/${z}/${row}/${col}`, {},
+      { label: 'Esri Wayback', timeoutMs: 15000 });
+    if (!tm?.data?.[0]) break;
+    const sel = Number(tm.select?.[0]) || rel;
+    if (seen.has(sel) || !index.has(sel)) break;
+    seen.add(sel);
+    found.push({ release: sel, size: Number(tm.size?.[0]) || 0 });
+    rel = releases[index.get(sel) + 1]?.release;
+  }
+  // Re-published but unchanged imagery comes back as a run of releases with
+  // tiles of identical size. Keep the oldest of a run: it is the one that
+  // introduced the picture. (Esri's library offers this size-only shortcut;
+  // comparing tile bytes as well would double the requests for little gain.)
+  return found.filter((f, i) => !(found[i + 1] && f.size && found[i + 1].size === f.size));
+}
+
+/** When, by whom and how sharp the imagery of one release is at a point. */
+async function waybackCapture(r, lat, lon, z) {
+  if (!r.metadataUrl) return null;
+  // Sub-layer 0 describes zoom 23 and 13 describes zoom 10.
+  const layer = clamp(23 - z, 0, 13);
+  const url = new URL(`${r.metadataUrl}/${layer}/query`);
+  url.searchParams.set('f', 'json');
+  url.searchParams.set('where', '1=1');
+  url.searchParams.set('outFields', 'SRC_DATE2,NICE_DESC,SRC_DESC,SAMP_RES,SRC_ACC');
+  url.searchParams.set('geometry', JSON.stringify({ spatialReference: { wkid: 4326 }, x: lon, y: lat }));
+  url.searchParams.set('geometryType', 'esriGeometryPoint');
+  url.searchParams.set('spatialRel', 'esriSpatialRelIntersects');
+  url.searchParams.set('returnGeometry', 'false');
+  let d;
+  try { d = await grab(url, {}, { label: 'Esri Wayback metadata', timeoutMs: 15000 }); } catch { return null; }
+  const a = d?.features?.[0]?.attributes;
+  if (!a) return null;
+  const t = typeof a.SRC_DATE2 === 'number' ? a.SRC_DATE2 : Date.parse(a.SRC_DATE2);
+  const num = (v) => (v != null && v !== '' && Number.isFinite(Number(v)) ? Number(v) : null);
+  return {
+    captured: Number.isFinite(t) ? new Date(t).toISOString().slice(0, 10) : null,
+    provider: typeof a.NICE_DESC === 'string' ? a.NICE_DESC : null,
+    source: typeof a.SRC_DESC === 'string' ? a.SRC_DESC : null,
+    resolutionM: num(a.SAMP_RES),
+    accuracyM: num(a.SRC_ACC),
+  };
+}
+
+async function waybackScenes({ bbox }) {
+  const box = parseBbox(bbox);
+  if (!box) throw new UpstreamError(400, 'a bbox is required to find imagery');
+  const releases = await waybackReleases();
+  if (!releases.length) throw new UpstreamError(502, 'Esri Wayback listed no usable releases');
+
+  // The tile under the view centre is the fixed grid cell this is cached by:
+  // the same ground at the same zoom always names the same key. The newest
+  // release is in the key so a new Esri release is looked at, not waited out.
+  const z = waybackZoom(box);
+  const c = bboxCenter(box);
+  const col = lon2tile(c.lon, z);
+  const row = lat2tile(clamp(c.lat, -85, 85), z);
+  const key = `wayback:changes:v1:${releases[0].release}:${z}/${row}/${col}`;
+
+  const raw = await cachedPersistent(key, RETAIN['maps.scenes'], async () => {
+    const byRelease = new Map(releases.map((r) => [r.release, r]));
+    const changes = await waybackLocalChanges(releases, z, row, col);
+    // Nothing recorded for this tile (open ocean, mostly): the current
+    // mosaic is still a picture, so offer that.
+    const picked = (changes.length ? changes.map((ch) => byRelease.get(ch.release)) : [releases[0]])
+      .filter(Boolean);
+    const lat = tile2lat(row + 0.5, z);
+    const lon = tile2lon(col + 0.5, z);
+    const scenes = [];
+    for (let i = 0; i < picked.length; i += 4) {
+      const metas = await Promise.all(picked.slice(i, i + 4).map((r) => waybackCapture(r, lat, lon, z)));
+      metas.forEach((m, j) => {
+        const r = picked[i + j];
+        scenes.push({ id: String(r.release), release: r.release, date: r.date, url: r.url, ...(m || {}) });
+      });
+    }
+    return { at: { lat, lon, zoom: z }, total: releases.length, changed: changes.length, scenes };
+  });
+
+  return {
+    provider: 'wayback',
+    label: 'Esri World Imagery Wayback',
+    attribution: WAYBACK_ATTRIBUTION,
+    // World Imagery is sub-metre to z19 almost everywhere; deeper levels
+    // exist only in patches and come back as "no data" tiles elsewhere.
+    maxLevel: 19,
+    at: raw.at,
+    releases: raw.total,
+    changed: raw.changed,
+    scenes: raw.scenes,
+  };
+}
+
 function basemapProviders() {
   return [
     { key: 'osm', label: 'Streets (OpenStreetMap)', kind: 'static', available: true,
@@ -4823,6 +5376,9 @@ function basemapProviders() {
         ? 'High resolution, but capture dates vary by years between regions. '
           + 'Use Sentinel-2 when you need to know how recent the picture is.'
         : 'Needs CESIUM_ION_TOKEN in .env.' },
+    { key: 'wayback', label: 'Aerial history (Esri Wayback)', kind: 'scenes', available: true,
+      note: 'Esri World Imagery and its past releases since 2014, sub-metre in most places. '
+        + 'Only the versions that changed over the view are listed, each with its capture date. No key.' },
     { key: 'shortbread', label: 'Vector (OSM Shortbread)', kind: 'vector', available: true,
       note: 'OpenStreetMap vector tiles drawn in the terminal palette. Rendered in '
         + 'the browser from the Shortbread schema via VersaTiles; no key, to zoom 14.' },
@@ -4840,6 +5396,7 @@ async function basemap({ provider, bbox, from, to, maxCloud, limit }) {
   const p = provider || 'sentinel2';
   if (p === 'sentinel2') return sentinelScenes({ bbox, from, to, maxCloud, limit });
   if (p === 'gee') return geeComposite({ bbox, from, to, maxCloud });
+  if (p === 'wayback') return waybackScenes({ bbox });
   if (p === 'osm') {
     return {
       provider: 'osm', label: 'Streets (OpenStreetMap)',
@@ -4893,6 +5450,7 @@ async function basemap({ provider, bbox, from, to, maxCloud, limit }) {
 /** Drop cached tokens and live connections that were made with an old credential. */
 const CREDENTIAL_RESETS = {
   opensky: () => { openSkyToken = { value: null, expires: 0 }; },
+  spacetrack: () => { spaceTrackCookie = null; },
   gee: () => { geeToken = { value: null, expires: 0 }; },
   ais: () => {
     clearTimeout(ais.reconnectTimer);
@@ -4918,6 +5476,13 @@ const CREDENTIALS = [
   { name: 'OPENSKY_CLIENT_SECRET', group: 'Aircraft', label: 'OpenSky client secret',
     set: (v) => { CFG.openSkySecret = v; }, reset: 'opensky' },
 
+  { name: 'SPACETRACK_USER', group: 'Satellites', label: 'Space-Track login (email)', secret: false,
+    url: 'https://www.space-track.org/auth/createAccount',
+    note: 'Optional, free. Used when CelesTrak is unreachable or has blocked this address.',
+    set: (v) => { CFG.spaceTrackUser = v; }, reset: 'spacetrack' },
+  { name: 'SPACETRACK_PASSWORD', group: 'Satellites', label: 'Space-Track password',
+    set: (v) => { CFG.spaceTrackPassword = v; }, reset: 'spacetrack' },
+
   { name: 'AISSTREAM_API_KEY', group: 'Vessels', label: 'AISStream key', url: 'https://aisstream.io/',
     note: 'Live AIS ship positions.', set: (v) => { CFG.aisKey = v; }, reset: 'ais' },
 
@@ -4925,6 +5490,11 @@ const CREDENTIALS = [
     note: 'Worldwide public webcams.', set: (v) => { CFG.windyKey = v; } },
   { name: 'OPENWEBCAMDB_API_KEY', group: 'Webcams', label: 'OpenWebcamDB key', url: 'https://openwebcamdb.com/api',
     set: (v) => { CFG.owcdbKey = v; } },
+
+  { name: 'YOUTUBE_API_KEY', group: 'Video', label: 'YouTube Data API key',
+    url: 'https://console.cloud.google.com/apis/library/youtube.googleapis.com',
+    note: 'Geotagged YouTube uploads near the view. Free quota: 10,000 units/day.',
+    set: (v) => { CFG.youtubeKey = v; } },
 
   { name: 'FIRMS_MAP_KEY', group: 'Hazards', label: 'NASA FIRMS map key',
     url: 'https://firms.modaps.eosdis.nasa.gov/api/map_key/',
@@ -5234,12 +5804,15 @@ const ROUTES = {
       shodan: CFG.shodanKey ? 'configured' : 'missing SHODAN_API_KEY',
       opensky: CFG.openSkyId ? 'authenticated' : 'anonymous (400 credits/day)',
       celestrak: 'open',
+      spacetrack: spaceTrackConfigured() ? 'configured (fallback for CelesTrak)' : 'not configured (optional fallback)',
       sentinel2: 'open (AWS Open Data)',
+      wayback: 'open (Esri World Imagery Wayback)',
       earthengine: geeConfigured() ? 'configured' : 'not configured (optional)',
       overpass: 'open',
       windy: CFG.windyKey ? 'configured' : 'missing WINDY_API_KEY (other cam sources still work)',
       openwebcamdb: CFG.owcdbKey ? 'configured' : 'missing OPENWEBCAMDB_API_KEY',
       alertcalifornia: 'open (wildfire PTZ cameras)',
+      youtube: CFG.youtubeKey ? 'configured' : 'missing YOUTUBE_API_KEY',
       cesiumIon: CFG.cesiumIonToken ? 'configured' : 'not set (OSM basemap only)',
       gdacs: 'open', eonet: 'open', usgs: 'open', nws: 'open',
       alpr: 'open (OpenStreetMap via Overpass)',
@@ -5301,6 +5874,7 @@ const ROUTES = {
       alpr: RETAIN['overpass.alpr'],
       netinfra: RETAIN['network.infrastructure'],
       webcams: RETAIN['cameras.directories'],
+      youtube: RETAIN['youtube.videos'],
       events: RETAIN['current.events'],
       iot: RETAIN['current.sensors'],
       traffic: RETAIN['current.traffic'],
@@ -5320,6 +5894,7 @@ const ROUTES = {
     limit: q.get('limit'),
   }),
   '/api/webcams': (q) => webcams({ bbox: q.get('bbox') }),
+  '/api/youtube': (q) => youtubeVideos({ bbox: q.get('bbox') }),
   '/api/events': (q) => events({
     bbox: q.get('bbox'), sources: q.get('sources'), minSeverity: q.get('minSeverity'),
   }),
@@ -5395,6 +5970,10 @@ const TILE_SOURCES = [
   // The location inset's aerial style.
   { label: 'Esri imagery', hosts: ['server.arcgisonline.com'],
     path: (p) => p.startsWith('/ArcGIS/rest/services/World_Imagery/MapServer/tile/') },
+  // Esri Wayback releases. Each release's tiles never change once
+  // published, which makes them the best possible thing to keep on disk.
+  { label: 'Esri Wayback', hosts: [WAYBACK_HOST],
+    path: (p) => p.startsWith(WAYBACK_TILE_PREFIX) && /^\d{1,6}\/\d{1,2}\/\d{1,7}\/\d{1,7}$/.test(p.slice(WAYBACK_TILE_PREFIX.length)) },
   { label: 'NASA GIBS', hosts: ['gibs.earthdata.nasa.gov'], path: (p) => p.startsWith('/wmts/') },
   ...templateSource(SHORTBREAD_URL, 'Shortbread'),
   ...templateSource(`${TITILER}/cog/tiles/{z}`, 'TiTiler'),
@@ -5480,7 +6059,7 @@ async function cachedTile(key, fetcher) {
     try {
       res = await fetcher();
     } catch (err) {
-      throw err instanceof UpstreamError ? err : new UpstreamError(504, `tile source unreachable: ${err.message}`);
+      throw err instanceof UpstreamError ? err : new UpstreamError(504, `tile source unreachable: ${networkReason(err)}`);
     }
     if (res.status === 204 || res.status === 404) {
       const rec = { status: res.status, type: 'text/plain', body: Buffer.alloc(0) };
@@ -5952,6 +6531,7 @@ ${ACCESS_KEY ? `  ${C.yel}!${C.rst} Listening on ${CFG.host}, beyond this machin
   Shodan .............. ${ok(!!CFG.shodanKey)}
   OpenSky ............. ${CFG.openSkyId ? `${C.grn}authenticated${C.rst}` : `${C.yel}anonymous${C.rst} (400 credits/day)`}
   CelesTrak ........... ${C.grn}open${C.rst}
+  Space-Track ......... ${spaceTrackConfigured() ? `${C.grn}fallback ready${C.rst}` : `${C.dim}not configured (optional)${C.rst}`}
   Overpass / OSM ...... ${C.grn}open${C.rst}
   ALPR / Flock ........ ${C.grn}open${C.rst} (DeFlock data via OSM)
   Flight routes ....... ${C.grn}open${C.rst} (adsbdb)
@@ -5965,6 +6545,7 @@ ${ACCESS_KEY ? `  ${C.yel}!${C.rst} Listening on ${CFG.host}, beyond this machin
   Windy webcams ....... ${ok(!!CFG.windyKey)}
   OpenWebcamDB ........ ${ok(!!CFG.owcdbKey)}
   ALERTCalifornia ..... ${C.grn}open${C.rst} (wildfire cams)
+  YouTube geotags ..... ${ok(!!CFG.youtubeKey)}
   Cesium Ion .......... ${CFG.cesiumIonToken ? `${C.grn}terrain + buildings${C.rst}` : `${C.yel}OSM basemap only${C.rst}`}
 `);
 
@@ -6012,6 +6593,7 @@ module.exports = {
   boxContains, shodanIndex, findBoughtShodanBox, rememberShodanBox, serviceCategory, SHODAN_PRESETS, SHODAN_CELL_DEG,
   openSky, openSkyPollSec, openSkyRefillSec, noteOpenSkyHeaders, assertOpenSkyCredit, OPENSKY_FLOOR,
   SAT_GROUPS, fetchTle, readCachedTle, writeCachedTle, tleCachePath,
+  orbitalElements, SPACETRACK_GROUPS, celestrakHold, CREDENTIAL_RESETS,
   overpassGate, overpassQuery, mirrorFailure, OVERPASS_PRESETS, OVERPASS_ENDPOINTS,
   parseOverpassStatus, overpassDense,
   ais, aisIngest, aisConnect, aisBoxesFor, boxMovedEnough, shipTypeName,
