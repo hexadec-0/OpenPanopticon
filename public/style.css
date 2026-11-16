@@ -1032,5 +1032,14 @@ body.resizing-detail #detail { transition: none; }
 
 /* Street View: a load button and a link; the panorama fills the stage. */
 #detail .street-view { margin-top: 14px; }
-#detail .street-view .sv-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 6px 0; }
+#detail .street-view .sv-row { display: flex; gap: 10px; align-items: stretch; margin: 6px 0; }
+/* The load button and the Maps link share one size: equal halves of the row,
+   the same height, padding and type, text centred. */
+#detail .street-view .sv-row > .hm-btn,
+#detail .street-view .sv-row > .ext {
+  flex: 1 1 0; min-width: 0; box-sizing: border-box; margin: 0;
+  display: flex; align-items: center; justify-content: center; text-align: center;
+  min-height: 32px; padding: 7px 12px; font: 400 11px var(--mono); letter-spacing: .06em;
+  white-space: normal;
+}
 #detail .street-view .cam-frame { min-height: 260px; }
