@@ -586,29 +586,34 @@ describe('YoutubeLayer', () => {
 });
 
 describe('nearby photos in the detail panel', () => {
-  test('shows date, distance, author and licence, and links to the Commons page', () => {
-    const html = L.nearbyPhotosHtml({ withinM: 250, searchedM: 10000, photos: [
-      { title: 'Market', photo: 'https://upload.wikimedia.org/t.jpg', page: 'https://commons.wikimedia.org/wiki/File:M.jpg',
-        date: '2024-05-04', dateKind: 'taken', distanceM: 42, credit: 'T. Tester', license: 'CC BY 4.0', licenseUrl: 'https://creativecommons.org/licenses/by/4.0' },
-      { title: 'Up', photo: 'https://upload.wikimedia.org/u.jpg', date: '2023-03-03', dateKind: 'uploaded', distanceM: 1500, credit: 'U' },
+  const sources = { wikimedia: { status: 'ok' }, flickr: { status: 'ok' }, mapillary: { status: 'not configured' } };
+  test('shows distance, date, author, licence and source, and links to the photo page', () => {
+    const html = L.nearbyPhotosHtml({ withinM: 1000, sources, photos: [
+      { source: 'flickr', title: 'Market', photo: 'https://live.staticflickr.com/t.jpg', page: 'https://www.flickr.com/photos/1@N00/1/',
+        date: '2026-05-04', dateKind: 'taken', distanceM: 42, credit: 'F. Lickr', license: 'CC BY 4.0', licenseUrl: 'https://creativecommons.org/licenses/by/4.0/' },
+      { source: 'wikimedia', title: 'Up', photo: 'https://upload.wikimedia.org/u.jpg', date: '2026-03-03', dateKind: 'uploaded', distanceM: 1000, credit: 'U' },
     ] });
-    assert.match(html, /2024-05-04 · 42 m away/);
-    assert.match(html, /uploaded 2023-03-03 · 1\.5 km away/);
-    assert.match(html, /href="https:\/\/commons\.wikimedia\.org\/wiki\/File:M\.jpg"/);
-    assert.match(html, /CC BY 4\.0<\/a>/);
-    assert.match(html, /2 newest photos from the past year within 250 m/);
+    assert.match(html, /42 m away · 2026-05-04/);
+    assert.match(html, /1\.0 km away · uploaded 2026-03-03/);
+    assert.match(html, /CC BY 4\.0<\/a> · Flickr/);
+    assert.match(html, /U · Wikimedia Commons/);
+    assert.match(html, /href="https:\/\/www\.flickr\.com\/photos\/1@N00\/1\/"/);
+    assert.match(html, /2 closest photos from the past year within 1\.0 km,\s+from Wikimedia Commons, Flickr\./);
+    assert.match(html, /Add MAPILLARY_TOKEN in settings/);
   });
 
-  test('hostile text and URLs come out inert; nothing found says so', () => {
-    const html = L.nearbyPhotosHtml({ withinM: 250, photos: [
-      { title: XSS, photo: 'https://upload.wikimedia.org/t.jpg', page: 'javascript:alert(1)', credit: XSS, license: XSS, licenseUrl: 'javascript:alert(1)', date: XSS, distanceM: 1 },
+  test('hostile text and URLs come out inert; nothing found says so; source errors are shown', () => {
+    const html = L.nearbyPhotosHtml({ withinM: 1000, sources: { wikimedia: { status: 'error', error: XSS } }, photos: [
+      { source: XSS, title: XSS, photo: 'https://upload.wikimedia.org/t.jpg', page: 'javascript:alert(1)', credit: XSS, license: XSS, licenseUrl: 'javascript:alert(1)', date: XSS, distanceM: 1 },
       { title: 'http thumb', photo: 'http://insecure.example/t.jpg', distanceM: 1 },
       { title: 'js thumb', photo: 'javascript:alert(1)', distanceM: 1 },
     ] });
     assertInert(html);
     assert.ok(!html.includes('insecure.example'));
     assert.equal((html.match(/<figure/g) || []).length, 1);
-    assert.match(L.nearbyPhotosHtml({ photos: [], searchedM: 10000 }), /No geotagged photos from the past year on Wikimedia Commons within 10 km/);
+    const none = L.nearbyPhotosHtml({ photos: [], searchedM: 1000, sources: { wikimedia: { status: 'ok' }, flickr: { status: 'not configured' }, mapillary: { status: 'not configured' } } });
+    assert.match(none, /No geotagged photos from the past year within 1\.0 km on Wikimedia Commons\. Older ones are not shown\./);
+    assert.match(none, /Add FLICKR_API_KEY or MAPILLARY_TOKEN in settings/);
   });
 });
 

@@ -540,13 +540,17 @@ satellites) gets two extra sections at the foot of its detail panel:
   where you are looking. The Embed key is the second key handed to the
   browser by design (it is part of the iframe address): restrict it to the
   Maps Embed API and to the address you open the app at.
-- **Nearby photos**: up to four geotagged photos from Wikimedia Commons,
-  no key needed. Only photos from the past year are shown (by the day taken
-  where the file says, otherwise the upload day); with none, the section
-  says so instead of showing old ones. The search widens through 250 m, 1 km, 5 km and 10 km and
-  stops at the first ring holding four photos, then shows the four most
-  recently taken there, each with its date, distance, author and licence.
-  Lookups are kept for `[places] photos` (7 days) in `cache.conf`.
+- **Nearby photos**: the four closest geotagged photos within 1 km, from
+  Wikimedia Commons (always, no key), Flickr (`FLICKR_API_KEY`) and
+  Mapillary street-level imagery (`MAPILLARY_TOKEN`). Closest wins whatever
+  the source or age, so an older photo of the spot beats a newer one down
+  the road; only Mapillary keeps one frame per drive-past, so a sequence
+  does not fill the grid. Only photos from the past year are shown (by the
+  day taken where the source says, otherwise the upload day), and only
+  openly licensed ones from Flickr; with none, the section says so. Each
+  photo carries its source, date, distance, author and licence. Lookups
+  are kept for `[places] photos` (7 days) in `cache.conf`, except
+  Mapillary's, kept an hour because its image links expire.
 
 ---
 

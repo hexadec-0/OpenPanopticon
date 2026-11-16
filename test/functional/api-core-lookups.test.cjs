@@ -208,35 +208,113 @@ describe('/api/nearby-photos', () => {
   const P = { lat: '35.00010', lon: '-100.00010' };
   const ago = (n) => new Date(Date.now() - n * 86400e3).toISOString().slice(0, 10);
 
-  test('the four newest photos of the nearest ring that holds four, none older than a year', async () => {
+  test('the four closest across Wikimedia, Flickr and Mapillary, closest first', async () => {
     const d = (await s.api('/api/nearby-photos', P)).json();
-    assert.equal(d.withinM, 250);
+    assert.deepEqual(d.photos.map((p) => `${p.source}:${p.title}`), [
+      'flickr:Near frame', 'mapillary:Street-level photo', 'mapillary:Street-level photo', 'wikimedia:Market',
+    ]);
+    const dist = d.photos.map((p) => p.distanceM);
+    assert.deepEqual(dist, [...dist].sort((x, y) => x - y), 'ordered by distance');
+    assert.ok(dist.every((m) => m <= 1000));
+    assert.deepEqual(d.sources, {
+      wikimedia: { status: 'ok', count: 1 }, flickr: { status: 'ok', count: 1 }, mapillary: { status: 'ok', count: 2 },
+    });
+    assert.equal(d.withinM, 1000);
     assert.equal(d.maxAgeDays, 365);
-    assert.deepEqual(d.photos.map((p) => p.title), ['Market', 'Undated upload', 'Street', 'Tower']);
-    const m = d.photos[0];
-    assert.equal(m.date, ago(20));
-    assert.equal(m.dateKind, 'taken');
-    assert.match(m.photo, /^https:\/\/upload\.wikimedia\.org\/.*640px-Market\.jpg$/);
-    assert.equal(m.page, 'https://commons.wikimedia.org/wiki/File:Market.jpg');
-    assert.equal(m.credit, 'T. Tester');
-    assert.equal(m.license, 'CC BY 4.0');
-    assert.ok(m.distanceM > 0 && m.distanceM < 250);
-    assert.equal(d.photos[1].dateKind, 'uploaded');
-    assert.equal(d.photos[1].date, ago(40));
   });
 
-  test('left out: taken long ago though uploaded last month, 400 days old, a PDF, an http thumbnail, newer but 3 km off', async () => {
+  test('a close older photo beats a newer one further off', async () => {
     const d = (await s.api('/api/nearby-photos', P)).json();
-    assert.ok(!d.photos.some((p) => /Old square|Stale|Scan|Insecure|Far/.test(p.title)));
+    const [first, second] = d.photos;
+    assert.equal(first.date, ago(300));
+    assert.ok(second.date > first.date && second.distanceM > first.distanceM);
   });
 
-  test('fewer than four recent photos: those are shown, and never topped up with old ones', async () => {
-    const two = (await s.api('/api/nearby-photos', { lat: '55.00010', lon: '10.00010' })).json();
-    assert.deepEqual(two.photos.map((p) => p.title), ['Far', 'Near']);
-    assert.equal(two.withinM, 10000);
-    const none = (await s.api('/api/nearby-photos', { lat: '65.00010', lon: '10.00010' })).json();
-    assert.equal(none.count, 0);
-    assert.deepEqual(none.photos, []);
+  test('one frame per Mapillary drive-past, with its credit and CC BY-SA licence', async () => {
+    const d = (await s.api('/api/nearby-photos', P)).json();
+    const m = d.photos.filter((p) => p.source === 'mapillary');
+    assert.deepEqual(m.map((p) => p.page), ['https://www.mapillary.com/app/?pKey=201', 'https://www.mapillary.com/app/?pKey=204']);
+    assert.equal(m[0].credit, 'streetwalker on Mapillary');
+    assert.equal(m[0].license, 'CC BY-SA 4.0');
+    assert.equal(m[0].sequence, undefined, 'the sequence id is internal');
+    const call = s.mock.callsTo('graph.mapillary.com')[0];
+    assert.equal(call.headers.authorization, `OAuth ${TEST_KEYS.MAPILLARY_TOKEN}`);
+    const q = new URL(call.url).searchParams;
+    assert.equal(q.get('access_token'), null, 'the token is not in the URL');
+    const [w, so, e, n] = q.get('bbox').split(',').map(Number);
+    assert.ok((e - w) * (n - so) < 0.01, 'inside Mapillary\'s box limit');
+    assert.match(q.get('start_captured_at'), /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
+  });
+
+  test('Flickr: open licences only, taken date wins over upload date, page and credit built safely', async () => {
+    const d = (await s.api('/api/nearby-photos', P)).json();
+    const f = d.photos.find((p) => p.source === 'flickr');
+    assert.equal(f.page, 'https://www.flickr.com/photos/12345@N00/101/');
+    assert.equal(f.credit, 'F. Lickr');
+    assert.equal(f.license, 'CC BY 4.0');
+    assert.equal(f.licenseUrl, 'https://creativecommons.org/licenses/by/4.0/');
+    assert.equal(f.dateKind, 'taken');
+    assert.ok(!d.photos.some((p) => /Taken long ago|No location|Bad owner/.test(p.title)));
+    const search = s.mock.callsTo('flickr.photos.search')[0];
+    const q = new URL(search.url).searchParams;
+    assert.equal(q.get('license'), '4,11', 'all-rights-reserved is never asked for');
+    assert.equal(q.get('radius'), '1.2');
+    assert.equal(q.get('safe_search'), '1');
+    assert.ok(Number(q.get('min_upload_date')) > 0);
+  });
+
+  test('Wikimedia: past-year rule and file filters still apply', async () => {
+    const d = (await s.api('/api/nearby-photos', P)).json();
+    const w = d.photos.find((p) => p.source === 'wikimedia');
+    assert.equal(w.title, 'Market');
+    assert.equal(w.date, ago(20));
+    assert.equal(w.dateKind, 'taken');
+    assert.equal(w.credit, 'T. Tester');
+    const q = new URL(s.mock.callsTo('generator=geosearch')[0].url).searchParams;
+    assert.equal(q.get('ggsradius'), '1200');
+    assert.equal(q.get('ggscoord'), '35.00100|-100.00100');
+  });
+
+  test('only old photos nearby on Commons: none from it, never topped up with old ones', async () => {
+    const d = (await s.api('/api/nearby-photos', { lat: '65.00010', lon: '10.00010' })).json();
+    assert.equal(d.sources.wikimedia.count, 0);
+    assert.ok(!d.photos.some((p) => p.source === 'wikimedia'));
+  });
+
+  test('each source is asked once per cell', async () => {
+    await s.api('/api/nearby-photos', P);
+    await s.api('/api/nearby-photos', { lat: '35.00050', lon: '-100.00050' });
+    assert.equal(s.mock.callsTo('generator=geosearch').length, 1);
+    assert.equal(s.mock.callsTo('flickr.photos.search').length, 1);
+    assert.equal(s.mock.callsTo('graph.mapillary.com').length, 1);
+    assert.equal(s.mod.RETAIN['places.photos'], 7 * 86400e3);
+  });
+
+  test('a failing source is reported without hiding the rest; all failing is an error', async () => {
+    s.mock.fail('graph.mapillary.com', 500, '{"error":{"message":"Application request limit reached"}}');
+    const d = (await s.api('/api/nearby-photos', P)).json();
+    assert.equal(d.sources.mapillary.status, 'error');
+    assert.match(d.sources.mapillary.error, /request limit/);
+    assert.ok(d.photos.length > 0);
+    s.mock.fail('commons.wikimedia.org', 503);
+    s.mock.on((url) => url.hostname === 'api.flickr.com', () => json({ stat: 'fail', code: 100, message: 'Invalid API Key' }));
+    s.mod.cache.clear();
+    await s.mod.clearDiskCache();
+    const r = await s.api('/api/nearby-photos', P);
+    assert.equal(r.status, 502);
+    assert.match(r.json().error, /Invalid API Key/);
+  });
+
+  test('without the Flickr and Mapillary keys, only Commons is asked', async () => {
+    const t = await startServer();
+    try {
+      const d = (await t.api('/api/nearby-photos', P)).json();
+      assert.deepEqual(d.sources.flickr, { status: 'not configured' });
+      assert.deepEqual(d.sources.mapillary, { status: 'not configured' });
+      assert.ok(d.photos.every((p) => p.source === 'wikimedia'));
+      assert.equal(t.mock.callsTo('api.flickr.com').length, 0);
+      assert.equal(t.mock.callsTo('graph.mapillary.com').length, 0);
+    } finally { await t.close(); }
   });
 
   test('an unreadable taken-date ("2021:07:08") falls back to the upload day', () => {
@@ -245,23 +323,7 @@ describe('/api/nearby-photos', () => {
     assert.equal(s.mod.photoTakenAt('2999-01-01'), null);
   });
 
-  test('asks Commons for the 500 nearest files around the snapped cell, and once per cell', async () => {
-    await s.api('/api/nearby-photos', P);
-    await s.api('/api/nearby-photos', { lat: '35.00050', lon: '-100.00050' });
-    const calls = s.mock.callsTo('generator=geosearch');
-    assert.equal(calls.length, 1);
-    const q = new URL(calls[0].url).searchParams;
-    assert.equal(q.get('ggsnamespace'), '6');
-    assert.equal(q.get('ggsradius'), '10000');
-    assert.equal(q.get('ggslimit'), '500');
-    assert.equal(q.get('ggscoord'), '35.00100|-100.00100');
-    assert.equal(s.mod.RETAIN['places.photos'], 7 * 86400e3);
-  });
-
-  test('nothing nearby is an empty answer; bad coordinates are a 400', async () => {
-    const d = (await s.api('/api/nearby-photos', { lat: '-84', lon: '10' })).json();
-    assert.equal(d.count, 0);
-    assert.deepEqual(d.photos, []);
+  test('bad coordinates are a 400', async () => {
     assert.equal((await s.api('/api/nearby-photos', { lat: 'x', lon: '1' })).status, 400);
     assert.equal((await s.api('/api/nearby-photos', { lon: '1' })).status, 400);
     assert.equal((await s.api('/api/nearby-photos', { lat: '91', lon: '1' })).status, 400);

@@ -3547,14 +3547,26 @@ export async function enrichHost(ip, slot) {
 }
 
 /**
- * The "Nearby photos" block of the detail panel: up to four Commons photos
- * with the date, distance, author and licence that showing them requires.
+ * The "Nearby photos" block of the detail panel: up to four photos, closest
+ * first, each with the source, date, distance, author and licence that
+ * showing it requires.
  */
+const PHOTO_SOURCE_NAMES = { wikimedia: 'Wikimedia Commons', flickr: 'Flickr', mapillary: 'Mapillary' };
 export function nearbyPhotosHtml(d) {
   const photos = (d?.photos || []).filter((p) => safeUrl(p.photo, { httpsOnly: true }));
   const km = (m) => (m >= 1000 ? `${(m / 1000).toFixed(m >= 10000 ? 0 : 1)} km` : `${Math.round(m)} m`);
+  const src = d?.sources || {};
+  const names = (pred) => Object.keys(PHOTO_SOURCE_NAMES).filter((k) => src[k] && pred(src[k])).map((k) => PHOTO_SOURCE_NAMES[k]);
+  const asked = names((v) => v.status !== 'not configured');
+  const failed = Object.entries(src).filter(([k, v]) => v?.status === 'error' && PHOTO_SOURCE_NAMES[k])
+    .map(([k, v]) => `${PHOTO_SOURCE_NAMES[k]}: ${v.error || 'failed'}`);
+  const missing = [src.flickr?.status === 'not configured' && 'FLICKR_API_KEY',
+    src.mapillary?.status === 'not configured' && 'MAPILLARY_TOKEN'].filter(Boolean);
+  const from = asked.length ? asked.join(', ') : 'Wikimedia Commons';
+  const extra = (failed.length ? `<p class="hint">${esc(failed.join(' · '))}</p>` : '')
+    + (missing.length ? `<p class="hint">Add ${esc(missing.join(' or '))} in settings to search more sources.</p>` : '');
   if (!photos.length) {
-    return `<h4>Nearby photos</h4><p class="hint">No geotagged photos from the past year on Wikimedia Commons within ${esc(km(d?.searchedM || 10000))}. Older ones are not shown.</p>`;
+    return `<h4>Nearby photos</h4><p class="hint">No geotagged photos from the past year within ${esc(km(d?.searchedM || 1000))} on ${esc(from)}. Older ones are not shown.</p>${extra}`;
   }
   const cells = photos.map((p) => {
     const page = safeUrl(p.page);
@@ -3565,14 +3577,15 @@ export function nearbyPhotosHtml(d) {
         : esc(p.license))
       : null;
     const when = p.date ? `${p.dateKind === 'taken' ? '' : 'uploaded '}${esc(p.date)}` : 'undated';
+    const source = PHOTO_SOURCE_NAMES[p.source] || 'photo';
     return `<figure class="np">
         ${page ? `<a href="${esc(page)}" target="_blank" rel="noopener noreferrer" title="${esc(p.title || '')}">${img}</a>` : img}
-        <figcaption>${when} · ${esc(km(p.distanceM || 0))} away<br>${esc(p.credit || 'Unknown author')}${lic ? ` · ${lic}` : ''}</figcaption>
+        <figcaption>${esc(km(p.distanceM || 0))} away · ${when}<br>${esc(p.credit || 'Unknown author')}${lic ? ` · ${lic}` : ''} · ${esc(source)}</figcaption>
       </figure>`;
   }).join('');
   return `<h4>Nearby photos</h4><div class="np-grid">${cells}</div>
-    <p class="hint">The ${photos.length === 1 ? 'only photo from the past year' : `${photos.length} newest photos from the past year`} within ${esc(km(d.withinM || 0))},
-    from Wikimedia Commons. Positions are where each uploader says the camera stood.</p>`;
+    <p class="hint">The ${photos.length === 1 ? 'closest photo' : `${photos.length} closest photos`} from the past year within ${esc(km(d.withinM || 1000))},
+    from ${esc(from)}. Positions are where each uploader says the camera stood.</p>${extra}`;
 }
 
 /** Whether a pick has a fixed place on the ground worth looking at. */

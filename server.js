@@ -63,6 +63,8 @@ const CFG = {
   windyKey: (process.env.WINDY_API_KEY || '').trim(),
   youtubeKey: (process.env.YOUTUBE_API_KEY || '').trim(),
   googleEmbedKey: (process.env.GOOGLE_MAPS_EMBED_KEY || '').trim(),
+  flickrKey: (process.env.FLICKR_API_KEY || '').trim(),
+  mapillaryToken: (process.env.MAPILLARY_TOKEN || '').trim(),
   cesiumIonToken: (process.env.CESIUM_ION_TOKEN || '').trim(),
   openSkyId: (process.env.OPENSKY_CLIENT_ID || '').trim(),
   openSkySecret: (process.env.OPENSKY_CLIENT_SECRET || '').trim(),
@@ -722,7 +724,9 @@ function refusalReason(body, max = 220) {
   if (!body) return '';
   try {
     const j = JSON.parse(body);
-    const msg = j.message || j.error || j.detail || j.error_message || j.remark
+    // Graph-style APIs (Mapillary, Google) nest it: {"error":{"message":…}}.
+    const msg = j.message || (typeof j.error === 'object' ? j.error?.message : j.error)
+      || j.detail || j.error_message || j.remark
       || (typeof j.errors?.[0] === 'string' ? j.errors[0] : j.errors?.[0]?.message);
     return typeof msg === 'string' && msg.trim() ? clip(msg.trim().replace(/\s+/g, ' '), max) : '';
   } catch { /* not JSON */ }
@@ -3821,22 +3825,33 @@ async function vesselPhoto({ imo, mmsi }) {
 }
 
 // ---------------------------------------------------------------------------
-// NEARBY PHOTOS — geotagged pictures on Wikimedia Commons
+// NEARBY PHOTOS — geotagged pictures from Wikimedia Commons, Flickr, Mapillary
 // ---------------------------------------------------------------------------
 //
-// Any pin can be asked "what does this place look like?". Commons (the image
-// library behind Wikipedia) holds the coordinates its photographers recorded
-// and answers a search around a point, nearest first. What is shown is the
-// newest few of the nearest: the search widens ring by ring until one ring
-// holds enough photos, and the most recently taken in that ring are kept.
+// Any pin can be asked "what does this place look like?". Three sources hold
+// photos with the coordinates their photographers recorded: Commons (the
+// image library behind Wikipedia, no key), Flickr (free key) and Mapillary
+// (street-level, free token). Each is asked for what lies around the pin,
+// the answers are pooled, and the closest win whatever their source: an
+// older picture of the spot itself says more than a newer one down the road.
 // A photo's position is where the camera stood, as its uploader stated it.
 
-const PHOTO_RINGS_M = [250, 1000, 5000, 10000];   // 10 km is the API's limit
+// Nothing past 1 km: further off, a photo shows somewhere else, not this pin.
+const PHOTO_MAX_M = 1000;
+// Asked of each source around the middle of the pin's ~200 m cell, so the
+// search reaches a full kilometre from any pin in the cell.
+const PHOTO_SEARCH_M = 1200;
 const PHOTO_COUNT = 4;
 // Older than this is not shown at all: a place can change past recognition
 // in a few years, and an empty answer misleads less than an old picture.
 const PHOTO_MAX_AGE_DAYS = 365;
 const PHOTO_MIMES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/tiff', 'image/gif']);
+const PHOTO_SOURCES = {
+  __proto__: null,
+  wikimedia: 'Wikimedia Commons',
+  flickr: 'Flickr',
+  mapillary: 'Mapillary',
+};
 
 const metresBetween = (lat1, lon1, lat2, lon2) => {
   const r = Math.PI / 180;
@@ -3845,7 +3860,7 @@ const metresBetween = (lat1, lon1, lat2, lon2) => {
   return 2 * 6371008 * Math.asin(Math.sqrt(a));
 };
 
-/** When a Commons photo was taken, if its metadata says so believably. */
+/** When a photo was taken, if its metadata says so believably. */
 function photoTakenAt(raw) {
   // Matched on the raw value: Commons often wraps the date as
   // <time datetime="2024-05-04">4 May 2024</time>, and only digits are kept.
@@ -3857,21 +3872,24 @@ function photoTakenAt(raw) {
   return `${m[1]}-${m[2]}-${m[3]}`;
 }
 
-/** Every geotagged Commons image around one grid cell, nearest first. */
+const photoCutoff = () => new Date(Date.now() - PHOTO_MAX_AGE_DAYS * 86400e3);
+
+/* --- Wikimedia Commons ---------------------------------------------- */
+
 async function commonsPhotosNear(cell) {
   const c = bboxCenter(cell);
-  return cachedPersistent(`photos:v2:${cell.key}`, RETAIN['places.photos'], async () => {
+  return cachedPersistent(`photos:wm:v1:${cell.key}`, RETAIN['places.photos'], async () => {
     const pages = new Map();
     let cont = {};
-    // The 500 nearest, not the 50: only recent photos are shown, and around
-    // a landmark the nearest few dozen are mostly years old. A long answer
-    // arrives in parts.
+    // The 500 nearest: only recent photos are shown, and around a landmark
+    // the nearest few dozen are mostly years old. A long answer arrives in
+    // parts.
     for (let i = 0; i < 8; i++) {
       const d = await grab(`https://commons.wikimedia.org/w/api.php?${new URLSearchParams({
         action: 'query', format: 'json', formatversion: '2',
         generator: 'geosearch', ggsnamespace: '6', ggsprimary: 'all',
         ggscoord: `${c.lat.toFixed(5)}|${c.lon.toFixed(5)}`,
-        ggsradius: String(PHOTO_RINGS_M.at(-1)), ggslimit: '500',
+        ggsradius: String(PHOTO_SEARCH_M), ggslimit: '500',
         prop: 'coordinates|imageinfo', colimit: 'max', coprimary: 'all',
         iiprop: 'url|timestamp|mime|extmetadata', iiurlwidth: '640',
         iiextmetadatafilter: 'DateTimeOriginal|Artist|LicenseShortName|LicenseUrl',
@@ -3894,6 +3912,7 @@ async function commonsPhotosNear(cell) {
       const meta = ii.extmetadata || {};
       const taken = photoTakenAt(meta.DateTimeOriginal?.value);
       out.push({
+        source: 'wikimedia',
         title: clip(String(p.title || '').replace(/^File:/, '').replace(/\.[a-z0-9]{2,5}$/i, '').replace(/_/g, ' '), 120),
         photo,
         page: safeUrl(ii.descriptionurl),
@@ -3911,6 +3930,140 @@ async function commonsPhotosNear(cell) {
   });
 }
 
+/* --- Flickr --------------------------------------------------------- */
+
+const FLICKR_REST = 'https://api.flickr.com/services/rest/';
+
+/** A Flickr REST call. Flickr reports failure in the body, with HTTP 200. */
+async function flickrCall(method, params, label = 'Flickr') {
+  const url = new URL(FLICKR_REST);
+  url.search = new URLSearchParams({
+    method, api_key: CFG.flickrKey, format: 'json', nojsoncallback: '1', ...params,
+  }).toString();
+  const d = await grab(url, {}, { label, timeoutMs: 20000 });
+  if (d?.stat !== 'ok') {
+    const e = new UpstreamError(d?.code === 100 || d?.code === '100' ? 401 : 502,
+      `${label}: ${clip(String(d?.message || 'request refused'), 160)}`);
+    throw e;
+  }
+  return d;
+}
+
+/**
+ * Flickr's licences by id, from Flickr itself. The list grew in 2025 when
+ * the CC 4.0 licences arrived with new ids, so it is read, not hard-coded.
+ */
+async function flickrLicenses() {
+  return cachedPersistent('flickr:licenses:v1', 30 * 86400e3, async () => {
+    const d = await flickrCall('flickr.photos.licenses.getInfo', {}, 'Flickr licences');
+    return (d.licenses?.license || []).map((l) => ({
+      id: String(l.id), name: clip(String(l.name || ''), 80), url: safeUrl(l.url),
+    }));
+  });
+}
+
+async function flickrPhotosNear(cell) {
+  if (!CFG.flickrKey) return null;
+  const c = bboxCenter(cell);
+  return cachedPersistent(`photos:fl:v1:${cell.key}`, RETAIN['places.photos'], async () => {
+    const licenses = await flickrLicenses();
+    // Openly licensed photos only, as on Commons: all-rights-reserved ones
+    // are not offered for reuse, and showing them here would be reuse.
+    const open = licenses.filter((l) => l.id !== '0' && !/all rights reserved/i.test(l.name));
+    if (!open.length) return [];
+    const byId = new Map(open.map((l) => [l.id, l]));
+    // A radius search comes back nearest first. The upload-date floor is the
+    // "limiting agent" Flickr requires of geo queries; the taken date is
+    // checked afterwards.
+    const d = await flickrCall('flickr.photos.search', {
+      lat: c.lat.toFixed(5), lon: c.lon.toFixed(5),
+      radius: String(PHOTO_SEARCH_M / 1000), radius_units: 'km',
+      has_geo: '1', media: 'photos', safe_search: '1',
+      min_upload_date: String(Math.floor(photoCutoff().getTime() / 1000)),
+      license: open.map((l) => l.id).join(','),
+      extras: 'date_taken,date_upload,owner_name,geo,license,url_z,url_m',
+      per_page: '250',
+    });
+    const out = [];
+    for (const p of d.photos?.photo || []) {
+      const la = Number(p.latitude);
+      const lo = Number(p.longitude);
+      const lic = byId.get(String(p.license));
+      const photo = safeUrl(p.url_z || p.url_m, { httpsOnly: true });
+      if (!Number.isFinite(la) || !Number.isFinite(lo) || (la === 0 && lo === 0) || !lic || !photo) continue;
+      if (!/^\d+$/.test(String(p.id)) || !/^[\w@-]+$/.test(String(p.owner || ''))) continue;
+      const taken = String(p.datetakenunknown) === '1' ? null : photoTakenAt(p.datetaken);
+      const up = Number(p.dateupload);
+      out.push({
+        source: 'flickr',
+        title: clip(String(p.title || '').trim(), 120) || 'Untitled',
+        photo,
+        page: `https://www.flickr.com/photos/${p.owner}/${p.id}/`,
+        lat: la, lon: lo,
+        date: taken || (Number.isFinite(up) ? new Date(up * 1000).toISOString().slice(0, 10) : null),
+        dateKind: taken ? 'taken' : 'uploaded',
+        credit: clip(String(p.ownername || '').trim(), 120) || 'Unknown author',
+        license: lic.name || null,
+        licenseUrl: lic.url,
+      });
+    }
+    return out;
+  });
+}
+
+/* --- Mapillary ------------------------------------------------------ */
+
+// Mapillary's thumbnail links are signed and stop working after a while, so
+// its answers are kept for an hour, not the week the others are.
+const MAPILLARY_KEEP_MS = 60 * 60_000;
+
+async function mapillaryPhotosNear(cell) {
+  if (!CFG.mapillaryToken) return null;
+  const c = bboxCenter(cell);
+  const dLat = PHOTO_SEARCH_M / 111320;
+  const dLon = dLat / Math.max(0.05, Math.cos(c.lat * Math.PI / 180));
+  // Mapillary refuses a box of 0.01 square degrees or more, which a 1.2 km
+  // box only reaches within about three degrees of a pole.
+  if ((2 * dLat) * (2 * dLon) >= 0.01) return [];
+  const ttl = Math.min(RETAIN['places.photos'], MAPILLARY_KEEP_MS);
+  return cachedPersistent(`photos:mly:v1:${cell.key}`, ttl, async () => {
+    const url = new URL('https://graph.mapillary.com/images');
+    url.search = new URLSearchParams({
+      bbox: [c.lon - dLon, c.lat - dLat, c.lon + dLon, c.lat + dLat].map((v) => v.toFixed(6)).join(','),
+      fields: 'id,captured_at,computed_geometry,geometry,thumb_1024_url,creator,sequence,is_pano',
+      start_captured_at: photoCutoff().toISOString().replace(/\.\d{3}Z$/, 'Z'),
+      limit: '2000',
+    }).toString();
+    // The token travels as a header, which Mapillary recommends over the URL.
+    const d = await grab(url, { headers: { Authorization: `OAuth ${CFG.mapillaryToken}` } },
+      { label: 'Mapillary', timeoutMs: 25000 });
+    const out = [];
+    for (const im of d?.data || []) {
+      const [lo, la] = im.computed_geometry?.coordinates || im.geometry?.coordinates || [];
+      const photo = safeUrl(im.thumb_1024_url, { httpsOnly: true });
+      const t = Number(im.captured_at);
+      if (!Number.isFinite(la) || !Number.isFinite(lo) || !photo || !/^\d+$/.test(String(im.id))) continue;
+      const user = clip(String(im.creator?.username || '').trim(), 80);
+      out.push({
+        source: 'mapillary',
+        title: im.is_pano ? 'Street-level panorama' : 'Street-level photo',
+        photo,
+        page: `https://www.mapillary.com/app/?pKey=${im.id}`,
+        lat: la, lon: lo,
+        date: Number.isFinite(t) ? new Date(t).toISOString().slice(0, 10) : null,
+        dateKind: 'taken',
+        credit: user ? `${user} on Mapillary` : 'Mapillary contributor',
+        license: 'CC BY-SA 4.0',
+        licenseUrl: 'https://creativecommons.org/licenses/by-sa/4.0/',
+        sequence: typeof im.sequence === 'string' ? im.sequence : null,
+      });
+    }
+    return out;
+  });
+}
+
+/* --- Pooling ------------------------------------------------------- */
+
 async function nearbyPhotos({ lat, lon }) {
   const la = Number(lat);
   const lo = Number(lon);
@@ -3921,23 +4074,52 @@ async function nearbyPhotos({ lat, lon }) {
   // Searched from the middle of a fixed ~200 m cell, so every pin in the
   // cell shares one stored answer; distances are then measured from the pin.
   const cell = viewCell({ south: la, north: la, west: lo, east: lo }, 'photos');
-  // Judged by the day it was taken where the file says, else the upload
-  // day: a 2009 photograph uploaded last month is still a 2009 photograph.
-  const cutoff = new Date(Date.now() - PHOTO_MAX_AGE_DAYS * 86400e3).toISOString().slice(0, 10);
-  const all = (await commonsPhotosNear(cell))
-    .filter((p) => p.date && p.date >= cutoff)
-    .map((p) => ({ ...p, distanceM: Math.round(metresBetween(la, lo, p.lat, p.lon)) }));
+  const named = [['wikimedia', commonsPhotosNear], ['flickr', flickrPhotosNear], ['mapillary', mapillaryPhotosNear]];
+  const settled = await Promise.allSettled(named.map(([, fn]) => fn(cell)));
 
-  let ring = PHOTO_RINGS_M.at(-1);
-  let pool = all;
-  for (const r of PHOTO_RINGS_M) {
-    const inside = all.filter((p) => p.distanceM <= r);
-    if (inside.length >= PHOTO_COUNT || r === PHOTO_RINGS_M.at(-1)) { ring = r; pool = inside; break; }
+  const sources = {};
+  const pool = [];
+  settled.forEach((r, i) => {
+    const name = named[i][0];
+    if (r.status === 'rejected') sources[name] = { status: 'error', error: r.reason?.message || String(r.reason) };
+    else if (r.value == null) sources[name] = { status: 'not configured' };
+    else { sources[name] = { status: 'ok' }; pool.push(...r.value); }
+  });
+  const asked = Object.values(sources).filter((v) => v.status !== 'not configured');
+  if (asked.length && asked.every((v) => v.status === 'error')) {
+    throw new UpstreamError(502, asked.map((v) => v.error).join('; '));
   }
-  const photos = pool
-    .sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')) || a.distanceM - b.distanceM)
-    .slice(0, PHOTO_COUNT);
-  return { count: photos.length, withinM: ring, searchedM: PHOTO_RINGS_M.at(-1), maxAgeDays: PHOTO_MAX_AGE_DAYS, photos };
+
+  // Judged by the day it was taken where the source says, else the upload
+  // day: a 2009 photograph uploaded last month is still a 2009 photograph.
+  const cutoff = photoCutoff().toISOString().slice(0, 10);
+  const near = pool
+    .filter((p) => p.date && p.date >= cutoff)
+    .map((p) => ({ ...p, distanceM: Math.round(metresBetween(la, lo, p.lat, p.lon)) }))
+    .filter((p) => p.distanceM <= PHOTO_MAX_M)
+    // Closest first, from any source; the newer of two at one distance.
+    .sort((a, b) => a.distanceM - b.distanceM || String(b.date).localeCompare(String(a.date)));
+
+  // One frame per Mapillary sequence: a drive past records a photo every few
+  // metres, and four near-identical frames would crowd out everything else.
+  const seen = new Set();
+  const photos = [];
+  for (const p of near) {
+    if (p.sequence) {
+      if (seen.has(p.sequence)) continue;
+      seen.add(p.sequence);
+    }
+    const { sequence, ...shown } = p;
+    photos.push({ ...shown, sourceName: PHOTO_SOURCES[p.source] });
+    if (photos.length >= PHOTO_COUNT) break;
+  }
+  for (const [name, v] of Object.entries(sources)) {
+    if (v.status === 'ok') v.count = photos.filter((p) => p.source === name).length;
+  }
+  return {
+    count: photos.length, withinM: PHOTO_MAX_M, searchedM: PHOTO_MAX_M,
+    maxAgeDays: PHOTO_MAX_AGE_DAYS, sources, photos,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -5616,6 +5798,15 @@ const CREDENTIALS = [
   { name: 'OPENWEBCAMDB_API_KEY', group: 'Webcams', label: 'OpenWebcamDB key', url: 'https://openwebcamdb.com/api',
     set: (v) => { CFG.owcdbKey = v; } },
 
+  { name: 'FLICKR_API_KEY', group: 'Photos', label: 'Flickr API key',
+    url: 'https://www.flickr.com/services/apps/create/',
+    note: 'More nearby photos in the detail panel. Free, non-commercial key.',
+    set: (v) => { CFG.flickrKey = v; } },
+  { name: 'MAPILLARY_TOKEN', group: 'Photos', label: 'Mapillary client token',
+    url: 'https://www.mapillary.com/dashboard/developers',
+    note: 'Street-level photos in the nearby-photo panel. Free; register an app and copy its client token.',
+    set: (v) => { CFG.mapillaryToken = v; } },
+
   { name: 'YOUTUBE_API_KEY', group: 'Video', label: 'YouTube Data API key',
     url: 'https://console.cloud.google.com/apis/library/youtube.googleapis.com',
     note: 'Geotagged YouTube uploads near the view. Free quota: 10,000 units/day.',
@@ -5945,6 +6136,9 @@ const ROUTES = {
       openwebcamdb: CFG.owcdbKey ? 'configured' : 'missing OPENWEBCAMDB_API_KEY',
       alertcalifornia: 'open (wildfire PTZ cameras)',
       youtube: CFG.youtubeKey ? 'configured' : 'missing YOUTUBE_API_KEY',
+      wikimediaPhotos: 'open (nearby photos)',
+      flickr: CFG.flickrKey ? 'configured (nearby photos)' : 'not set (optional, nearby photos)',
+      mapillary: CFG.mapillaryToken ? 'configured (nearby photos)' : 'not set (optional, nearby photos)',
       streetView: streetViewKey() ? 'configured (embedded panorama)' : 'not set (link to Google Maps only)',
       cesiumIon: CFG.cesiumIonToken ? 'configured' : 'not set (OSM basemap only)',
       gdacs: 'open', eonet: 'open', usgs: 'open', nws: 'open',
@@ -6684,6 +6878,8 @@ ${ACCESS_KEY ? `  ${C.yel}!${C.rst} Listening on ${CFG.host}, beyond this machin
   OpenWebcamDB ........ ${ok(!!CFG.owcdbKey)}
   ALERTCalifornia ..... ${C.grn}open${C.rst} (wildfire cams)
   YouTube geotags ..... ${ok(!!CFG.youtubeKey)}
+  Flickr photos ....... ${CFG.flickrKey ? `${C.grn}configured${C.rst}` : `${C.dim}not set (optional)${C.rst}`}
+  Mapillary photos .... ${CFG.mapillaryToken ? `${C.grn}configured${C.rst}` : `${C.dim}not set (optional)${C.rst}`}
   Street View ......... ${streetViewKey() ? `${C.grn}embedded${C.rst}` : `${C.dim}link only (no GOOGLE_MAPS_EMBED_KEY)${C.rst}`}
   Cesium Ion .......... ${CFG.cesiumIonToken ? `${C.grn}terrain + buildings${C.rst}` : `${C.yel}OSM basemap only${C.rst}`}
 `);

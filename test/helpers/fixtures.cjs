@@ -26,6 +26,8 @@ const TEST_KEYS = Object.freeze({
   SHODAN_API_KEY: 'test-shodan-SECRET-1111',
   WINDY_API_KEY: 'test-windy-SECRET-2222',
   YOUTUBE_API_KEY: 'test-youtube-SECRET-eeee',
+  FLICKR_API_KEY: 'test-flickr-SECRET-1212',
+  MAPILLARY_TOKEN: 'MLY|1234|test-mapillary-SECRET-3434',
   OPENWEBCAMDB_API_KEY: 'test-owcdb-SECRET-3333',
   FIRMS_MAP_KEY: 'test-firms-SECRET-4444',
   AISSTREAM_API_KEY: 'test-ais-SECRET-5555',
@@ -751,6 +753,55 @@ function registerDefaults(mock) {
       file('Insecure', 0.0002, ago(6), ago(5), { thumburl: 'http://insecure.example/t.jpg' }),
       file('Far', 0.027, ago(2), ago(1)),
     ] } });
+  });
+
+  // Flickr: the licence list, and a radius search around the asked point.
+  // "Taken long ago" was uploaded recently but taken in 2010; "Near frame"
+  // is the closest of all. A wrong key is refused the way Flickr does it:
+  // HTTP 200 with stat "fail".
+  mock.on((url) => url.hostname === 'api.flickr.com', ({ params }) => {
+    if (params.get('api_key') !== 'test-flickr-SECRET-1212') return json({ stat: 'fail', code: 100, message: 'Invalid API Key (Key has invalid format)' });
+    if (params.get('method') === 'flickr.photos.licenses.getInfo') {
+      return json({ stat: 'ok', licenses: { license: [
+        { id: 0, name: 'All Rights Reserved', url: '' },
+        { id: 4, name: 'Attribution License', url: 'https://creativecommons.org/licenses/by/2.0/' },
+        { id: 11, name: 'CC BY 4.0', url: 'https://creativecommons.org/licenses/by/4.0/' },
+      ] } });
+    }
+    const lat = Number(params.get('lat'));
+    const lon = Number(params.get('lon'));
+    const ago = (n) => new Date(Date.now() - n * 86400e3);
+    const photo = (id, title, dLat, taken, uploaded, extra = {}) => ({
+      id, owner: '12345@N00', secret: 's', server: '1', title, license: '11',
+      datetaken: taken, datetakenunknown: '0', dateupload: String(Math.floor(uploaded.getTime() / 1000)),
+      ownername: 'F. Lickr', latitude: String(lat + dLat), longitude: String(lon),
+      url_z: `https://live.staticflickr.com/1/${id}_s_z.jpg`, ...extra,
+    });
+    return json({ stat: 'ok', photos: { page: 1, pages: 1, perpage: 250, total: 4, photo: [
+      photo('101', 'Near frame', 0.00002, `${ago(300).toISOString().slice(0, 10)} 09:00:00`, ago(299)),
+      photo('102', 'Taken long ago', 0.00003, '2010-01-01 10:00:00', ago(5)),
+      photo('103', 'No location', 0.0, `${ago(3).toISOString().slice(0, 10)} 09:00:00`, ago(2), { latitude: '0', longitude: '0' }),
+      photo('104', 'Bad owner', 0.00001, `${ago(3).toISOString().slice(0, 10)} 09:00:00`, ago(2), { owner: 'x"><' }),
+    ] } });
+  });
+
+  // Mapillary: three frames of one drive-past, near the asked point, and a
+  // second sequence a little further off.
+  mock.on((url) => url.hostname === 'graph.mapillary.com' && url.pathname === '/images', ({ params }) => {
+    const [w, s, e, n] = String(params.get('bbox')).split(',').map(Number);
+    const lat = (s + n) / 2;
+    const lon = (w + e) / 2;
+    const ago = (d) => Date.now() - d * 86400e3;
+    const frame = (id, seq, dLat, when) => ({
+      id, sequence: seq, captured_at: ago(when), is_pano: false,
+      computed_geometry: { type: 'Point', coordinates: [lon, lat + dLat] },
+      thumb_1024_url: `https://scontent.example.fbcdn.net/m1/${id}.jpg?oh=x&oe=FFFFFFFF`,
+      creator: { username: 'streetwalker', id: '9' },
+    });
+    return json({ data: [
+      frame('201', 'SEQ1', 0.00004, 30), frame('202', 'SEQ1', 0.00005, 30), frame('203', 'SEQ1', 0.00006, 30),
+      frame('204', 'SEQ2', 0.00007, 10),
+    ] });
   });
 
   mock.on(host('atlas.ripe.net', '/api/v2/probes'), atlas);

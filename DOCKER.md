@@ -79,6 +79,7 @@ All are optional. Anything unset stays switched off, just like an empty line in
 | Satellites | `SPACETRACK_USER`, `SPACETRACK_PASSWORD` |
 | Webcams | `WINDY_API_KEY`, `OPENWEBCAMDB_API_KEY`, `FIVE_ELEVEN_KEYS` |
 | Video | `YOUTUBE_API_KEY` |
+| Photos | `FLICKR_API_KEY`, `MAPILLARY_TOKEN` |
 | Hazards | `FIRMS_MAP_KEY`, `EDIS_API_URL`, `EDIS_API_KEY` |
 | Vessels and devices | `AISSTREAM_API_KEY`, `OPENCELLID_API_KEY`, `WIGLE_API_NAME`, `WIGLE_API_TOKEN`, `GREYNOISE_API_KEY` |
 | Infrastructure | `EIA_API_KEY`, `CLOUDFLARE_API_TOKEN` |

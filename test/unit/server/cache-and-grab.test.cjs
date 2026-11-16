@@ -295,6 +295,12 @@ describe('grab()', () => {
     await assert.rejects(S.grab('https://tls.example/x', {}, { label: 'X' }), /TLS certificate not trusted/);
   });
 
+  test('a nested {"error":{"message"}} refusal is read too', async () => {
+    mock.on('nested.example', () => status(400, '{"error":{"message":"Invalid OAuth access token","type":"OAuthException","code":190}}'));
+    await assert.rejects(S.grab('https://nested.example/x', {}, { label: 'Mapillary' }),
+      /Mapillary returned HTTP 400: Invalid OAuth access token$/);
+  });
+
   test('a hung upstream times out as a 504', async () => {
     mock.hang('a.example');
     await assert.rejects(S.grab('https://a.example/x', {}, { label: 'Slow', timeoutMs: 50 }), (e) => {
