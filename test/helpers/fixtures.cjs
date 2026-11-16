@@ -707,6 +707,52 @@ function registerDefaults(mock) {
     }],
   }] } }));
 
+  // Nearby photos, dated relative to today. Around most points: five recent
+  // files within 250 m, plus ones that must be left out: a 2009 photograph
+  // uploaded last month, one taken 400 days ago, a PDF, an http thumbnail,
+  // and "Far", the newest of all but 3 km away. Latitude 50-60 has two
+  // recent files only; above 60, only old ones.
+  mock.on((url) => url.hostname === 'commons.wikimedia.org' && url.searchParams.get('generator') === 'geosearch', ({ params }) => {
+    const [lat, lon] = String(params.get('ggscoord')).split('|').map(Number);
+    if (lat < -80) return json({ batchcomplete: true });
+    const ago = (n) => new Date(Date.now() - n * 86400e3).toISOString().slice(0, 10);
+    const file = (name, dLat, taken, uploaded, extra = {}) => ({
+      title: `File:${name}.jpg`,
+      coordinates: [{ lat: lat + dLat, lon, primary: true, globe: 'earth' }],
+      imageinfo: [{
+        timestamp: `${uploaded}T10:00:00Z`, mime: 'image/jpeg',
+        url: `https://upload.wikimedia.org/wikipedia/commons/x/xx/${name}.jpg`,
+        thumburl: `https://upload.wikimedia.org/wikipedia/commons/thumb/x/xx/${name}.jpg/640px-${name}.jpg`,
+        descriptionurl: `https://commons.wikimedia.org/wiki/File:${name}.jpg`,
+        extmetadata: {
+          ...(taken ? { DateTimeOriginal: { value: taken } } : {}),
+          Artist: { value: '<a href="//commons.wikimedia.org/wiki/User:T">T. Tester</a>' },
+          LicenseShortName: { value: 'CC BY 4.0' }, LicenseUrl: { value: 'https://creativecommons.org/licenses/by/4.0' },
+        },
+        ...extra,
+      }],
+    });
+    const old = [
+      file('Old_square', 0.0001, '2009-06-01 12:00:00', ago(30)),
+      file('Stale', 0.0004, ago(400), ago(399)),
+    ];
+    if (lat > 60) return json({ batchcomplete: true, query: { pages: old } });
+    if (lat > 50) {
+      return json({ batchcomplete: true, query: { pages: [...old, file('Near', 0.0009, ago(10), ago(9)), file('Far', 0.027, ago(2), ago(1))] } });
+    }
+    return json({ batchcomplete: true, query: { pages: [
+      ...old,
+      file('Market', 0.0003, `<time datetime="${ago(20)}">some day</time>`, ago(15)),
+      file('Undated_upload', 0.0005, null, ago(40)),
+      file('Tower', 0.0007, '2021:07:08', ago(100)),
+      file('Street', 0.0009, ago(60), ago(59)),
+      file('Bridge', 0.0006, ago(200), ago(199)),
+      file('Scan', 0.0002, ago(5), ago(4), { mime: 'application/pdf' }),
+      file('Insecure', 0.0002, ago(6), ago(5), { thumburl: 'http://insecure.example/t.jpg' }),
+      file('Far', 0.027, ago(2), ago(1)),
+    ] } });
+  });
+
   mock.on(host('atlas.ripe.net', '/api/v2/probes'), atlas);
   mock.on(host('opencellid.org', '/cell/getInArea'), openCellId);
   mock.on(host('api.wigle.net', '/api/v2/network/search'), wigle);

@@ -18,7 +18,8 @@ import { installConfigMenu } from './config.js';
 import {
   ShodanLayer, FlightLayer, SatelliteLayer, OverpassLayer, WebcamLayer,
   EventLayer, AlprLayer, VesselLayer, NetInfraLayer, IotLayer, TrafficLayer, YoutubeLayer,
-  WeatherOverlay, ImageryOverlay, LabelsOverlay, BasemapOverlay, api,
+  WeatherOverlay, ImageryOverlay, LabelsOverlay, BasemapOverlay, api, nearbyPhotosHtml,
+  groundPoint, streetViewLink, streetViewEmbedUrl,
 } from './layers.js';
 
 const $ = (sel) => document.querySelector(sel);
@@ -87,6 +88,7 @@ class OpenPanopticon {
     await installTileCache(cfg.tileCache?.hosts, cfg.tileCache?.ports);
 
     this.setBoot('initialising globe');
+    this.streetViewKey = cfg.streetViewKey || null;
     await this.initViewer(cfg.cesiumIonToken);
 
     this.setBoot('loading orbital propagator');
@@ -893,7 +895,87 @@ class OpenPanopticon {
       layer.enrich(meta.record, $('#detail-body'))
         .catch((e) => console.warn('enrich failed', e));
     }
+    this.showStreetView(layer, meta.record);
+    this.showNearbyPhotos(layer, meta.record);
     return true;
+  }
+
+  /**
+   * Google Street View for the pick: always a link, and with a Maps Embed
+   * key the panorama itself, in the panel.
+   *
+   * The panorama loads only when asked for. Loading it tells Google which
+   * spot is being looked at, so opening a panel must not be what does that.
+   */
+  showStreetView(layer, rec) {
+    this.stopStreetView();
+    const at = !globalThis.OP_DEMO && groundPoint(layer.id, rec);
+    if (!at) return;
+    const box = el('section', 'street-view');
+    box.append(el('h4', null, 'Street View'));
+    const stage = el('div', 'cam-stage');
+    const row = el('p', 'sv-row');
+    const link = el('a', 'ext', 'Open in Google Maps ↗');
+    link.href = streetViewLink(at.lat, at.lon);
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    const embed = streetViewEmbedUrl(this.streetViewKey, at.lat, at.lon);
+    if (embed) {
+      const load = el('button', 'hm-btn sv-load', 'Load Street View here');
+      load.type = 'button';
+      load.onclick = () => {
+        load.remove();
+        const frame = document.createElement('iframe');
+        frame.className = 'cam-frame';
+        frame.title = 'Google Street View';
+        // Third-party content, sandboxed like the camera players. The
+        // origin is sent as referrer because that is what a restricted
+        // Embed key is checked against.
+        frame.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-popups');
+        frame.setAttribute('referrerpolicy', 'strict-origin-when-cross-origin');
+        frame.setAttribute('allow', 'fullscreen; accelerometer; gyroscope');
+        frame.setAttribute('allowfullscreen', '');
+        frame.src = embed;
+        stage.append(frame);
+        this.streetViewFrame = frame;
+      };
+      row.append(load);
+    }
+    row.append(link);
+    box.append(stage, row, el('p', 'hint', embed
+      ? 'The nearest Google panorama to this point, which can be some distance away and years old.'
+      : 'Add GOOGLE_MAPS_EMBED_KEY (free) in settings to view the panorama inside this panel.'));
+    $('#detail-body').append(box);
+  }
+
+  /** Take the panorama off the page, so a closed panel stops loading it. */
+  stopStreetView() {
+    const f = this.streetViewFrame;
+    this.streetViewFrame = null;
+    if (f) { f.src = 'about:blank'; f.remove(); }
+  }
+
+  /**
+   * Photos taken near the pick, at the foot of the detail panel.
+   *
+   * Not for things in the air or in orbit: what lies under an aircraft or a
+   * satellite says nothing about it. The static demo has no server to ask.
+   */
+  showNearbyPhotos(layer, rec) {
+    const seq = this.photoSeq = (this.photoSeq || 0) + 1;
+    const at = !globalThis.OP_DEMO && groundPoint(layer.id, rec);
+    if (!at) return;
+    const { lat, lon } = at;
+    const box = el('section', 'nearby-photos');
+    box.append(el('h4', null, 'Nearby photos'), el('p', 'hint', 'Looking on Wikimedia Commons…'));
+    $('#detail-body').append(box);
+    // A reply that lands after another pick belongs to a panel that is gone.
+    const current = () => seq === this.photoSeq && box.isConnected;
+    api('/api/nearby-photos', { lat: lat.toFixed(5), lon: lon.toFixed(5) })
+      .then((d) => { if (current()) box.innerHTML = nearbyPhotosHtml(d); })
+      .catch((e) => {
+        if (current()) box.querySelector('.hint').textContent = `Photo lookup failed: ${e.message}`;
+      });
   }
 
   /**
@@ -997,6 +1079,7 @@ class OpenPanopticon {
     this.layers?.flights?.clearRoute();
     this.layers?.webcams?.stopLive();
     this.layers?.youtube?.stopLive();
+    this.stopStreetView();
   }
 
   /* ---------------------------------------------------------------- */

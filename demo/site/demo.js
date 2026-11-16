@@ -67,7 +67,10 @@
       flights: true, events: true, shodan: true, alpr: true, webcams: true, overpass: true, netinfra: true,
     },
     overpassAllClasses: true,
-    lockedLayers: { satellites: 'Not part of the demo.' },
+    // YouTube is never captured: its API terms do not allow keeping results
+    // indefinitely, which a published snapshot would do. Locking it here also
+    // keeps it from appearing available when the capture ran with a key.
+    lockedLayers: { satellites: 'Not part of the demo.', youtube: 'Not part of the demo.' },
   };
 
   /* ---------------------------------------------------------------- */

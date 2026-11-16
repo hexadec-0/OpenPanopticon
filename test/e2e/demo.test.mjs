@@ -115,6 +115,8 @@ e2e('static demo', () => {
     assert.equal(await page.$eval('.layer[data-layer="satellites"] .layer-count', (n) => n.textContent), 'OFF');
     await page.evaluate(() => WV.layers.satellites.setEnabled(true));
     assert.equal(await page.evaluate(() => WV.layers.satellites.enabled), false, 'stays off');
+    assert.match(await page.evaluate(() => WV.locked.youtube), /Not part of the demo/);
+    assert.equal(await page.$eval('.layer[data-layer="youtube"] .layer-count', (n) => n.textContent), 'OFF');
     assert.equal(st.osm, true);
     assert.deepEqual(st.classes, st.all);
     assert.equal(st.net, true);

@@ -13,7 +13,8 @@ on a Cesium globe. `npm start` runs it on http://127.0.0.1:8420.
 - No npm dependencies. Node built-ins only. (`puppeteer-core` is a
   devDependency for the browser tests and must never be required by the app.)
 - Every credential stays in `server.js` (`CFG`). The browser never gets a key,
-  except the Cesium Ion token via `/api/config`, which is browser-side by design.
+  except the Cesium Ion token and the Google Maps Embed key (Street View
+  iframe) via `/api/config`, which are browser-side by design.
   `/api/settings` takes new keys from the settings menu and writes them to
   `.env`; it reports whether each is set and must never return a value.
 - Cache keys must use snapped grid cells: `viewCell(b, kind)` with a

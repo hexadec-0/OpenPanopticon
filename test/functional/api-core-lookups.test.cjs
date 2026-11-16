@@ -58,11 +58,23 @@ describe('/api/config', () => {
       assert.equal(retention.shodan, 30 * 86400_000);
       return rest;
     };
-    assert.deepEqual(strip((await s.api('/api/config')).json()), { cesiumIonToken: null, cartoLabels: true });
+    assert.deepEqual(strip((await s.api('/api/config')).json()), { cesiumIonToken: null, streetViewKey: null, cartoLabels: true });
     const t = await startServer();
     try {
-      assert.deepEqual(strip((await t.api('/api/config')).json()), { cesiumIonToken: null, cartoLabels: false });
+      assert.deepEqual(strip((await t.api('/api/config')).json()), { cesiumIonToken: null, streetViewKey: null, cartoLabels: false });
     } finally { await t.close(); }
+  });
+
+  test('the Google Maps Embed key is the second browser-side key, and only if it looks like one', async () => {
+    const t = await startServer({ env: { GOOGLE_MAPS_EMBED_KEY: 'AIzaSyTestEmbedKey_0123456789-abcdefgh' } });
+    try {
+      assert.equal((await t.api('/api/config')).json().streetViewKey, 'AIzaSyTestEmbedKey_0123456789-abcdefgh');
+      assert.match((await t.api('/api/health')).json().sources.streetView, /^configured/);
+    } finally { await t.close(); }
+    const bad = await startServer({ env: { GOOGLE_MAPS_EMBED_KEY: 'x"&location=evil' } });
+    try {
+      assert.equal((await bad.api('/api/config')).json().streetViewKey, null);
+    } finally { await bad.close(); }
   });
 });
 
@@ -189,6 +201,70 @@ describe('/api/imagery (NASA GIBS)', () => {
     const d = (await s.api('/api/imagery', { layer: 'x', date: 'tomorrow' })).json();
     assert.equal(d.selected.layer, 'VIIRS_SNPP_CorrectedReflectance_TrueColor');
     assert.equal(d.selected.date, d.defaultDate);
+  });
+});
+
+describe('/api/nearby-photos', () => {
+  const P = { lat: '35.00010', lon: '-100.00010' };
+  const ago = (n) => new Date(Date.now() - n * 86400e3).toISOString().slice(0, 10);
+
+  test('the four newest photos of the nearest ring that holds four, none older than a year', async () => {
+    const d = (await s.api('/api/nearby-photos', P)).json();
+    assert.equal(d.withinM, 250);
+    assert.equal(d.maxAgeDays, 365);
+    assert.deepEqual(d.photos.map((p) => p.title), ['Market', 'Undated upload', 'Street', 'Tower']);
+    const m = d.photos[0];
+    assert.equal(m.date, ago(20));
+    assert.equal(m.dateKind, 'taken');
+    assert.match(m.photo, /^https:\/\/upload\.wikimedia\.org\/.*640px-Market\.jpg$/);
+    assert.equal(m.page, 'https://commons.wikimedia.org/wiki/File:Market.jpg');
+    assert.equal(m.credit, 'T. Tester');
+    assert.equal(m.license, 'CC BY 4.0');
+    assert.ok(m.distanceM > 0 && m.distanceM < 250);
+    assert.equal(d.photos[1].dateKind, 'uploaded');
+    assert.equal(d.photos[1].date, ago(40));
+  });
+
+  test('left out: taken long ago though uploaded last month, 400 days old, a PDF, an http thumbnail, newer but 3 km off', async () => {
+    const d = (await s.api('/api/nearby-photos', P)).json();
+    assert.ok(!d.photos.some((p) => /Old square|Stale|Scan|Insecure|Far/.test(p.title)));
+  });
+
+  test('fewer than four recent photos: those are shown, and never topped up with old ones', async () => {
+    const two = (await s.api('/api/nearby-photos', { lat: '55.00010', lon: '10.00010' })).json();
+    assert.deepEqual(two.photos.map((p) => p.title), ['Far', 'Near']);
+    assert.equal(two.withinM, 10000);
+    const none = (await s.api('/api/nearby-photos', { lat: '65.00010', lon: '10.00010' })).json();
+    assert.equal(none.count, 0);
+    assert.deepEqual(none.photos, []);
+  });
+
+  test('an unreadable taken-date ("2021:07:08") falls back to the upload day', () => {
+    assert.equal(s.mod.photoTakenAt('2021:07:08'), null);
+    assert.equal(s.mod.photoTakenAt('<time>2021-07-08</time>'), '2021-07-08');
+    assert.equal(s.mod.photoTakenAt('2999-01-01'), null);
+  });
+
+  test('asks Commons for the 500 nearest files around the snapped cell, and once per cell', async () => {
+    await s.api('/api/nearby-photos', P);
+    await s.api('/api/nearby-photos', { lat: '35.00050', lon: '-100.00050' });
+    const calls = s.mock.callsTo('generator=geosearch');
+    assert.equal(calls.length, 1);
+    const q = new URL(calls[0].url).searchParams;
+    assert.equal(q.get('ggsnamespace'), '6');
+    assert.equal(q.get('ggsradius'), '10000');
+    assert.equal(q.get('ggslimit'), '500');
+    assert.equal(q.get('ggscoord'), '35.00100|-100.00100');
+    assert.equal(s.mod.RETAIN['places.photos'], 7 * 86400e3);
+  });
+
+  test('nothing nearby is an empty answer; bad coordinates are a 400', async () => {
+    const d = (await s.api('/api/nearby-photos', { lat: '-84', lon: '10' })).json();
+    assert.equal(d.count, 0);
+    assert.deepEqual(d.photos, []);
+    assert.equal((await s.api('/api/nearby-photos', { lat: 'x', lon: '1' })).status, 400);
+    assert.equal((await s.api('/api/nearby-photos', { lon: '1' })).status, 400);
+    assert.equal((await s.api('/api/nearby-photos', { lat: '91', lon: '1' })).status, 400);
   });
 });
 

@@ -529,6 +529,25 @@ Hover **BASEMAP** in the top bar for the controls. Imagery tiles are fetched
 by the browser directly rather than proxied: they are megabytes per screen,
 and relaying them would add a hop for nothing.
 
+### Looking at a pin: Street View and nearby photos
+
+Every pin with a fixed place on the ground (everything except aircraft and
+satellites) gets two extra sections at the foot of its detail panel:
+
+- **Street View**: a link to Google's panorama nearest the pin, and with
+  `GOOGLE_MAPS_EMBED_KEY` set, a button that loads the panorama inside the
+  panel. It loads only when pressed, so clicking pins does not tell Google
+  where you are looking. The Embed key is the second key handed to the
+  browser by design (it is part of the iframe address): restrict it to the
+  Maps Embed API and to the address you open the app at.
+- **Nearby photos**: up to four geotagged photos from Wikimedia Commons,
+  no key needed. Only photos from the past year are shown (by the day taken
+  where the file says, otherwise the upload day); with none, the section
+  says so instead of showing old ones. The search widens through 250 m, 1 km, 5 km and 10 km and
+  stops at the first ring holding four photos, then shows the four most
+  recently taken there, each with its date, distance, author and licence.
+  Lookups are kept for `[places] photos` (7 days) in `cache.conf`.
+
 ---
 
 ## Optical modes & Controls

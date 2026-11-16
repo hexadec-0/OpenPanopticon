@@ -62,6 +62,7 @@ const CFG = {
   shodanKey: (process.env.SHODAN_API_KEY || '').trim(),
   windyKey: (process.env.WINDY_API_KEY || '').trim(),
   youtubeKey: (process.env.YOUTUBE_API_KEY || '').trim(),
+  googleEmbedKey: (process.env.GOOGLE_MAPS_EMBED_KEY || '').trim(),
   cesiumIonToken: (process.env.CESIUM_ION_TOKEN || '').trim(),
   openSkyId: (process.env.OPENSKY_CLIENT_ID || '').trim(),
   openSkySecret: (process.env.OPENSKY_CLIENT_SECRET || '').trim(),
@@ -145,6 +146,7 @@ const CACHE_SCHEMA = [
   ['aircraft', 'trails', '4m', 'How long each segment of an aircraft trail stays on screen before it\n# drops off the tail. Longer shows more of the track and more clutter; 0\n# draws no trails. At most 240 fixes are kept per aircraft.'],
   ['places', 'geocode', '3d', 'Place-name searches.'],
   ['places', 'seismic', '3d', 'Seismometer station lists.'],
+  ['places', 'photos', '7d', 'Nearby-photo lookups on Wikimedia Commons, shown in the detail panel.'],
   ['current', 'events', '1h', 'Hazards and alerts: GDACS, EONET, USGS, NWS, FIRMS, EDIS. An old alert\n# drawn as live is worse than none.'],
   ['current', 'traffic', '1h', 'Traffic incidents and cameras from 511 services.'],
   ['current', 'sensors', '1h', 'Live sensor readings (Sensor.Community).'],
@@ -447,6 +449,9 @@ const VIEW_CELL_DEG = {
   // YouTube charges 100 quota units per search page whatever the radius, so
   // a coarse cell lets panning around a city reuse one paid answer.
   youtube: 0.5,
+  // Photo lookups are per pin. ~200 m: pins on one block share an answer,
+  // and the search still starts close enough to rank by distance.
+  photos: 0.002,
 };
 
 /**
@@ -3816,6 +3821,126 @@ async function vesselPhoto({ imo, mmsi }) {
 }
 
 // ---------------------------------------------------------------------------
+// NEARBY PHOTOS — geotagged pictures on Wikimedia Commons
+// ---------------------------------------------------------------------------
+//
+// Any pin can be asked "what does this place look like?". Commons (the image
+// library behind Wikipedia) holds the coordinates its photographers recorded
+// and answers a search around a point, nearest first. What is shown is the
+// newest few of the nearest: the search widens ring by ring until one ring
+// holds enough photos, and the most recently taken in that ring are kept.
+// A photo's position is where the camera stood, as its uploader stated it.
+
+const PHOTO_RINGS_M = [250, 1000, 5000, 10000];   // 10 km is the API's limit
+const PHOTO_COUNT = 4;
+// Older than this is not shown at all: a place can change past recognition
+// in a few years, and an empty answer misleads less than an old picture.
+const PHOTO_MAX_AGE_DAYS = 365;
+const PHOTO_MIMES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/tiff', 'image/gif']);
+
+const metresBetween = (lat1, lon1, lat2, lon2) => {
+  const r = Math.PI / 180;
+  const a = Math.sin((lat2 - lat1) * r / 2) ** 2
+    + Math.cos(lat1 * r) * Math.cos(lat2 * r) * Math.sin((lon2 - lon1) * r / 2) ** 2;
+  return 2 * 6371008 * Math.asin(Math.sqrt(a));
+};
+
+/** When a Commons photo was taken, if its metadata says so believably. */
+function photoTakenAt(raw) {
+  // Matched on the raw value: Commons often wraps the date as
+  // <time datetime="2024-05-04">4 May 2024</time>, and only digits are kept.
+  const m = /(\d{4})-(\d{2})-(\d{2})/.exec(String(raw || ''));
+  if (!m) return null;
+  const t = Date.parse(`${m[1]}-${m[2]}-${m[3]}T00:00:00Z`);
+  // Photography starts in 1826, and a date after tomorrow is a camera clock.
+  if (!Number.isFinite(t) || Number(m[1]) < 1826 || t > Date.now() + 86400e3) return null;
+  return `${m[1]}-${m[2]}-${m[3]}`;
+}
+
+/** Every geotagged Commons image around one grid cell, nearest first. */
+async function commonsPhotosNear(cell) {
+  const c = bboxCenter(cell);
+  return cachedPersistent(`photos:v2:${cell.key}`, RETAIN['places.photos'], async () => {
+    const pages = new Map();
+    let cont = {};
+    // The 500 nearest, not the 50: only recent photos are shown, and around
+    // a landmark the nearest few dozen are mostly years old. A long answer
+    // arrives in parts.
+    for (let i = 0; i < 8; i++) {
+      const d = await grab(`https://commons.wikimedia.org/w/api.php?${new URLSearchParams({
+        action: 'query', format: 'json', formatversion: '2',
+        generator: 'geosearch', ggsnamespace: '6', ggsprimary: 'all',
+        ggscoord: `${c.lat.toFixed(5)}|${c.lon.toFixed(5)}`,
+        ggsradius: String(PHOTO_RINGS_M.at(-1)), ggslimit: '500',
+        prop: 'coordinates|imageinfo', colimit: 'max', coprimary: 'all',
+        iiprop: 'url|timestamp|mime|extmetadata', iiurlwidth: '640',
+        iiextmetadatafilter: 'DateTimeOriginal|Artist|LicenseShortName|LicenseUrl',
+        ...cont,
+      })}`, {}, { label: 'Wikimedia Commons', timeoutMs: 20000 });
+      for (const p of d?.query?.pages || []) {
+        const prev = pages.get(p.title) || {};
+        pages.set(p.title, { ...prev, ...p, coordinates: p.coordinates || prev.coordinates, imageinfo: p.imageinfo || prev.imageinfo });
+      }
+      if (!d?.continue) break;
+      cont = d.continue;
+    }
+    const out = [];
+    for (const p of pages.values()) {
+      const ii = p.imageinfo?.[0];
+      const co = (p.coordinates || []).find((x) => Number.isFinite(x?.lat) && Number.isFinite(x?.lon));
+      if (!ii || !co || !PHOTO_MIMES.has(ii.mime)) continue;
+      const photo = safeUrl(ii.thumburl || ii.url, { httpsOnly: true });
+      if (!photo) continue;
+      const meta = ii.extmetadata || {};
+      const taken = photoTakenAt(meta.DateTimeOriginal?.value);
+      out.push({
+        title: clip(String(p.title || '').replace(/^File:/, '').replace(/\.[a-z0-9]{2,5}$/i, '').replace(/_/g, ' '), 120),
+        photo,
+        page: safeUrl(ii.descriptionurl),
+        lat: co.lat, lon: co.lon,
+        // The day it was taken when the file says; otherwise the upload day,
+        // which is the latest it can have been taken.
+        date: taken || String(ii.timestamp || '').slice(0, 10) || null,
+        dateKind: taken ? 'taken' : 'uploaded',
+        credit: clip(plainText(meta.Artist?.value), 120) || 'Unknown author',
+        license: clip(plainText(meta.LicenseShortName?.value), 60) || null,
+        licenseUrl: safeUrl(meta.LicenseUrl?.value),
+      });
+    }
+    return out;
+  });
+}
+
+async function nearbyPhotos({ lat, lon }) {
+  const la = Number(lat);
+  const lo = Number(lon);
+  if (lat == null || lon == null || lat === '' || lon === ''
+    || !Number.isFinite(la) || !Number.isFinite(lo) || Math.abs(la) > 90 || Math.abs(lo) > 180) {
+    throw new UpstreamError(400, 'lat and lon required');
+  }
+  // Searched from the middle of a fixed ~200 m cell, so every pin in the
+  // cell shares one stored answer; distances are then measured from the pin.
+  const cell = viewCell({ south: la, north: la, west: lo, east: lo }, 'photos');
+  // Judged by the day it was taken where the file says, else the upload
+  // day: a 2009 photograph uploaded last month is still a 2009 photograph.
+  const cutoff = new Date(Date.now() - PHOTO_MAX_AGE_DAYS * 86400e3).toISOString().slice(0, 10);
+  const all = (await commonsPhotosNear(cell))
+    .filter((p) => p.date && p.date >= cutoff)
+    .map((p) => ({ ...p, distanceM: Math.round(metresBetween(la, lo, p.lat, p.lon)) }));
+
+  let ring = PHOTO_RINGS_M.at(-1);
+  let pool = all;
+  for (const r of PHOTO_RINGS_M) {
+    const inside = all.filter((p) => p.distanceM <= r);
+    if (inside.length >= PHOTO_COUNT || r === PHOTO_RINGS_M.at(-1)) { ring = r; pool = inside; break; }
+  }
+  const photos = pool
+    .sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')) || a.distanceM - b.distanceM)
+    .slice(0, PHOTO_COUNT);
+  return { count: photos.length, withinM: ring, searchedM: PHOTO_RINGS_M.at(-1), maxAgeDays: PHOTO_MAX_AGE_DAYS, photos };
+}
+
+// ---------------------------------------------------------------------------
 // NASA GIBS — daily global satellite imagery, keyless WMTS
 //
 // Template: /wmts/epsg3857/best/{layer}/default/{time}/{matrixSet}/{z}/{y}/{x}.{ext}
@@ -5506,6 +5631,10 @@ const CREDENTIALS = [
   { name: 'CESIUM_ION_TOKEN', group: 'Maps', label: 'Cesium Ion token', url: 'https://ion.cesium.com/tokens',
     note: 'Terrain and aerial imagery. This one token is handed to the browser by design, so scope it read-only.',
     set: (v) => { CFG.cesiumIonToken = v; } },
+  { name: 'GOOGLE_MAPS_EMBED_KEY', group: 'Maps', label: 'Google Maps Embed key',
+    url: 'https://console.cloud.google.com/google/maps-apis/credentials',
+    note: 'Street View inside the detail panel. Handed to the browser by design, like the Ion token: restrict it to the Maps Embed API and to this site. Reload the page after changing it.',
+    set: (v) => { CFG.googleEmbedKey = v; } },
   { name: 'CARTO_API_KEY', group: 'Maps', label: 'CARTO key', url: 'https://carto.com/basemaps/apikey',
     note: 'Place and road labels.', set: (v) => { CFG.cartoKey = v; } },
   { name: 'GEE_PROJECT', group: 'Maps', label: 'Earth Engine project', secret: false,
@@ -5797,6 +5926,9 @@ async function handleSettings(req) {
   return saveSettings(await readJsonBody(req));
 }
 
+/** The Maps Embed key, if what is configured has the shape of one. */
+const streetViewKey = () => (/^[\w-]{20,80}$/.test(CFG.googleEmbedKey) ? CFG.googleEmbedKey : null);
+
 const ROUTES = {
   '/api/health': async () => ({
     ok: true,
@@ -5813,6 +5945,7 @@ const ROUTES = {
       openwebcamdb: CFG.owcdbKey ? 'configured' : 'missing OPENWEBCAMDB_API_KEY',
       alertcalifornia: 'open (wildfire PTZ cameras)',
       youtube: CFG.youtubeKey ? 'configured' : 'missing YOUTUBE_API_KEY',
+      streetView: streetViewKey() ? 'configured (embedded panorama)' : 'not set (link to Google Maps only)',
       cesiumIon: CFG.cesiumIonToken ? 'configured' : 'not set (OSM basemap only)',
       gdacs: 'open', eonet: 'open', usgs: 'open', nws: 'open',
       alpr: 'open (OpenStreetMap via Overpass)',
@@ -5862,6 +5995,10 @@ const ROUTES = {
 
   '/api/config': async () => ({
     cesiumIonToken: CFG.cesiumIonToken || null,
+    // The second browser-side key, also by design: Street View is an iframe
+    // Google serves, and the Maps Embed key is part of its address. Embed
+    // keys are made to be public and are locked down by referrer instead.
+    streetViewKey: streetViewKey(),
     // Only whether labels can be drawn; the CARTO key itself stays here.
     cartoLabels: !!CFG.cartoKey,
     // Tile hosts the browser should fetch through the disk cache.
@@ -5902,6 +6039,7 @@ const ROUTES = {
   '/api/geoip': () => geoip(),
   '/api/route': (q) => flightRoute({ callsign: q.get('callsign') }),
   '/api/aircraft': (q) => aircraftInfo({ icao24: q.get('icao24') }),
+  '/api/nearby-photos': (q) => nearbyPhotos({ lat: q.get('lat'), lon: q.get('lon') }),
   '/api/vessel-photo': (q) => vesselPhoto({ imo: q.get('imo'), mmsi: q.get('mmsi') }),
   '/api/weather': () => weather(),
   '/api/vessels': (q) => vessels({ bbox: q.get('bbox') }),
@@ -6546,6 +6684,7 @@ ${ACCESS_KEY ? `  ${C.yel}!${C.rst} Listening on ${CFG.host}, beyond this machin
   OpenWebcamDB ........ ${ok(!!CFG.owcdbKey)}
   ALERTCalifornia ..... ${C.grn}open${C.rst} (wildfire cams)
   YouTube geotags ..... ${ok(!!CFG.youtubeKey)}
+  Street View ......... ${streetViewKey() ? `${C.grn}embedded${C.rst}` : `${C.dim}link only (no GOOGLE_MAPS_EMBED_KEY)${C.rst}`}
   Cesium Ion .......... ${CFG.cesiumIonToken ? `${C.grn}terrain + buildings${C.rst}` : `${C.yel}OSM basemap only${C.rst}`}
 `);
 
@@ -6593,7 +6732,7 @@ module.exports = {
   boxContains, shodanIndex, findBoughtShodanBox, rememberShodanBox, serviceCategory, SHODAN_PRESETS, SHODAN_CELL_DEG,
   openSky, openSkyPollSec, openSkyRefillSec, noteOpenSkyHeaders, assertOpenSkyCredit, OPENSKY_FLOOR,
   SAT_GROUPS, fetchTle, readCachedTle, writeCachedTle, tleCachePath,
-  orbitalElements, SPACETRACK_GROUPS, celestrakHold, CREDENTIAL_RESETS,
+  nearbyPhotos, photoTakenAt, orbitalElements, SPACETRACK_GROUPS, celestrakHold, CREDENTIAL_RESETS,
   overpassGate, overpassQuery, mirrorFailure, OVERPASS_PRESETS, OVERPASS_ENDPOINTS,
   parseOverpassStatus, overpassDense,
   ais, aisIngest, aisConnect, aisBoxesFor, boxMovedEnough, shipTypeName,

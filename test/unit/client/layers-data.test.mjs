@@ -585,6 +585,52 @@ describe('YoutubeLayer', () => {
   });
 });
 
+describe('nearby photos in the detail panel', () => {
+  test('shows date, distance, author and licence, and links to the Commons page', () => {
+    const html = L.nearbyPhotosHtml({ withinM: 250, searchedM: 10000, photos: [
+      { title: 'Market', photo: 'https://upload.wikimedia.org/t.jpg', page: 'https://commons.wikimedia.org/wiki/File:M.jpg',
+        date: '2024-05-04', dateKind: 'taken', distanceM: 42, credit: 'T. Tester', license: 'CC BY 4.0', licenseUrl: 'https://creativecommons.org/licenses/by/4.0' },
+      { title: 'Up', photo: 'https://upload.wikimedia.org/u.jpg', date: '2023-03-03', dateKind: 'uploaded', distanceM: 1500, credit: 'U' },
+    ] });
+    assert.match(html, /2024-05-04 · 42 m away/);
+    assert.match(html, /uploaded 2023-03-03 · 1\.5 km away/);
+    assert.match(html, /href="https:\/\/commons\.wikimedia\.org\/wiki\/File:M\.jpg"/);
+    assert.match(html, /CC BY 4\.0<\/a>/);
+    assert.match(html, /2 newest photos from the past year within 250 m/);
+  });
+
+  test('hostile text and URLs come out inert; nothing found says so', () => {
+    const html = L.nearbyPhotosHtml({ withinM: 250, photos: [
+      { title: XSS, photo: 'https://upload.wikimedia.org/t.jpg', page: 'javascript:alert(1)', credit: XSS, license: XSS, licenseUrl: 'javascript:alert(1)', date: XSS, distanceM: 1 },
+      { title: 'http thumb', photo: 'http://insecure.example/t.jpg', distanceM: 1 },
+      { title: 'js thumb', photo: 'javascript:alert(1)', distanceM: 1 },
+    ] });
+    assertInert(html);
+    assert.ok(!html.includes('insecure.example'));
+    assert.equal((html.match(/<figure/g) || []).length, 1);
+    assert.match(L.nearbyPhotosHtml({ photos: [], searchedM: 10000 }), /No geotagged photos from the past year on Wikimedia Commons within 10 km/);
+  });
+});
+
+describe('Street View helpers', () => {
+  test('ground pins get a point; aircraft, satellites and bad coordinates do not', () => {
+    assert.deepEqual(L.groundPoint('alpr', { lat: 35, lon: -100 }), { lat: 35, lon: -100 });
+    assert.equal(L.groundPoint('flights', { lat: 35, lon: -100 }), null);
+    assert.equal(L.groundPoint('satellites', { lat: 35, lon: -100 }), null);
+    assert.equal(L.groundPoint('shodan', { lat: null, lon: 0 }), null);
+    assert.equal(L.groundPoint('shodan', { lat: 'x', lon: 0 }), null);
+    assert.equal(L.groundPoint('shodan', { lat: 95, lon: 0 }), null);
+  });
+
+  test('link needs no key; the embed address needs one that looks like a key', () => {
+    assert.equal(L.streetViewLink(35, -100.5), 'https://www.google.com/maps/@?api=1&map_action=pano&viewpoint=35.000000,-100.500000');
+    assert.equal(L.streetViewEmbedUrl('AIzaSyTestEmbedKey_0123456789-abcdefgh', 35, -100.5),
+      'https://www.google.com/maps/embed/v1/streetview?key=AIzaSyTestEmbedKey_0123456789-abcdefgh&location=35.000000,-100.500000');
+    assert.equal(L.streetViewEmbedUrl(null, 35, -100), null);
+    assert.equal(L.streetViewEmbedUrl('k"&location=1,1', 35, -100), null);
+  });
+});
+
 describe('VesselLayer', () => {
   test('draws vessels from the stream, honouring "moving only"', async () => {
     const { FakeWebSocket, positionReport, staticData } = require('../../helpers/fake-websocket.cjs');

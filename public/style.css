@@ -1018,3 +1018,19 @@ body.resizing-detail #detail { transition: none; }
   white-space: pre-line; max-height: 9em; overflow: auto;
   font-size: 12px; opacity: .85; margin: 6px 0;
 }
+
+/* Nearby photos: a two-by-two grid at the foot of the detail panel. */
+#detail .nearby-photos { margin-top: 14px; }
+#detail .np-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+#detail figure.np { margin: 0; min-width: 0; }
+#detail figure.np img {
+  display: block; width: 100%; aspect-ratio: 4 / 3; object-fit: cover;
+  border-radius: 3px; background: rgba(255, 255, 255, .05);
+}
+#detail figure.np figcaption { font-size: 10.5px; line-height: 1.35; opacity: .75; margin-top: 3px; overflow-wrap: anywhere; }
+#detail figure.np figcaption a { color: inherit; text-decoration: underline; }
+
+/* Street View: a load button and a link; the panorama fills the stage. */
+#detail .street-view { margin-top: 14px; }
+#detail .street-view .sv-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 6px 0; }
+#detail .street-view .cam-frame { min-height: 260px; }

@@ -74,7 +74,7 @@ All are optional. Anything unset stays switched off, just like an empty line in
 | Group | Variables |
 |---|---|
 | Access | `ACCESS_KEY`, `ALLOWED_HOSTS` |
-| Core | `SHODAN_API_KEY`, `CESIUM_ION_TOKEN`, `CARTO_API_KEY` |
+| Core | `SHODAN_API_KEY`, `CESIUM_ION_TOKEN`, `CARTO_API_KEY`, `GOOGLE_MAPS_EMBED_KEY` |
 | Flights | `OPENSKY_CLIENT_ID`, `OPENSKY_CLIENT_SECRET`, `OPENSKY_CREDIT_FLOOR` |
 | Satellites | `SPACETRACK_USER`, `SPACETRACK_PASSWORD` |
 | Webcams | `WINDY_API_KEY`, `OPENWEBCAMDB_API_KEY`, `FIVE_ELEVEN_KEYS` |

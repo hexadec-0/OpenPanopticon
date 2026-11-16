@@ -69,7 +69,7 @@ const BULK_LIMIT = MAX_INFLIGHT - 1;
 
 // Short lookups behind a click.
 const INTERACTIVE = new Set([
-  '/api/route', '/api/aircraft', '/api/vessel-photo', '/api/enrich', '/api/geocode',
+  '/api/route', '/api/aircraft', '/api/vessel-photo', '/api/nearby-photos', '/api/enrich', '/api/geocode',
   '/api/health', '/api/config', '/api/geoip',
 ]);
 // Time-critical polls. These are worthless late: an aircraft position that
@@ -3544,6 +3544,57 @@ export async function enrichHost(ip, slot) {
 
   const s = target();
   if (s) s.innerHTML = parts.join('');
+}
+
+/**
+ * The "Nearby photos" block of the detail panel: up to four Commons photos
+ * with the date, distance, author and licence that showing them requires.
+ */
+export function nearbyPhotosHtml(d) {
+  const photos = (d?.photos || []).filter((p) => safeUrl(p.photo, { httpsOnly: true }));
+  const km = (m) => (m >= 1000 ? `${(m / 1000).toFixed(m >= 10000 ? 0 : 1)} km` : `${Math.round(m)} m`);
+  if (!photos.length) {
+    return `<h4>Nearby photos</h4><p class="hint">No geotagged photos from the past year on Wikimedia Commons within ${esc(km(d?.searchedM || 10000))}. Older ones are not shown.</p>`;
+  }
+  const cells = photos.map((p) => {
+    const page = safeUrl(p.page);
+    const img = `<img src="${esc(safeUrl(p.photo, { httpsOnly: true }))}" alt="${esc(p.title || 'photo')}" loading="lazy" referrerpolicy="no-referrer" data-hide-on-error>`;
+    const lic = p.license
+      ? (safeUrl(p.licenseUrl)
+        ? `<a href="${esc(safeUrl(p.licenseUrl))}" target="_blank" rel="noopener noreferrer">${esc(p.license)}</a>`
+        : esc(p.license))
+      : null;
+    const when = p.date ? `${p.dateKind === 'taken' ? '' : 'uploaded '}${esc(p.date)}` : 'undated';
+    return `<figure class="np">
+        ${page ? `<a href="${esc(page)}" target="_blank" rel="noopener noreferrer" title="${esc(p.title || '')}">${img}</a>` : img}
+        <figcaption>${when} · ${esc(km(p.distanceM || 0))} away<br>${esc(p.credit || 'Unknown author')}${lic ? ` · ${lic}` : ''}</figcaption>
+      </figure>`;
+  }).join('');
+  return `<h4>Nearby photos</h4><div class="np-grid">${cells}</div>
+    <p class="hint">The ${photos.length === 1 ? 'only photo from the past year' : `${photos.length} newest photos from the past year`} within ${esc(km(d.withinM || 0))},
+    from Wikimedia Commons. Positions are where each uploader says the camera stood.</p>`;
+}
+
+/** Whether a pick has a fixed place on the ground worth looking at. */
+export function groundPoint(layerId, rec) {
+  if (layerId === 'flights' || layerId === 'satellites') return null;
+  const lat = Number(rec?.lat);
+  const lon = Number(rec?.lon);
+  if (rec?.lat == null || rec?.lon == null || !Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+  if (Math.abs(lat) > 90 || Math.abs(lon) > 180) return null;
+  return { lat, lon };
+}
+
+/** Google's own page for the panorama nearest a point. Needs no key. */
+export function streetViewLink(lat, lon) {
+  return `https://www.google.com/maps/@?api=1&map_action=pano&viewpoint=${lat.toFixed(6)},${lon.toFixed(6)}`;
+}
+
+/** The Maps Embed API address of that panorama, or null without a key. */
+export function streetViewEmbedUrl(key, lat, lon) {
+  if (!/^[\w-]{20,80}$/.test(String(key || ''))) return null;
+  return `https://www.google.com/maps/embed/v1/streetview?key=${encodeURIComponent(key)}`
+    + `&location=${lat.toFixed(6)},${lon.toFixed(6)}`;
 }
 
 export { api };
