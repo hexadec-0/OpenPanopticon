@@ -520,36 +520,6 @@ describe('Layer base class', () => {
     assert.equal(s.isCovered('1.1,2.1,2.9,3.9'), true);
     assert.equal(s.count, 2);
   });
-
-  test('Shodan asks for the view as it is, unpadded: padding bought cells out of sight', async () => {
-    const asked = [];
-    const s = new ShodanLayer(makeViewer());
-    s.setEnabled(true);
-    s.fetch = async (path, params) => {
-      asked.push(params.bbox);
-      return { query: '', total: 0, byCategory: {}, vulnerable: 0, cellDeg: 0.25, cells: 1, matches: [] };
-    };
-    await s.refresh({ bbox: '1.5,2.5,2.5,3.5' });
-    assert.deepEqual(asked.map((b) => b.split(',').map(Number)), [[1.5, 2.5, 2.5, 3.5]]);
-  });
-
-  test('Shodan with cells still owed: draws what came, claims no coverage, asks again', async () => {
-    const s = new ShodanLayer(makeViewer());
-    s.setEnabled(true);
-    s.fetch = async () => ({
-      query: '', total: 1, byCategory: { web: 1 }, vulnerable: 0, cellDeg: 0.25, queried: null,
-      cells: 4, missing: 2, bought: 2, partial: true, retryAfter: 2,
-      partialReason: '2 more cells in view, bought 2 at a time.',
-      matches: [{ ip: '1.2.3.4', port: 80, lat: 1, lon: 2, vulns: [], category: 'web' }],
-    });
-    await s.refresh({ bbox: '1.5,2.5,2.5,3.5', retry() {} });
-    assert.equal(s.count, 1, 'the cells in hand are drawn');
-    assert.equal(s.isCovered('1.5,2.5,2.5,3.5'), false);
-    assert.equal(s.status, 'error');
-    assert.match(s.error, /Partly loaded: 2 of 4 areas in\. 2 more cells in view, bought 2 at a time\. The rest follows in about 5s\./);
-    assert.ok(s.retryAt > Date.now(), 'the rest is booked');
-    s.resetBackoff();
-  });
 });
 
 describe('OSM layer fetches the view tile by tile', () => {

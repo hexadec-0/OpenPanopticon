@@ -55,7 +55,7 @@ describe('ShodanLayer', () => {
     await l.refresh(ctx());
     assert.equal(l.status, 'ok', l.error);
     assert.equal(l.count, 2);
-    assert.equal(l.total, 12, 'the view straddles four cells; their counts add up');
+    assert.equal(l.total, 3);
     assert.equal(l.vulnerable, 1);
     const colours = ents(l).map((e) => e.point.outlineColor.css).sort();
     assert.deepEqual(colours, ['#4cc9f0', '#ff2d55'], 'web blue, ICS red');

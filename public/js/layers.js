@@ -196,10 +196,10 @@ const RETRY_LADDER_SEC = [30, 60, 90, 120, 300, 3600];
  * Thrown after drawing so the layer neither claims the ground as covered nor
  * waits for the next camera move to ask for the remainder.
  */
-function partialAnswer(d, why = 'Overpass is busy, so the rest follows') {
+function partialAnswer(d) {
   const secs = Math.max(5, Number(d.retryAfter) || 30);
   const e = new Error(`Partly loaded: ${d.cells - d.missing} of ${d.cells} areas in. `
-    + `${why} in about ${secs}s.`);
+    + `Overpass is busy, so the rest follows in about ${secs}s.`);
   e.status = 429;
   e.retryAfter = secs;
   e.partial = true;
@@ -829,10 +829,7 @@ export class ShodanLayer extends Layer {
     super(viewer, 'shodan', 'Shodan exposure');
     // Every miss spends a query credit. Held for 72 hours (TTL.static), refreshed on demand.
     this.coverageTtlMs = INVENTORY_COVERAGE_MS;
-    // No padding: the server buys whole 0.25° cells, one credit each, so
-    // padding the view only bought cells nobody was looking at. The cell
-    // edges give small pans their margin.
-    this.padFactor = 0;
+    this.padFactor = 0.6;
     this.accumulate = true;
     // No type filter and no query box: the layer always asks for everything
     // Shodan has indexed in view, and reading it is done by colour instead.
@@ -850,13 +847,13 @@ export class ShodanLayer extends Layer {
   async load({ bbox }) {
     const box = this.padBbox(bbox);
     this.lastFetchedBbox = box;
-    // Replaced below with the whole cells the server holds for this view,
-    // which are wider than it and cover every zoom level inside them.
+    // Replaced below with the cell the server actually charged for, which is
+    // wider than this and covers every zoom level inside it.
     const data = await this.fetch('/api/shodan', { bbox: box, preset: 'all' });
-    this.cellDeg = data.cellDeg || null;
     if (data.queried) {
       const q = data.queried;
       this.lastFetchedBbox = [q.south, q.west, q.north, q.east].join(',');
+      this.cellDeg = data.cellDeg || null;
     }
     this.lastQuery = data.query;
     this.total = data.total;
@@ -867,12 +864,6 @@ export class ShodanLayer extends Layer {
     for (const m of data.matches) m.id = `${m.ip}:${m.port}`;
     this.remember(data.matches);
     this.redraw();
-    // Some cells still to buy (a wide view, or a refusal part-way): draw what
-    // came, claim no coverage, and come back for the rest.
-    if (data.partial) {
-      throw partialAnswer(data, data.partialReason
-        ? `${data.partialReason} The rest follows` : 'The rest follows');
-    }
   }
 
   draw(matches) {

@@ -68,7 +68,7 @@ e2e('layers and the detail panel', () => {
     await page.select(`${row('shodan')} select.ctl`, 'risk');
     const risk = await page.$$eval(`${row('shodan')} .legend-item`, (ns) => ns.map((n) => n.textContent));
     assert.deepEqual(risk, ['known CVEs 1', 'no known CVEs 1']);
-    assert.match(await text$(page, `${row('shodan')} .note`), /About \d+ matches in view; the first page of each cell is drawn/);
+    assert.match(await text$(page, `${row('shodan')} .note`), /3 total matches in view; the first page is drawn/);
     // Switching the layer on reads the credit count without a full refresh.
     await page.waitForFunction(() => /100 query credits left/.test(document.querySelector('.layer[data-layer="shodan"] .layer-count').title));
   });

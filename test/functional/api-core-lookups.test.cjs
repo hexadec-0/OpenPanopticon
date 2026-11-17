@@ -471,7 +471,6 @@ describe('/api/geocode (Nominatim)', () => {
 describe('/api/flush', () => {
   test('empties memory and disk and says how much', async () => {
     await s.api('/api/shodan', { bbox: BBOX });
-    const bought = s.mock.callsTo('/shodan/host/search').length;   // one per cell in view
     await s.api('/api/geocode', { q: 'Testville' });
     const d = (await s.api('/api/flush', {}, { method: 'POST' })).json();
     assert.equal(d.ok, true);
@@ -479,7 +478,7 @@ describe('/api/flush', () => {
     assert.ok(d.diskEntries >= 2);
     assert.equal(s.mod.cache.size, 0);
     await s.api('/api/shodan', { bbox: BBOX });
-    assert.equal(s.mock.callsTo('/shodan/host/search').length, 2 * bought, 'refetched after the flush');
+    assert.equal(s.mock.callsTo('/shodan/host/search').length, 2, 'refetched after the flush');
   });
 });
 

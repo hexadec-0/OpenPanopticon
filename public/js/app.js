@@ -1420,7 +1420,7 @@ class OpenPanopticon {
         }
       }
       note.textContent = l.total > l.count
-        ? `About ${l.total.toLocaleString()} matches in view; the first page of each cell is drawn.`
+        ? `${l.total.toLocaleString()} total matches in view; the first page is drawn.`
         : 'Every host Shodan has indexed in this view.';
     };
     this.renderShodanLegend = renderLegend;
@@ -2449,11 +2449,11 @@ class OpenPanopticon {
               : '\nElements fetched fresh from CelesTrak.');
         } else if (id === 'shodan') {
           const bits = [layer.total > layer.count
-            ? `About ${layer.total.toLocaleString()} matches; first page of each cell shown`
+            ? `${layer.total.toLocaleString()} total matches; first page shown`
             : `${layer.count.toLocaleString()} hosts`];
           if (layer.cellDeg) {
-            bits.push(`Bought one ${layer.cellDeg}° cell (~${
-              Math.round(layer.cellDeg * 111)}km) at a time, one query credit each, never twice`);
+            bits.push(`One query covers a ${layer.cellDeg}° cell (~${
+              Math.round(layer.cellDeg * 111)}km) and serves every zoom inside it`);
           }
           if (this.shodanCredits != null) {
             bits.push(`${this.shodanCredits.toLocaleString()} query credits left`);
