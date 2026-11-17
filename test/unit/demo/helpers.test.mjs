@@ -44,6 +44,17 @@ describe('demo capture helpers', () => {
     assert.deepEqual(acc.meta.problems, { a: 'x', b: 'y' });
   });
 
+  test('mergeInto never stores a "rest follows shortly" flag in the snapshot', () => {
+    const acc = mergeInto({}, 'overpass', {
+      count: 1, partial: true, cells: 4, missing: 2, retryAfter: 24, partialReason: 'cooling down',
+      features: [{ id: 'node/1' }],
+    });
+    for (const k of ['partial', 'cells', 'missing', 'retryAfter', 'partialReason']) {
+      assert.equal(k in acc.meta, false, k);
+    }
+    assert.equal(acc.meta.count, 1);
+  });
+
   test('buildings: heights from tags, levels, or a default; shapes under 4 points dropped', () => {
     const sq = (h) => [[0, 0], [0, 1e-4], [1e-4, 1e-4], [1e-4, 0], [0, 0]].map(([lat, lon]) => ({ lat, lon })).slice(0, h);
     const raw = { elements: [

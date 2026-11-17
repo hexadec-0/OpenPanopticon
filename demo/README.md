@@ -11,8 +11,10 @@ npm run demo:build       # seconds; re-run after any change to the app
 ```
 
 The capture runs its own copy of `server.js` on a private port, using your
-keys and the `providers/` cache, and writes everything into `docs/`. It
-resumes if interrupted; delete `docs/data` for a fresh snapshot.
+keys, and writes everything into `docs/`. Each run asks for the layer data
+afresh and downloads every camera still again; map tiles already on disk are
+kept. If a capture is interrupted, `npm run demo:capture -- --resume` picks
+up where it stopped, reusing the server's cache and the stills on disk.
 
 - **Capture in New York daylight** (08:00 to 17:00 there). The demo's clock
   and the sun lighting are fixed to the moment of capture.

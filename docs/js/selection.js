@@ -140,7 +140,7 @@ export class SelectionMarker {
         // terrain, while JS-side position maths still reports a perfect
         // match. Disabling the depth test is what keeps it on top, and it
         // does so without moving the ring anywhere.
-        disableDepthTestDistance: Number.POSITIVE_INFINITY,
+        disableDepthTestDistance: 50_000,   // as DEPTH_FREE_M in layers.js: on top near the camera, hidden behind the planet
         // Set per selection to match the pin being ringed — see select().
         heightReference: Cesium.HeightReference.NONE,
       },

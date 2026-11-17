@@ -122,6 +122,35 @@ e2e('static demo', () => {
     assert.equal(st.net, true);
   });
 
+  test('the whole snapshot loads once: moving the camera fetches nothing more', async () => {
+    const { page } = app;
+    assert.equal(await page.$eval('#hud-gate', (n) => n.textContent), 'SNAPSHOT');
+    assert.equal(await page.$eval('#hud-gate', (n) => n.classList.contains('demo-off')), true);
+    const before = site.seen.filter((p) => /\/data\/api\//.test(p)).length;
+    const asked = await page.evaluate(async () => {
+      const seen = [];
+      const f = window.fetch;
+      window.fetch = (u, i) => { seen.push(String(u?.url || u)); return f(u, i); };
+      for (const h of [500_000, 40_000]) {
+        WV.viewer.camera.setView({ destination: Cesium.Cartesian3.fromDegrees(-73.2, 41.1, h) });
+        WV.viewer.camera.moveEnd.raiseEvent();
+        await new Promise((r) => setTimeout(r, 1500));
+      }
+      window.fetch = f;
+      return seen.filter((u) => u.includes('/api/'));
+    });
+    assert.deepEqual(asked, [], 'no API calls after a camera move');
+    assert.equal(site.seen.filter((p) => /\/data\/api\//.test(p)).length, before);
+  });
+
+  test('opens with ships on and the Sentinel-2 mosaic as the base map', async () => {
+    const { page } = app;
+    assert.equal(await page.evaluate(() => WV.layers.vessels.enabled), true);
+    await page.waitForFunction(() => WV.basemap.provider === 's2cloudless'
+      && /data\/tiles\/s2cloudless\//.test(WV.viewer.imageryLayers.get(0).imageryProvider.url || ''), { timeout: 20_000 });
+    assert.equal(await page.$eval('#bm-provider', (n) => n.value), 's2cloudless');
+  });
+
   test('saved targets and the reset button are not shown', async () => {
     const { page } = app;
     const hidden = (sel) => page.$eval(sel, (n) => getComputedStyle(n).display === 'none'

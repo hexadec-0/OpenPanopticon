@@ -64,10 +64,15 @@
     // appends {z}/{x}/{y}.png to this.
     osmTiles: M.osm ? { url: site('data/tiles/osm/'), maxLevel: M.osm.maxLevel ?? 15 } : null,
     defaultLayers: {
-      flights: true, events: true, shodan: true, alpr: true, webcams: true, overpass: true, netinfra: true,
+      flights: true, vessels: true, events: true, shodan: true, alpr: true, webcams: true, overpass: true, netinfra: true,
     },
+    // Opens on the captured satellite mosaic when there is one.
+    defaultBasemap: M.cloudless ? 's2cloudless' : null,
     overpassAllClasses: true,
-    lockedLayers: { satellites: 'Not part of the demo.' },
+    // YouTube is never captured: its API terms do not allow keeping results
+    // indefinitely, which a published snapshot would do. Locking it here also
+    // keeps it from appearing available when the capture ran with a key.
+    lockedLayers: { satellites: 'Not part of the demo.', youtube: 'Not part of the demo.' },
   };
 
   /* ---------------------------------------------------------------- */
@@ -265,7 +270,10 @@
     const b = parseBbox(q.get('bbox'));
     if (!b) return json(400, { error: 'bbox required as south,west,north,east' });
     const items = (data.items || []).filter((it) => inside(it, b));
-    return json(200, spec.shape(items, data.meta || {}, q, b));
+    // A snapshot taken while Overpass was rate limiting may still carry the
+    // "rest follows shortly" flags; nothing more will ever arrive here.
+    const { partial, cells, missing, retryAfter, partialReason, ...meta } = data.meta || {};
+    return json(200, spec.shape(items, meta, q, b));
   }
 
   /* ---------------------------------------------------------------- */
@@ -441,7 +449,7 @@
   /* ---------------------------------------------------------------- */
 
   const OFF = [
-    '#flush-cache', '#refresh-now', '#reset-settings',
+    '#flush-cache', '#refresh-now', '#reset-settings', '#hud-gate', '#auto-toggle',
     '#he-geolocate', '#he-here', '#he-save', '#he-clear',
     '#im-prev', '#im-next', '#im-date', '#bm-from', '#bm-to', '#bm-cloud', '#bm-clearest',
   ].join(',');

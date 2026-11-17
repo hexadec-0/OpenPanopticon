@@ -32,6 +32,8 @@ const API_TIMEOUTS = {
   '/api/alpr': 180000,
   // Fan out across many upstreams at 25-30s each.
   '/api/webcams': 90000,
+  // Up to three search pages, then the video lookups, one after another.
+  '/api/youtube': 60000,
   '/api/events': 90000,
   '/api/netinfra': 90000,
   '/api/traffic': 90000,
@@ -67,7 +69,7 @@ const BULK_LIMIT = MAX_INFLIGHT - 1;
 
 // Short lookups behind a click.
 const INTERACTIVE = new Set([
-  '/api/route', '/api/aircraft', '/api/enrich', '/api/geocode',
+  '/api/route', '/api/aircraft', '/api/vessel-photo', '/api/nearby-photos', '/api/enrich', '/api/geocode',
   '/api/health', '/api/config', '/api/geoip',
 ]);
 // Time-critical polls. These are worthless late: an aircraft position that
@@ -138,16 +140,26 @@ const DR_MAX_SEC = 45;
 /**
  * How long a trail segment stays on screen, in milliseconds.
  *
- * Capped by age rather than point count: at a 7-second poll, 40 points is most
- * of ten minutes of history, and with the aircraft box snapped to a whole
- * degree the globe carries a few hundred contacts. Two minutes of track is
- * enough to read a heading and a turn, and it bounds the line to the distance
- * an aircraft covers in that time rather than to a number of fixes.
+ * Capped by age rather than point count, and with the aircraft box snapped to
+ * a whole degree the globe carries a few hundred contacts. Four minutes of
+ * track shows a heading, a turn and most of an approach, and it bounds the
+ * line to the distance an aircraft covers in that time rather than to a
+ * number of fixes.
+ *
+ * The default only: at boot the flight layer takes aircraft.trails from the
+ * server's cache.conf (see app.js, cfg.retention.flightTrails).
  */
-const TRAIL_MAX_AGE_MS = 120_000;
+const TRAIL_MAX_AGE_MS = 240_000;
 
-/** A hard ceiling on points per contact, whatever the poll rate does. */
-const TRAIL_MAX_POINTS = 40;
+/**
+ * A hard ceiling on points per contact, whatever the poll rate and the
+ * configured age: a trail set to hours must not grow without bound across a
+ * few hundred aircraft.
+ */
+const TRAIL_MAX_POINTS = 240;
+
+/** The fastest the feed is polled, for sizing a trail's point budget. */
+const TRAIL_MIN_POLL_MS = 5000;
 
 /** Shared empty positions array, so a contact with no history allocates none. */
 const EMPTY_TRAIL = Object.freeze([]);
@@ -164,10 +176,41 @@ const EMPTY_TRAIL = Object.freeze([]);
  * The last step repeats, so a persistent failure settles at one attempt an
  * hour — often enough to notice a recovery, rare enough to cost nothing.
  */
+/**
+ * How close to the camera a marker skips the depth test.
+ *
+ * Markers skip it so they stay visible over buildings and hills up close.
+ * At an infinite distance they also skipped the one depth test that hides
+ * things behind the planet, so flying to the other side of the world showed
+ * the pins left behind through the Earth. Ground hidden by the curve of the
+ * Earth is always beyond the horizon, about 600 km from a camera 30 km up
+ * and 110 km from one at 1 km, so 50 km keeps every marker near the camera
+ * on top and leaves everything farther to be hidden by the globe.
+ */
+export const DEPTH_FREE_M = 50_000;
+
 const RETRY_LADDER_SEC = [30, 60, 90, 120, 300, 3600];
 
 /**
+ * An OSM answer that came back in part: drawn already, and the rest is owed.
+ * Thrown after drawing so the layer neither claims the ground as covered nor
+ * waits for the next camera move to ask for the remainder.
+ */
+function partialAnswer(d) {
+  const secs = Math.max(5, Number(d.retryAfter) || 30);
+  const e = new Error(`Partly loaded: ${d.cells - d.missing} of ${d.cells} areas in. `
+    + `Overpass is busy, so the rest follows in about ${secs}s.`);
+  e.status = 429;
+  e.retryAfter = secs;
+  e.partial = true;
+  return e;
+}
+
+/**
  * How long the browser treats an area as already fetched.
+ *
+ * Defaults only: at boot each layer takes its figure from the server's
+ * cache.conf (see app.js, cfg.retention), so the two stay in step.
  *
  * Paired with the server's retention policy: INVENTORY_COVERAGE_MS matches
  * TTL.static there, so a layer that cannot have changed is not even asked
@@ -228,6 +271,17 @@ const api = async (path, params, {
   }
 };
 
+// Images in detail panels that fail to load are hidden rather than left as a
+// broken-image box. One capturing listener instead of inline onerror
+// attributes, which the page's Content-Security-Policy refuses to run.
+// (error does not bubble, so this listens in the capture phase.)
+if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+  document.addEventListener('error', (e) => {
+    const t = e.target;
+    if (t && t.tagName === 'IMG' && t.hasAttribute('data-hide-on-error')) t.style.display = 'none';
+  }, true);
+}
+
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g,
   (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
@@ -256,6 +310,67 @@ const rows = (pairs) => pairs
 /* ================================================================== */
 /* Base                                                                */
 /* ================================================================== */
+
+/* ------------------------------------------------------------------ */
+/* Ground heights                                                      */
+/*                                                                     */
+/* Markers used to be drawn with HeightReference.CLAMP_TO_GROUND, which */
+/* clamps to whatever terrain tile happens to be loaded under the point.*/
+/* Two things went wrong with that:                                     */
+/*                                                                     */
+/*  - Away from the camera only coarse tiles are loaded, and Cesium's   */
+/*    height lookup there lands on tile skirts — the curtains that hide */
+/*    seams between tiles, kilometres deep at coarse levels. Markers     */
+/*    sat ~7 km underground and, drawn through terrain on purpose, were */
+/*    seen through the ground below the horizon.                        */
+/*  - Nearer in, the loaded level is often still tens of metres off the */
+/*    real ground. In a tilted view that height error is parallax: the  */
+/*    pin draws away from the field-of-view wedge, which is draped onto */
+/*    the terrain itself and so is always in the right place.           */
+/*                                                                     */
+/* So each marker's ground is asked for once, from the most detailed    */
+/* terrain, and the marker is placed at that absolute height. Heights   */
+/* are kept for the session, so a redraw costs nothing. With no terrain */
+/* (the plain ellipsoid) clamping is exact and is left alone.           */
+/* ------------------------------------------------------------------ */
+
+const groundHeights = new Map();     // "lat,lon" (1e-5 deg) -> metres
+const groundInflight = new Map();    // same key -> Promise
+const GROUND_CACHE_MAX = 50_000;
+const GROUND_LIFT_M = 0.5;           // just clear of the surface, no z-fighting
+
+const groundKey = (c) => `${(c.latitude * 180 / Math.PI).toFixed(5)},${(c.longitude * 180 / Math.PI).toFixed(5)}`;
+
+function realTerrain(viewer) {
+  const tp = viewer?.scene?.terrainProvider;
+  if (!tp || typeof Cesium.sampleTerrainMostDetailed !== 'function') return null;
+  if (Cesium.EllipsoidTerrainProvider && tp instanceof Cesium.EllipsoidTerrainProvider) return null;
+  return tp.availability ? tp : null;
+}
+
+/** Heights for some cartographics, fetched once each and shared by every layer. */
+function groundHeightsFor(tp, items) {
+  const fresh = [];
+  for (const it of items) {
+    if (groundHeights.has(it.key) || groundInflight.has(it.key)) continue;
+    if (fresh.some((f) => f.key === it.key)) continue;
+    fresh.push(it);
+  }
+  if (fresh.length) {
+    const batch = Cesium.sampleTerrainMostDetailed(tp,
+      fresh.map((f) => Cesium.Cartographic.fromRadians(f.c.longitude, f.c.latitude, 0)))
+      .then((out) => {
+        out.forEach((c, i) => {
+          if (Number.isFinite(c?.height)) groundHeights.set(fresh[i].key, c.height);
+        });
+        while (groundHeights.size > GROUND_CACHE_MAX) groundHeights.delete(groundHeights.keys().next().value);
+      })
+      .catch((e) => console.warn('terrain heights unavailable; markers stay clamped', e))
+      .finally(() => { for (const f of fresh) groundInflight.delete(f.key); });
+    for (const f of fresh) groundInflight.set(f.key, batch);
+  }
+  return Promise.all([...new Set(items.map((it) => groundInflight.get(it.key)).filter(Boolean))]);
+}
 
 class Layer {
   constructor(viewer, id, label) {
@@ -310,7 +425,7 @@ class Layer {
     if (!on) {
       this.status = 'idle';
       // Nothing should fire for a layer that has been switched off.
-      clearTimeout(this._retryTimer);
+      clearTimeout(this._retryTimer); this._retryTimer = null;
     } else {
       // Switching a layer back on is a request to try it, not to resume a
       // backoff from an hour ago.
@@ -358,7 +473,14 @@ class Layer {
       // Evict least-recently-seen first, so the area you're working in stays.
       const byAge = [...this.store.entries()].sort((a, b) => a[1].seen - b[1].seen);
       const excess = this.store.size - this.cacheCap;
-      for (let i = 0; i < excess; i++) this.store.delete(byAge[i][0]);
+      const evicted = [];
+      for (let i = 0; i < excess; i++) {
+        evicted.push(byAge[i][1].rec);
+        this.store.delete(byAge[i][0]);
+      }
+      // Ground that has lost features is no longer fully held, so a layer
+      // that tracks coverage finely can give it up and fetch it again.
+      this.onEvict?.(evicted);
     }
   }
 
@@ -385,6 +507,47 @@ class Layer {
     if (typeof this.draw !== 'function') return;
     this.clear();
     this.count = this.draw(this.records()) || 0;
+    this.settleOnGround();
+  }
+
+  /**
+   * Move every ground-clamped marker this layer drew onto the true ground
+   * height (see "Ground heights" above). Markers whose height is not known
+   * yet stay clamped until it arrives, then move.
+   */
+  settleOnGround() {
+    const tp = realTerrain(this.viewer);
+    if (!tp) return;
+    const CLAMP = Cesium.HeightReference.CLAMP_TO_GROUND;
+    const t = this.viewer.clock?.currentTime;
+    const pending = [];
+    for (const ent of this.source.entities.values) {
+      const gfx = [ent.billboard, ent.point, ent.label]
+        .filter((g) => g && (g.heightReference?.getValue?.(t) ?? g.heightReference) === CLAMP);
+      if (!gfx.length) continue;
+      const pos = ent.position?.getValue?.(t);
+      if (!pos) continue;
+      const c = Cesium.Cartographic.fromCartesian(pos);
+      if (!c) continue;
+      const key = groundKey(c);
+      if (groundHeights.has(key)) this.placeOnGround(ent, c, groundHeights.get(key), gfx);
+      else pending.push({ ent, c, key, gfx });
+    }
+    if (!pending.length) return;
+    groundHeightsFor(tp, pending).then(() => {
+      let moved = 0;
+      for (const p of pending) {
+        if (!groundHeights.has(p.key) || !this.source.entities.contains(p.ent)) continue;
+        this.placeOnGround(p.ent, p.c, groundHeights.get(p.key), p.gfx);
+        moved++;
+      }
+      if (moved) this.viewer.scene?.requestRender?.();
+    });
+  }
+
+  placeOnGround(ent, c, h, gfx) {
+    ent.position = Cesium.Cartesian3.fromRadians(c.longitude, c.latitude, h + GROUND_LIFT_M);
+    for (const g of gfx) g.heightReference = Cesium.HeightReference.NONE;
   }
 
   /**
@@ -413,7 +576,7 @@ class Layer {
     (this.covered ||= []).push({
       south: p[0], west: p[1], north: p[2], east: p[3], at: Date.now(),
     });
-    if (this.covered.length > 40) this.covered.shift();
+    while (this.covered.length > (this.coverMax || 40)) this.covered.shift();
   }
 
   /** Fetch a little wider than the view so small pans stay inside cover. */
@@ -437,15 +600,21 @@ class Layer {
    * alone so descending does not refetch what is already held.
    */
   async holdForAltitude() {
-    clearTimeout(this._retryTimer);
-    if (this.enabled) {
+    clearTimeout(this._retryTimer); this._retryTimer = null;
+    // A request already on its way is not held: it will land and draw, and
+    // calling it "held" left the label stuck on "descend to query" after the
+    // camera had come back down, until that answer arrived.
+    if (this.enabled && !this._inFlight) {
       this.status = 'held';
-      this.error = null;
+      // Keep the reason for a backoff that is still running: coming back
+      // down inside it, that is what the layer will be waiting on.
+      if (!this.retryAt) this.error = null;
     }
   }
 
   async refresh(ctx, { isRetry = false, force = false } = {}) {
     if (!this.enabled) return;
+    this._viewBbox = ctx.bbox;   // where the camera is now, for _doRefresh
 
     // One refresh at a time, per layer.
     //
@@ -454,11 +623,45 @@ class Layer {
     // refresh may still be in flight when the next is due. Joining the one
     // already running means the duplicate never reaches the queue, let alone
     // the network, and two near-identical answers never race.
-    if (this._inFlight && !force) return this._inFlight;
+    //
+    // Joining is only right for the same view, though. Pan away and back
+    // while a slow query for the other place is still running, and the view
+    // you came back to waited on that query — showing "loading" for ground
+    // already in hand — and a new view was never asked for at all once it
+    // finished, until the camera moved again.
+    if (this._inFlight && !force) {
+      // Ground already fetched needs no network: draw it now.
+      if (this.accumulate && ctx.bbox && this.isCovered(ctx.bbox)) {
+        this._next = null;
+        this.skipped = (this.skipped || 0) + 1;
+        this.fromCache = true;
+        this.redraw();
+        this.status = 'ok';
+        this.error = null;
+        ctx.onStatus?.();
+        return undefined;
+      }
+      if (this.status === 'held') {
+        this.status = 'loading';
+        this.error = null;
+        ctx.onStatus?.();
+      }
+      // Somewhere new: ask for it as soon as the running query is done. Only
+      // the latest view is kept; the ones panned through on the way are not.
+      if (ctx.bbox && ctx.bbox !== this._inFlightBbox) this._next = ctx;
+      return this._inFlight;
+    }
 
     const run = this._doRefresh(ctx, { isRetry, force });
     this._inFlight = run;
-    try { return await run; } finally { this._inFlight = null; }
+    this._inFlightBbox = ctx.bbox;
+    try { return await run; } finally {
+      this._inFlight = null;
+      this._inFlightBbox = null;
+      const next = this._next;
+      this._next = null;
+      if (next && this.enabled) this.refresh(next).catch?.(() => {});
+    }
   }
 
   /**
@@ -474,7 +677,7 @@ class Layer {
   }
 
   async _doRefresh(ctx, { isRetry = false, force = false } = {}) {
-    clearTimeout(this._retryTimer);
+    clearTimeout(this._retryTimer); this._retryTimer = null;
     this._forced = !!force;
     // SYNC means "try now": the ladder starts again rather than resuming at
     // the hour-long step it had crawled to.
@@ -497,6 +700,16 @@ class Layer {
     // so being told "too many requests" was answered with more requests.
     if (this.retryAt && Date.now() < this.retryAt && !force && !isRetry) {
       this.skipped = (this.skipped || 0) + 1;
+      // Coming back down from an altitude hold in the middle of a backoff.
+      // The hold cancelled the retry timer and left the status at "held", so
+      // the layer kept saying "descend to query" after you had, and nothing
+      // was booked to bring it back. Say what it is actually waiting for,
+      // and book the retry again.
+      if (this.status === 'held') {
+        this.status = 'error';
+        this.error = this.error || 'Waiting out an earlier refusal from the upstream.';
+      }
+      if (!this._retryTimer) this.armRetry(ctx, this.retryAt - Date.now());
       ctx.onStatus?.();
       return;
     }
@@ -513,6 +726,7 @@ class Layer {
     }
 
     this.status = 'loading';
+    this.loadingSince = Date.now();
     this.error = null;
     ctx.onStatus?.();
     try {
@@ -522,7 +736,8 @@ class Layer {
       // outward to a whole cell, so the answer covers more ground than was
       // asked for. Recording the request instead threw that away and made
       // the next small pan refetch ground already in hand.
-      if (this.accumulate && ctx.bbox) {
+      // `false` means load() recorded coverage itself, piece by piece.
+      if (this.accumulate && ctx.bbox && this.coveredBbox !== false) {
         this.markCovered(this.coveredBbox || this.lastFetchedBbox || ctx.bbox);
       }
       this.status = 'ok';
@@ -531,9 +746,18 @@ class Layer {
       this.retryInSec = null;
       this.failures = 0;
     } catch (e) {
-      this.status = 'error';
-      this.error = e.message;
-      this.scheduleRetry(e, ctx);
+      if (this.accumulate && this._viewBbox && this._viewBbox !== ctx.bbox
+          && this.isCovered(this._viewBbox)) {
+        // The camera has since gone back to ground already held. This
+        // failure is about a place nobody is looking at: don't paint the
+        // view in front of you as failed, or book a retry for elsewhere.
+        this.status = 'ok';
+        this.error = null;
+      } else {
+        this.status = 'error';
+        this.error = e.message;
+        this.scheduleRetry(e, ctx);
+      }
     }
     ctx.onStatus?.();
   }
@@ -550,14 +774,33 @@ class Layer {
    * not a retry, it is ignoring the answer.
    */
   scheduleRetry(err, ctx) {
-    clearTimeout(this._retryTimer);
-    const step = RETRY_LADDER_SEC[Math.min(this.failures, RETRY_LADDER_SEC.length - 1)];
-    this.failures += 1;
-    const wait = Math.max(step, Number(err?.retryAfter) || 0);
+    clearTimeout(this._retryTimer); this._retryTimer = null;
+    const told = Number(err?.retryAfter) || 0;
+    let wait;
+    if (err?.status === 429 && told > 0) {
+      // Told exactly when to come back, by our own server (Overpass's
+      // cooldown) or the upstream behind it. Climbing the ladder on top of
+      // that turned a few minutes of cooldown into an hour of nothing after
+      // five refusals in a row, which a busy Overpass easily produces. A few
+      // seconds of spread so two layers do not come back on the same tick.
+      this.failures = Math.min(this.failures + 1, 3);
+      wait = told + Math.floor(Math.random() * 5);
+    } else {
+      const step = RETRY_LADDER_SEC[Math.min(this.failures, RETRY_LADDER_SEC.length - 1)];
+      this.failures += 1;
+      wait = Math.max(step, told);
+    }
     this.retryInSec = wait;
     this.retryAt = Date.now() + wait * 1000;
 
+    this.armRetry(ctx, wait * 1000);
+  }
+
+  /** Book the next attempt `ms` from now, replacing any already booked. */
+  armRetry(ctx, ms) {
+    clearTimeout(this._retryTimer); this._retryTimer = null;
     this._retryTimer = setTimeout(() => {
+      this._retryTimer = null;
       if (!this.enabled) return;
       // Ask the app to refetch rather than replaying the captured context.
       // An hour into a backoff the camera is somewhere else, and the stale
@@ -565,12 +808,12 @@ class Layer {
       // gate, which only the caller knows about.
       if (ctx.retry) ctx.retry();
       else this.refresh(ctx, { isRetry: true });
-    }, wait * 1000 + 500);
+    }, Math.max(0, ms) + 500);
   }
 
   /** A deliberate act starts the ladder over. */
   resetBackoff() {
-    clearTimeout(this._retryTimer);
+    clearTimeout(this._retryTimer); this._retryTimer = null;
     this.failures = 0;
     this.retryAt = null;
     this.retryInSec = null;
@@ -653,7 +896,7 @@ export class ShodanLayer extends Layer {
           color: color.withAlpha(0.85),
           outlineColor: color,
           outlineWidth: risky ? 2 : 1,
-          disableDepthTestDistance: Number.POSITIVE_INFINITY,
+          disableDepthTestDistance: DEPTH_FREE_M,
           heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
           scaleByDistance: new Cesium.NearFarScalar(1e3, 1.6, 6e5, 0.5),
         },
@@ -727,6 +970,7 @@ export class FlightLayer extends Layer {
     this.showLabels = true;
     this.showTrails = true;
     this.trails = new Map();   // icao24 -> { pos: Cartesian3[], at: number[] }
+    this.trailMaxAgeMs = TRAIL_MAX_AGE_MS;   // aircraft.trails in cache.conf
     // Dead-reckoning anchors: icao24 -> the last reported fix plus the motion
     // to carry it forward with. See deadReckon().
     this.dr = new Map();
@@ -780,10 +1024,10 @@ export class FlightLayer extends Layer {
     if (!t || !t.pos.length) return EMPTY_TRAIL;
 
     // Trimmed here rather than at poll time: this runs every frame, so a
-    // segment disappears when it is actually two minutes old instead of at
+    // segment disappears when it actually reaches the age limit instead of at
     // the next fetch, which could be seven seconds later or — with the feed
     // paused — never. The loop almost always does nothing.
-    const cutoff = Date.now() - TRAIL_MAX_AGE_MS;
+    const cutoff = Date.now() - this.trailMaxAgeMs;
     let drop = 0;
     while (drop < t.at.length && t.at[drop] < cutoff) drop++;
     if (drop) { t.pos.splice(0, drop); t.at.splice(0, drop); }
@@ -889,8 +1133,10 @@ export class FlightLayer extends Layer {
           t.pos.push(pos);
           t.at.push(Date.now());
         }
-        // The count ceiling is only a backstop now; age is what governs.
-        while (t.pos.length > TRAIL_MAX_POINTS) { t.pos.shift(); t.at.shift(); }
+        // The count ceiling is only a backstop; age is what governs. It is
+        // sized so the configured age fits at the fastest poll.
+        const maxPoints = Math.min(TRAIL_MAX_POINTS, Math.ceil(this.trailMaxAgeMs / TRAIL_MIN_POLL_MS) + 2);
+        while (t.pos.length > maxPoints) { t.pos.shift(); t.at.shift(); }
       }
 
       const emergency = !!a.alert;
@@ -924,7 +1170,7 @@ export class FlightLayer extends Layer {
             height: 26,
             rotation: 0,
             alignedAxis: Cesium.Cartesian3.ZERO,
-            disableDepthTestDistance: Number.POSITIVE_INFINITY,
+            disableDepthTestDistance: DEPTH_FREE_M,
             scaleByDistance: new Cesium.NearFarScalar(1e4, 1.3, 1.2e6, 0.45),
           },
           label: {
@@ -936,7 +1182,7 @@ export class FlightLayer extends Layer {
             outlineWidth: 3,
             pixelOffset: new Cesium.Cartesian2(16, -14),
             horizontalOrigin: Cesium.HorizontalOrigin.LEFT,
-            disableDepthTestDistance: Number.POSITIVE_INFINITY,
+            disableDepthTestDistance: DEPTH_FREE_M,
             distanceDisplayCondition: new Cesium.DistanceDisplayCondition(0, 9e5),
           },
           polyline: {
@@ -1081,9 +1327,20 @@ export class FlightLayer extends Layer {
       // The photo leads the panel rather than sitting under the airframe
       // table, so it is the first thing seen on a pick.
       const ps = photoSlot();
-      if (ac.photo && ps) {
-        ps.innerHTML = `<img class="cam" src="${esc(safeUrl(ac.photo) || '')}" alt="aircraft"
-                         onerror="this.style.display='none'">`;
+      const full = safeUrl(ac.photo);
+      const thumb = safeUrl(ac.photoThumb);
+      if (full && ps) {
+        // Thumbnail first, as it arrives at once; the full-size photo
+        // replaces it when it has loaded, and if it never does the thumbnail
+        // stays rather than the slot going blank.
+        const first = thumb && thumb !== full ? thumb : full;
+        ps.innerHTML = `<img class="cam" src="${esc(first)}" alt="aircraft" data-hide-on-error>`;
+        if (first !== full && typeof Image === 'function') {
+          const img = ps.querySelector('img');
+          const pre = new Image();
+          pre.onload = () => { if (img?.isConnected !== false) img.src = full; };
+          pre.src = full;
+        }
       }
     }
 
@@ -1158,7 +1415,7 @@ export class FlightLayer extends Layer {
           color: Cesium.Color.fromCssColorString(color).withAlpha(0.9),
           outlineColor: Cesium.Color.fromCssColorString(color),
           outlineWidth: 2,
-          disableDepthTestDistance: Number.POSITIVE_INFINITY,
+          disableDepthTestDistance: DEPTH_FREE_M,
           heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
         },
         label: {
@@ -1170,7 +1427,7 @@ export class FlightLayer extends Layer {
           outlineColor: Cesium.Color.BLACK.withAlpha(0.85),
           outlineWidth: 3,
           pixelOffset: new Cesium.Cartesian2(0, -22),
-          disableDepthTestDistance: Number.POSITIVE_INFINITY,
+          disableDepthTestDistance: DEPTH_FREE_M,
         },
       });
     }
@@ -1303,6 +1560,9 @@ export class SatelliteLayer extends Layer {
     // ones — the refusal is how CelesTrak says so — but worth showing.
     this.stale = !!data.stale;
     this.elementsAt = data.elementsAt || null;
+    // 'spacetrack' when CelesTrak could not answer and the server fell back.
+    this.elementsSource = data.source || 'celestrak';
+    this.approximate = !!data.approximate;
     this.tick(Cesium.JulianDate.now());
   }
 
@@ -1417,43 +1677,173 @@ function orbitColor(s) {
 /* OVERPASS — OSM infrastructure                                       */
 /* ================================================================== */
 
+// The server's VIEW_CELL_DEG.overpass. Tiles must sit on the same grid, or
+// each request would straddle cells and pay for its neighbours.
+const OSM_CELL_DEG = 0.125;
+const OSM_TILE_DEG = 0.25;     // 2 x 2 cells per request
+const OSM_TILE_LIMIT = 3000;   // the most the server sends per answer
+// Widest view filled tile by tile. Each tile is its own short request, so
+// the browser's timeout no longer bounds this; Overpass load does.
+const OSM_MAX_SPAN = 1.0;
+const OSM_REDRAW_MS = 800;     // repaint at most this often while tiles arrive
+const OSM_PAD = 0.25;          // margin beyond each edge of the view, as a share of its span
+
 export class OverpassLayer extends Layer {
   constructor(viewer) {
     super(viewer, 'overpass', 'OSM infrastructure');
     // Mapped infrastructure changes over weeks. Held for 72 hours, refreshed on demand.
     this.coverageTtlMs = INVENTORY_COVERAGE_MS;
-    // Modest, unlike Shodan's: the server snaps this outward onto a fixed
-    // grid anyway, so the slack that keeps small pans inside coverage comes
-    // from the cell rather than from padding. At 0.6 the padded box was 2.2x
-    // the view in each axis — nearly five times the area — and for an
-    // Overpass query that is paid for in seconds, not credits.
-    this.padFactor = 0.15;
+    // The view plus 25% of its span beyond each edge: enough slack that a
+    // small pan stays inside what is held. Requests are clipped to this box
+    // rather than snapped out to whole tiles, which over a wide view loaded
+    // thousands of features nobody could see.
+    this.padFactor = OSM_PAD;
     this.accumulate = true;
     this.presets = new Set(['surveillance']);
     this.available = {};
     this.byPreset = {};
     this.labels = {};
     this.truncated = false;
+    // Coverage is recorded per tile, so a dense city needs far more entries
+    // than the 40 whole-view boxes other layers keep, and far more features
+    // than the default store holds: evicting from ground marked as fetched
+    // left holes that were never asked for again.
+    this.coverMax = 600;
+    this.cacheCap = 40000;
   }
 
   settingsSig() { return [...this.presets].sort().join(','); }
 
-  async load({ bbox }) {
+  /**
+   * The box as tiles of the server's fixed grid, each clipped to the box,
+   * nearest the middle first, trimmed to OSM_MAX_SPAN around the centre.
+   *
+   * One answer for the whole view was cut to the features nearest its
+   * middle, yet the whole view was marked as fetched, so the rest of it was
+   * never asked for: a dense city showed one blob and nothing pending.
+   * Asking tile by tile keeps every answer small enough to arrive complete,
+   * and lets coverage be claimed only for tiles that actually did.
+   */
+  tilesFor(bbox) {
+    const p = String(bbox).split(',').map(Number);
+    if (p.length !== 4 || p.some((v) => !Number.isFinite(v))) return { tiles: [], trimmed: false };
+    let [s, w, n, e] = p;
+    const r = (v) => Number(v.toFixed(4));
+    const lat = (s + n) / 2, lon = (w + e) / 2;
+    let trimmed = false;
+    if (n - s > OSM_MAX_SPAN) { s = lat - OSM_MAX_SPAN / 2; n = lat + OSM_MAX_SPAN / 2; trimmed = true; }
+    if (e - w > OSM_MAX_SPAN) { w = lon - OSM_MAX_SPAN / 2; e = lon + OSM_MAX_SPAN / 2; trimmed = true; }
+    const t = OSM_TILE_DEG;
+    const tiles = [];
+    for (let ty = Math.floor(s / t); ty * t < n; ty++) {
+      for (let tx = Math.floor(w / t); tx * t < e; tx++) {
+        const south = r(Math.max(-85, s, ty * t)), north = r(Math.min(85, n, (ty + 1) * t));
+        const west = r(Math.max(-180, w, tx * t)), east = r(Math.min(180, e, (tx + 1) * t));
+        if (north <= south || east <= west) continue;
+        tiles.push({ south, west, north, east, key: `${south},${west},${north},${east}` });
+      }
+    }
+    const k = Math.cos((lat * Math.PI) / 180);
+    const d = (c) => ((c.south + c.north) / 2 - lat) ** 2 + (((c.west + c.east) / 2 - lon) * k) ** 2;
+    tiles.sort((a, b) => d(a) - d(b));
+    return { tiles, trimmed, view: { south: s, west: w, north: n, east: e } };
+  }
+
+  /**
+   * Covered when the part of every grid cell inside the view is. Checked
+   * per cell because a dense tile is recorded as its cells.
+   */
+  isCovered(bbox) {
+    const { tiles } = this.tilesFor(bbox);
+    return tiles.length > 0 && tiles.every((t) => this.partCovered(t));
+  }
+
+  /** A tile or cell held whole, or as all of its cells. */
+  partCovered(part) {
+    if (super.isCovered(part.key)) return true;
+    const cells = OverpassLayer.cellsOf(part);
+    return cells.length > 1 && cells.every((c) => super.isCovered(c.key));
+  }
+
+  /** Features evicted from the store: their tiles are no longer complete. */
+  onEvict(recs) {
+    if (!recs.length || !this.covered?.length) return;
+    this.covered = this.covered.filter((c) => !recs.some((f) =>
+      f && f.lat >= c.south && f.lat <= c.north && f.lon >= c.west && f.lon <= c.east));
+  }
+
+  /** Split a (clipped) tile into the server grid cells it touches, clipped the same way. */
+  static cellsOf(tile) {
+    const r = (v) => Number(v.toFixed(4));
+    const g = OSM_CELL_DEG;
+    const out = [];
+    for (let y = Math.floor(tile.south / g + 1e-9); y * g < tile.north - 1e-9; y++) {
+      for (let x = Math.floor(tile.west / g + 1e-9); x * g < tile.east - 1e-9; x++) {
+        const c = {
+          south: r(Math.max(tile.south, y * g)), north: r(Math.min(tile.north, (y + 1) * g)),
+          west: r(Math.max(tile.west, x * g)), east: r(Math.min(tile.east, (x + 1) * g)),
+        };
+        if (c.north <= c.south || c.east <= c.west) continue;
+        c.key = `${c.south},${c.west},${c.north},${c.east}`;
+        out.push(c);
+      }
+    }
+    return out;
+  }
+
+  async load(ctx) {
     if (!this.presets.size) { this.clear(); this.count = 0; this.byPreset = {}; return; }
 
-    // One request covering every selected class. Overpass allows ~2 slots per
-    // IP, so fanning out one request per class is what caused 429s.
-    const box = this.padBbox(bbox);
+    const box = this.padBbox(ctx.bbox);
     this.lastFetchedBbox = box;
-    const d = await this.fetch('/api/overpass', {
-      bbox: box, presets: [...this.presets].join(','), limit: 800,
-    });
+    this.coveredBbox = false;   // recorded per tile below
+    const { tiles, trimmed } = this.tilesFor(box);
+    this.trimmed = trimmed;
+    let truncated = false;
+    let lastDraw = 0;
+    const draw = (final) => {
+      if (!final && Date.now() - lastDraw < OSM_REDRAW_MS) return;
+      lastDraw = Date.now();
+      this.redraw();
+      ctx.onStatus?.();
+    };
 
-    this.truncated = !!d.truncated;
-    this.coveredBbox = d.covered || null;
-    this.trimmed = !!d.trimmed;
-    this.remember(d.features);
-    this.redraw();
+    // Tiles one at a time, nearest the middle first: Overpass allows ~2
+    // slots per IP and the server queues behind them anyway, so parallel
+    // requests would only wait in line and time out together.
+    const fetchPart = async (part) => {
+      if (this.partCovered(part)) return;
+      const d = await this.fetch('/api/overpass', {
+        bbox: part.key, presets: [...this.presets].join(','), limit: OSM_TILE_LIMIT,
+      });
+      // The server answers for whole grid cells; keep only what falls in
+      // the part asked for, so nothing past the padded view is loaded.
+      this.remember((d.features || []).filter((f) => f.lat >= part.south && f.lat <= part.north
+        && f.lon >= part.west && f.lon <= part.east));
+      if (d.partial) { draw(true); throw partialAnswer(d); }
+      // Cut to the draw limit: the server holds the rest, so ask for it
+      // cell by cell. A single cell over the limit is as fine as it gets.
+      const cells = OverpassLayer.cellsOf(part);
+      if (d.capped && cells.length > 1) {
+        for (const c of cells) await fetchPart(c);
+      } else {
+        if (d.truncated) truncated = true;
+        this.markCovered(part.key);
+      }
+      draw(false);
+    };
+
+    try {
+      for (const tile of tiles) {
+        // The camera has moved on: stop here. What is in hand stays, and
+        // refresh() asks for the new view as soon as this returns.
+        if (this._viewBbox !== ctx.bbox) break;
+        await fetchPart(tile);
+      }
+    } finally {
+      this.truncated = truncated;
+      draw(true);
+    }
   }
 
   /** Cached features are filtered by the currently selected classes here,
@@ -1473,7 +1863,7 @@ export class OverpassLayer extends Layer {
           color: color.withAlpha(0.9),
           outlineColor: Cesium.Color.BLACK.withAlpha(0.6),
           outlineWidth: 1,
-          disableDepthTestDistance: Number.POSITIVE_INFINITY,
+          disableDepthTestDistance: DEPTH_FREE_M,
           heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
           scaleByDistance: new Cesium.NearFarScalar(1e3, 1.5, 3e5, 0.4),
         },
@@ -1597,7 +1987,7 @@ export class AlprLayer extends Layer {
     this.byOperator = data.byOperator;
     this.total = data.total;
     this.remember(data.cameras);
-    this.redraw();
+    this.redraw();    if (data.partial) throw partialAnswer(data);
   }
 
   draw(cameras) {
@@ -1643,7 +2033,12 @@ export class AlprLayer extends Layer {
           image: alprSprite(css, c.directions.length > 0),
           width: 20,
           height: 20,
-          disableDepthTestDistance: Number.POSITIVE_INFINITY,
+          // The glyph is a camera on a pole: stand the pole's foot on the
+          // camera's position, where the field-of-view wedge starts, rather
+          // than centring the icon over it.
+          verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
+          pixelOffset: new Cesium.Cartesian2(0, 2),
+          disableDepthTestDistance: DEPTH_FREE_M,
           heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
           scaleByDistance: new Cesium.NearFarScalar(500, 1.6, 2.5e5, 0.35),
         },
@@ -1679,8 +2074,7 @@ export class AlprLayer extends Layer {
       title: rec.operator || rec.manufacturer || vendorLabel,
       accent,
       html: `
-        ${safeUrl(rec.image) ? `<img class="cam" src="${esc(safeUrl(rec.image))}" alt="camera"
-                            onerror="this.style.display='none'">` : ''}
+        ${safeUrl(rec.image) ? `<img class="cam" src="${esc(safeUrl(rec.image))}" alt="camera" data-hide-on-error>` : ''}
         <table>${rows([
           ['Vendor', vendorLabel],
           ['Manufacturer', rec.manufacturer],
@@ -1821,7 +2215,7 @@ export class EventLayer extends Layer {
           color: color.withAlpha(0.9),
           outlineColor: color,
           outlineWidth: 2,
-          disableDepthTestDistance: Number.POSITIVE_INFINITY,
+          disableDepthTestDistance: DEPTH_FREE_M,
           heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
           scaleByDistance: new Cesium.NearFarScalar(1e4, 1.4, 4e6, 0.55),
         },
@@ -1921,7 +2315,7 @@ export class WebcamLayer extends Layer {
           image: camSprite(CAM_COLOR[c.source] || '#ffd166'),
           width: 22,
           height: 22,
-          disableDepthTestDistance: Number.POSITIVE_INFINITY,
+          disableDepthTestDistance: DEPTH_FREE_M,
           heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
           scaleByDistance: new Cesium.NearFarScalar(1e3, 1.4, 4e5, 0.4),
         },
@@ -1960,6 +2354,7 @@ export class WebcamLayer extends Layer {
       frame.setAttribute('allow', 'autoplay; fullscreen; picture-in-picture');
       stage.append(frame);
       stage.append(liveBadge('live player'));
+      this.liveEls = [frame];
       return;
     }
 
@@ -1984,6 +2379,7 @@ export class WebcamLayer extends Layer {
     }
     const stamp = liveBadge('updating\u2026');
     stage.append(img, stamp);
+    this.liveEls = [img];
 
     let fails = 0;
     const tick = () => {
@@ -1997,19 +2393,57 @@ export class WebcamLayer extends Layer {
     img.onerror = () => {
       // Some cameras go offline for long stretches; stop rather than hammer.
       if (++fails >= 3) {
-        this.stopLive();
+        this.stopRefresh();
         stamp.textContent = 'camera not responding';
         img.style.display = 'none';
       }
     };
 
-    tick();
-    this.liveTimer = setInterval(tick, rec.source === 'nycdot' ? 3000 : 8000);
+    // Refetch only while the page is on screen: a frame nobody can see is
+    // a download and an image decode for nothing.
+    const period = rec.source === 'nycdot' ? 3000 : 8000;
+    const run = () => {
+      clearInterval(this.liveTimer);
+      tick();
+      this.liveTimer = setInterval(tick, period);
+    };
+    this.onLiveVisibility = () => {
+      if (document.visibilityState === 'visible') run();
+      else { clearInterval(this.liveTimer); this.liveTimer = null; }
+    };
+    document.addEventListener?.('visibilitychange', this.onLiveVisibility);
+    run();
   }
 
-  stopLive() {
+  /** Stop refetching the still, leaving what is on the page in place. */
+  stopRefresh() {
     clearInterval(this.liveTimer);
     this.liveTimer = null;
+    if (this.onLiveVisibility) {
+      document.removeEventListener?.('visibilitychange', this.onLiveVisibility);
+      this.onLiveVisibility = null;
+    }
+  }
+
+  /**
+   * End the live view and take the player or frame off the page. Closing the
+   * detail panel only hides it, so a player left in place would go on
+   * decoding video, and a still left in place would keep its last frame in
+   * memory.
+   */
+  stopLive() {
+    this.stopRefresh();
+    const els = this.liveEls || [];
+    this.liveEls = null;
+    for (const el of els) {
+      el.onload = null;
+      el.onerror = null;
+      // Blanking the player first stops its video and audio at once, rather
+      // than whenever the detached frame is collected.
+      if (el.tagName === 'IFRAME') el.src = 'about:blank';
+      else el.removeAttribute?.('src');
+      el.remove();
+    }
   }
 
   detail(rec) {
@@ -2064,6 +2498,170 @@ function camSprite(color) {
 }
 
 /* ================================================================== */
+/* YOUTUBE — geotagged uploads                                         */
+/* ================================================================== */
+
+/** "PT1H2M3S" as 1:02:03. */
+function ytDuration(iso) {
+  const m = /^P(?:(\d+)D)?T?(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/.exec(String(iso || ''));
+  if (!m || iso === 'P0D') return null;
+  const h = Number(m[1] || 0) * 24 + Number(m[2] || 0);
+  const mm = Number(m[3] || 0);
+  const ss = String(Number(m[4] || 0)).padStart(2, '0');
+  return h ? `${h}:${String(mm).padStart(2, '0')}:${ss}` : `${mm}:${ss}`;
+}
+
+const YT_COLOR = { none: '#ff3b30', live: '#ff2d95', upcoming: '#ffd166' };
+const YT_LIVE_LABEL = { live: 'Live now', upcoming: 'Upcoming stream' };
+
+export class YoutubeLayer extends Layer {
+  constructor(viewer) {
+    super(viewer, 'youtube', 'YouTube geotags');
+    // Each search is paid for in API quota and the server holds it for
+    // 72 hours (cache.conf [youtube] videos); the browser follows that from
+    // /api/config so it does not re-ask about ground the server still holds.
+    this.coverageTtlMs = 72 * 60 * 60_000;
+    this.accumulate = true;
+    this.window = null;
+    this.after = null;
+    this.found = 0;
+  }
+
+  async load({ bbox }) {
+    const box = this.padBbox(bbox);
+    this.lastFetchedBbox = box;
+    const data = await this.fetch('/api/youtube', { bbox: box });
+    this.window = data.window || this.window;
+    this.after = data.after || this.after;
+    this.found = data.found ?? 0;
+    this.remember(data.videos || []);
+    this.redraw();
+  }
+
+  draw(videos) {
+    for (const v of videos) {
+      this.source.entities.add({
+        position: Cesium.Cartesian3.fromDegrees(v.lon, v.lat, 0),
+        billboard: {
+          image: ytSprite(YT_COLOR[v.live] || YT_COLOR.none),
+          width: 22,
+          height: 16,
+          disableDepthTestDistance: DEPTH_FREE_M,
+          heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+          scaleByDistance: new Cesium.NearFarScalar(1e3, 1.4, 4e5, 0.4),
+        },
+        properties: { layer: 'youtube', record: v },
+      });
+    }
+    return videos.length;
+  }
+
+  /**
+   * Show the thumbnail, and load YouTube's player only when asked to. The
+   * player is third-party script and a connection to Google, so opening the
+   * panel to read the details must not be what starts it.
+   */
+  async enrich(rec, root) {
+    const stage = root.querySelector('[data-slot="ytstage"]');
+    if (!stage) return;
+    this.stopLive();
+    const thumb = safeUrl(rec.thumb, { httpsOnly: true });
+    const embed = safeUrl(rec.embed, { httpsOnly: true });
+
+    const shown = [];
+    if (thumb) {
+      const img = document.createElement('img');
+      img.className = 'cam-live';
+      img.alt = `${rec.title || 'Video'} thumbnail`;
+      img.referrerPolicy = 'no-referrer';
+      img.setAttribute('data-hide-on-error', '');
+      img.src = thumb;
+      stage.append(img);
+      shown.push(img);
+    }
+    this.liveEls = shown;
+    if (!embed) return;
+    const play = document.createElement('button');
+    play.type = 'button';
+    play.className = 'yt-play';
+    play.textContent = '\u25B6 Play here';
+    stage.append(play);
+    shown.push(play);
+
+    play.onclick = () => {
+      play.onclick = null;
+      for (const el of shown) el.remove();
+      const frame = document.createElement('iframe');
+      frame.className = 'cam-frame';
+      frame.src = `${embed}?autoplay=1&rel=0`;
+      // Sandboxed like the webcam players. YouTube refuses to play an embed
+      // that sends no referrer, so this one sends the origin and no more.
+      frame.setAttribute('sandbox',
+        'allow-scripts allow-same-origin allow-presentation allow-popups');
+      frame.setAttribute('referrerpolicy', 'strict-origin');
+      frame.setAttribute('allow', 'autoplay; encrypted-media; fullscreen; picture-in-picture');
+      frame.setAttribute('allowfullscreen', '');
+      stage.append(frame);
+      this.liveEls = [frame];
+    };
+  }
+
+  /** Take the player off the page, so a closed panel stops playing. */
+  stopLive() {
+    const els = this.liveEls || [];
+    this.liveEls = null;
+    for (const el of els) {
+      el.onclick = null;
+      if (el.tagName === 'IFRAME') el.src = 'about:blank';
+      el.remove();
+    }
+  }
+
+  detail(rec) {
+    const ago = relTime(rec.published);
+    const link = safeUrl(rec.link);
+    const channel = safeUrl(rec.channelLink);
+    return {
+      kind: 'YOUTUBE VIDEO',
+      title: rec.title || rec.videoId,
+      accent: YT_COLOR[rec.live] || YT_COLOR.none,
+      html: `
+        ${YT_LIVE_LABEL[rec.live] ? `<div class="alarm">${esc(YT_LIVE_LABEL[rec.live])}</div>` : ''}
+        <div class="cam-stage" data-slot="ytstage"></div>
+        <div data-slot="inset"></div>
+        <table>${rows([
+          ['Channel', rec.channel],
+          ['Published', rec.published ? `${rec.published}${ago ? ` (${ago})` : ''}` : null],
+          ['Recorded', rec.recorded],
+          ['Length', ytDuration(rec.duration)],
+          ['Views', rec.views != null ? rec.views.toLocaleString() : null],
+          ['Likes', rec.likes != null ? rec.likes.toLocaleString() : null],
+          ['Comments', rec.comments != null ? rec.comments.toLocaleString() : null],
+          ['Location', rec.place],
+          ['Geotag', `${rec.lat.toFixed(5)}, ${rec.lon.toFixed(5)}`],
+        ])}</table>
+        ${rec.description ? `<p class="yt-desc">${esc(rec.description)}</p>` : ''}
+        ${link ? `<a class="ext" href="${esc(link)}" target="_blank" rel="noopener noreferrer">Watch on YouTube ↗</a>` : ''}
+        ${channel ? `<a class="ext" href="${esc(channel)}" target="_blank" rel="noopener noreferrer">Channel ↗</a>` : ''}
+        <p class="hint">The geotag is whatever the uploader set, not a measured
+        position. Only uploads that carry one are found.</p>`,
+    };
+  }
+}
+
+const ytSpriteCache = new Map();
+function ytSprite(color) {
+  if (ytSpriteCache.has(color)) return ytSpriteCache.get(color);
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 44 32">
+    <rect x="2" y="2" width="40" height="28" rx="8" fill="${color}"
+          stroke="rgba(0,0,0,.6)" stroke-width="1.5"/>
+    <path d="M18 10 L30 16 L18 22 Z" fill="#fff"/></svg>`;
+  const uri = `data:image/svg+xml;base64,${btoa(svg)}`;
+  ytSpriteCache.set(color, uri);
+  return uri;
+}
+
+/* ================================================================== */
 /* VESSELS — live AIS ship positions                                   */
 /* ================================================================== */
 
@@ -2109,7 +2707,7 @@ export class VesselLayer extends Layer {
           width: 22, height: 22,
           rotation: Cesium.Math.toRadians(-bearing),
           alignedAxis: Cesium.Cartesian3.ZERO,
-          disableDepthTestDistance: Number.POSITIVE_INFINITY,
+          disableDepthTestDistance: DEPTH_FREE_M,
           heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
           scaleByDistance: new Cesium.NearFarScalar(1e4, 1.3, 2e6, 0.4),
         },
@@ -2123,7 +2721,7 @@ export class VesselLayer extends Layer {
           outlineWidth: 3,
           pixelOffset: new Cesium.Cartesian2(14, -10),
           horizontalOrigin: Cesium.HorizontalOrigin.LEFT,
-          disableDepthTestDistance: Number.POSITIVE_INFINITY,
+          disableDepthTestDistance: DEPTH_FREE_M,
           distanceDisplayCondition: new Cesium.DistanceDisplayCondition(0, 4e5),
           show: this.showNames,
         },
@@ -2140,6 +2738,8 @@ export class VesselLayer extends Layer {
       title: rec.name || `MMSI ${rec.mmsi}`,
       accent: vesselColor(rec.shipTypeName),
       html: `
+        <div data-slot="photo"></div>
+        <div data-slot="inset"></div>
         <table>${rows([
           ['MMSI', rec.mmsi],
           ['IMO', rec.imo || null],
@@ -2156,12 +2756,66 @@ export class VesselLayer extends Layer {
           ['Transponder', rec.classB ? 'Class B' : 'Class A'],
           ['Last report', rec.ageSeconds != null ? `${rec.ageSeconds}s ago` : null],
         ])}</table>
-        <a class="ext" href="https://www.vesselfinder.com/vessels?name=${encodeURIComponent(rec.mmsi)}"
-           target="_blank" rel="noopener">Look up vessel ↗</a>
+        ${vesselLinks(rec)}
         <p class="hint">Positions are self-reported over AIS. Transponders can be
         switched off or spoofed, so absence is not evidence of absence.</p>`,
     };
   }
+
+  /**
+   * After the panel renders: a freely licensed photo from Wikimedia Commons,
+   * found by IMO or MMSI. Most small craft have none, and then the slot
+   * simply stays empty; the links below lead to the tracking sites' photos.
+   */
+  async enrich(rec, root) {
+    const seq = ++this.enrichSeq;
+    const imo = /^[1-9]\d{6}$/.test(String(rec.imo || '')) ? String(rec.imo) : null;
+    const mmsi = /^\d{9}$/.test(String(rec.mmsi || '')) ? String(rec.mmsi) : null;
+    if (!imo && !mmsi) return;
+    let p;
+    try { p = await api('/api/vessel-photo', { imo, mmsi }); } catch { return; }
+    const slot = this.enrichSeq === seq ? root.querySelector('[data-slot="photo"]') : null;
+    if (!slot || !p?.known || !safeUrl(p.photo)) return;
+    slot.innerHTML = vesselPhotoHtml(p);
+  }
+}
+
+/**
+ * Photos on the tracking sites themselves. Their photos belong to the
+ * photographers and need their permission to reuse, so they are linked to
+ * rather than shown here. The old link searched VesselFinder by MMSI as a
+ * ship name, which finds nothing; a ship's page is keyed by IMO when it has
+ * one, by MMSI otherwise.
+ */
+function vesselLinks(rec) {
+  const mmsi = /^\d{9}$/.test(String(rec.mmsi || '')) ? String(rec.mmsi) : null;
+  const imo = /^[1-9]\d{6}$/.test(String(rec.imo || '')) ? String(rec.imo) : null;
+  const links = [];
+  if (mmsi) {
+    links.push(['MarineTraffic', `https://www.marinetraffic.com/en/ais/details/ships/mmsi:${mmsi}`]);
+  }
+  if (imo || mmsi) {
+    links.push(['VesselFinder', `https://www.vesselfinder.com/vessels/details/${imo || mmsi}`]);
+  }
+  return links.map(([label, href]) => `<a class="ext" href="${esc(href)}" target="_blank"
+    rel="noopener">Photos &amp; details on ${label} ↗</a>`).join(' ');
+}
+
+/** The photo slot's contents: a Commons photo, always with its credit. */
+function vesselPhotoHtml(p) {
+  const by = esc(p.credit || 'Unknown author');
+  const lic = p.license
+    ? (safeUrl(p.licenseUrl)
+      ? `<a href="${esc(safeUrl(p.licenseUrl))}" target="_blank" rel="noopener">${esc(p.license)}</a>`
+      : esc(p.license))
+    : null;
+  const src = safeUrl(p.page)
+    ? `<a href="${esc(safeUrl(p.page))}" target="_blank" rel="noopener">Wikimedia Commons</a>`
+    : 'Wikimedia Commons';
+  return `<figure class="photo">
+      <img class="cam" src="${esc(safeUrl(p.photo) || '')}" alt="${esc(p.subject || 'vessel')}" data-hide-on-error>
+      <figcaption>Photo: ${by}${lic ? ` · ${lic}` : ''} · ${src}</figcaption>
+    </figure>`;
 }
 
 const vesselCache = new Map();
@@ -2249,7 +2903,7 @@ export class NetInfraLayer extends Layer {
           color: color.withAlpha(0.9),
           outlineColor: color,
           outlineWidth: n.aggregate ? 2 : 1,
-          disableDepthTestDistance: Number.POSITIVE_INFINITY,
+          disableDepthTestDistance: DEPTH_FREE_M,
           heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
           scaleByDistance: new Cesium.NearFarScalar(1e3, 1.4, 3e6, 0.5),
         },
@@ -2275,7 +2929,7 @@ export class NetInfraLayer extends Layer {
           ...Object.entries(rec.detail || {}),
           ['Tags', rec.tags],
         ])}</table>
-        ${rec.source === 'atlas' ? `<a class="ext" href="https://atlas.ripe.net/probes/${rec.id.split(':')[1]}/"
+        ${rec.source === 'atlas' ? `<a class="ext" href="https://atlas.ripe.net/probes/${encodeURIComponent(rec.id.split(':')[1] ?? '')}/"
            target="_blank" rel="noopener">Open in RIPE Atlas ↗</a>` : ''}
         ${rec.source === 'wigle' ? '<p class="hint">Wireless survey data is contributed by volunteers '
           + 'and reflects where a network was observed, not who owns it.</p>' : ''}`,
@@ -2341,7 +2995,7 @@ export class IotLayer extends Layer {
           color: color.withAlpha(0.9),
           outlineColor: s.indoor ? Cesium.Color.fromCssColorString('#8b949e') : color,
           outlineWidth: s.indoor ? 1 : 2,
-          disableDepthTestDistance: Number.POSITIVE_INFINITY,
+          disableDepthTestDistance: DEPTH_FREE_M,
           heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
           scaleByDistance: new Cesium.NearFarScalar(1e3, 1.5, 3e5, 0.4),
         },
@@ -2433,7 +3087,7 @@ export class TrafficLayer extends Layer {
           position: Cesium.Cartesian3.fromDegrees(f.lon, f.lat, 0),
           billboard: {
             image: camSprite(css), width: 20, height: 20,
-            disableDepthTestDistance: Number.POSITIVE_INFINITY,
+            disableDepthTestDistance: DEPTH_FREE_M,
             heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
             scaleByDistance: new Cesium.NearFarScalar(1e3, 1.4, 3e5, 0.4),
           },
@@ -2447,7 +3101,7 @@ export class TrafficLayer extends Layer {
             color: Cesium.Color.fromCssColorString(css).withAlpha(0.9),
             outlineColor: Cesium.Color.fromCssColorString(css),
             outlineWidth: 2,
-            disableDepthTestDistance: Number.POSITIVE_INFINITY,
+            disableDepthTestDistance: DEPTH_FREE_M,
             heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
           },
           properties: { layer: 'traffic', record: f },
@@ -2464,8 +3118,7 @@ export class TrafficLayer extends Layer {
         title: rec.title,
         accent: '#ffd166',
         html: `
-          ${safeUrl(rec.image) ? `<img class="cam" src="${esc(safeUrl(rec.image))}" alt="camera view"
-                              onerror="this.style.display='none'">` : ''}
+          ${safeUrl(rec.image) ? `<img class="cam" src="${esc(safeUrl(rec.image))}" alt="camera view" data-hide-on-error>` : ''}
           <table>${rows([
             ['Roadway', rec.roadway],
             ['Direction', rec.direction],
@@ -2893,6 +3546,70 @@ export async function enrichHost(ip, slot) {
   if (s) s.innerHTML = parts.join('');
 }
 
+/**
+ * The "Nearby photos" block of the detail panel: up to four photos, closest
+ * first, each with the source, date, distance, author and licence that
+ * showing it requires.
+ */
+const PHOTO_SOURCE_NAMES = { wikimedia: 'Wikimedia Commons', flickr: 'Flickr', mapillary: 'Mapillary' };
+export function nearbyPhotosHtml(d) {
+  const photos = (d?.photos || []).filter((p) => safeUrl(p.photo, { httpsOnly: true }));
+  const km = (m) => (m >= 1000 ? `${(m / 1000).toFixed(m >= 10000 ? 0 : 1)} km` : `${Math.round(m)} m`);
+  const src = d?.sources || {};
+  const names = (pred) => Object.keys(PHOTO_SOURCE_NAMES).filter((k) => src[k] && pred(src[k])).map((k) => PHOTO_SOURCE_NAMES[k]);
+  const asked = names((v) => v.status !== 'not configured');
+  const failed = Object.entries(src).filter(([k, v]) => v?.status === 'error' && PHOTO_SOURCE_NAMES[k])
+    .map(([k, v]) => `${PHOTO_SOURCE_NAMES[k]}: ${v.error || 'failed'}`);
+  const missing = [src.flickr?.status === 'not configured' && 'FLICKR_API_KEY',
+    src.mapillary?.status === 'not configured' && 'MAPILLARY_TOKEN'].filter(Boolean);
+  const from = asked.length ? asked.join(', ') : 'Wikimedia Commons';
+  const extra = (failed.length ? `<p class="hint">${esc(failed.join(' · '))}</p>` : '')
+    + (missing.length ? `<p class="hint">Add ${esc(missing.join(' or '))} in settings to search more sources.</p>` : '');
+  if (!photos.length) {
+    return `<h4>Nearby photos</h4><p class="hint">No geotagged photos from the past year within ${esc(km(d?.searchedM || 1000))} on ${esc(from)}. Older ones are not shown.</p>${extra}`;
+  }
+  const cells = photos.map((p) => {
+    const page = safeUrl(p.page);
+    const img = `<img src="${esc(safeUrl(p.photo, { httpsOnly: true }))}" alt="${esc(p.title || 'photo')}" loading="lazy" referrerpolicy="no-referrer" data-hide-on-error>`;
+    const lic = p.license
+      ? (safeUrl(p.licenseUrl)
+        ? `<a href="${esc(safeUrl(p.licenseUrl))}" target="_blank" rel="noopener noreferrer">${esc(p.license)}</a>`
+        : esc(p.license))
+      : null;
+    const when = p.date ? `${p.dateKind === 'taken' ? '' : 'uploaded '}${esc(p.date)}` : 'undated';
+    const source = PHOTO_SOURCE_NAMES[p.source] || 'photo';
+    return `<figure class="np">
+        ${page ? `<a href="${esc(page)}" target="_blank" rel="noopener noreferrer" title="${esc(p.title || '')}">${img}</a>` : img}
+        <figcaption>${esc(km(p.distanceM || 0))} away · ${when}<br>${esc(p.credit || 'Unknown author')}${lic ? ` · ${lic}` : ''} · ${esc(source)}</figcaption>
+      </figure>`;
+  }).join('');
+  return `<h4>Nearby photos</h4><div class="np-grid">${cells}</div>
+    <p class="hint">The ${photos.length === 1 ? 'closest photo' : `${photos.length} closest photos`} from the past year within ${esc(km(d.withinM || 1000))},
+    from ${esc(from)}. Positions are where each uploader says the camera stood.</p>${extra}`;
+}
+
+/** Whether a pick has a fixed place on the ground worth looking at. */
+export function groundPoint(layerId, rec) {
+  if (layerId === 'flights' || layerId === 'satellites') return null;
+  const lat = Number(rec?.lat);
+  const lon = Number(rec?.lon);
+  if (rec?.lat == null || rec?.lon == null || !Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+  if (Math.abs(lat) > 90 || Math.abs(lon) > 180) return null;
+  return { lat, lon };
+}
+
+/** Google's own page for the panorama nearest a point. Needs no key. */
+export function streetViewLink(lat, lon) {
+  return `https://www.google.com/maps/@?api=1&map_action=pano&viewpoint=${lat.toFixed(6)},${lon.toFixed(6)}`;
+}
+
+/** The Maps Embed API address of that panorama, or null without a key. */
+export function streetViewEmbedUrl(key, lat, lon) {
+  if (!/^[\w-]{20,80}$/.test(String(key || ''))) return null;
+  return `https://www.google.com/maps/embed/v1/streetview?key=${encodeURIComponent(key)}`
+    + `&location=${lat.toFixed(6)},${lon.toFixed(6)}`;
+}
+
 export { api };
 
 /* ================================================================== */
@@ -2915,7 +3632,10 @@ export { api };
 const BUILTIN_BASEMAPS = new Set(['osm', 'cesium']);
 
 /** Providers whose imagery is a dated scene over a particular place. */
-const SCENE_BASED = new Set(['sentinel2', 'gee']);
+const SCENE_BASED = new Set(['sentinel2', 'gee', 'wayback']);
+
+/** Scene searches narrowed by a date window and a cloud limit. */
+const WINDOWED = new Set(['sentinel2', 'gee']);
 
 export class BasemapOverlay {
   constructor(viewer) {
@@ -2954,6 +3674,9 @@ export class BasemapOverlay {
    * would keep declaring itself empty.
    */
   get active() { return SCENE_BASED.has(this.provider); }
+
+  /** Whether the date window and cloud limit apply to this provider. */
+  get windowed() { return WINDOWED.has(this.provider); }
 
   /** Default window: the last month, which is 2-6 Sentinel-2 passes. */
   defaultWindow() {

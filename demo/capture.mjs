@@ -4,7 +4,7 @@
 /**
  * Capture a static snapshot of New York City for the GitHub Pages demo.
  *
- *   node demo/capture.mjs [--out docs] [--maps-only] [--no-tiles] [--ais-wait 180]
+ *   node demo/capture.mjs [--out docs] [--maps-only] [--resume] [--no-tiles] [--ais-wait 180]
  *
  * Run this on a machine with your .env and a normal internet connection. It
  * loads server.js in-process (on a random loopback port, using your keys and
@@ -19,10 +19,13 @@
  *   data/cams/...             one still frame per public camera
  *   data/buildings/...        OpenStreetMap building footprints with heights
  *
- * Then `node demo/build.mjs` copies the app next to it. Re-running is cheap:
- * answers come out of the server's disk cache and tiles already on disk are
- * kept, so an interrupted capture picks up where it stopped. Delete the
- * output folder for a completely fresh snapshot.
+ * Then `node demo/build.mjs` copies the app next to it. Each capture asks
+ * the upstreams afresh for the layer data (bypassing the server's disk cache)
+ * and downloads every camera still again, so the snapshot shows the moment
+ * it was taken. Map tiles and buildings already on disk are kept.
+ *
+ * --resume picks up an interrupted capture cheaply instead: layer answers
+ * come out of the server's disk cache and camera stills on disk are kept.
  *
  * Never captured: your own location (the demo's home is fixed in New York),
  * and anything from .env. The build step scans for your key values and
@@ -100,12 +103,15 @@ const cloudlessUrl = (year, set = 'g') =>
 /* ------------------------------------------------------------------ */
 
 function parseArgs(argv) {
-  const o = { out: path.join(ROOT, 'docs'), tiles: true, aisWait: 180, fixtures: false, outGiven: false, mapsOnly: false };
+  const o = {
+    out: path.join(ROOT, 'docs'), tiles: true, aisWait: 180, fixtures: false, outGiven: false, mapsOnly: false, resume: false,
+  };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--out') { o.out = path.resolve(argv[++i]); o.outGiven = true; }
     else if (a === '--no-tiles') o.tiles = false;
     else if (a === '--maps-only') o.mapsOnly = true;
+    else if (a === '--resume') o.resume = true;
     else if (a === '--ais-wait') o.aisWait = Number(argv[++i]) || 0;
     else if (a === '--fixtures') o.fixtures = true;
     else if (a === '-h' || a === '--help') { o.help = true; }
@@ -182,8 +188,8 @@ let ATTEMPTS = 2;
 let MAX_ZOOM = Infinity;   // lowered for --fixtures, where tiles are only plumbing
 
 /** Fetch to a file. Returns true when the file exists afterwards. */
-async function download(url, file, { gzip = false, accept = null, maxBytes = 8e6, headers = {} } = {}) {
-  if (fs.existsSync(file)) return true;
+async function download(url, file, { gzip = false, accept = null, maxBytes = 8e6, headers = {}, replace = false } = {}) {
+  if (!replace && fs.existsSync(file)) return true;
   for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
     try {
       const res = await fetch(url, {
@@ -245,6 +251,9 @@ export const REGION_SPECS = {
   vessels: { path: '/api/vessels', key: 'vessels', id: (v) => v.mmsi },
 };
 
+/** The fields a server answer uses to say part of it is still owed. */
+export const PARTIAL_KEYS = ['partial', 'cells', 'missing', 'retryAfter', 'partialReason'];
+
 /** Fold one answer into an accumulating region. */
 export function mergeInto(acc, name, answer) {
   const spec = REGION_SPECS[name];
@@ -256,6 +265,9 @@ export function mergeInto(acc, name, answer) {
   }
   const meta = { ...answer };
   delete meta[spec.key];
+  // A snapshot is complete by definition: "the rest follows shortly" from
+  // the moment of capture can never come true on a static site.
+  for (const k of PARTIAL_KEYS) delete meta[k];
   // Problems from any cell are worth keeping; the rest of the metadata is
   // the same in every answer.
   acc.problems = { ...(acc.problems || {}), ...(answer?.problems || {}) };
@@ -329,6 +341,25 @@ async function getJsonPatiently(srv, pathname, params, log) {
       log(`    ${pathname}: ${e.message.slice(0, 90)} — waiting ${wait}s`);
       await sleep(wait * 1000);
     }
+  }
+}
+
+/**
+ * One cell's answer, asked again while the server reports part of it owed.
+ * Overpass answers 200 with `partial: true` when it is rate limiting, so the
+ * status-based waits in getJsonPatiently never see it; the server keeps the
+ * areas it already has, so each repeat asks only for the missing ones.
+ */
+async function getCellPatiently(srv, pathname, params, log, { fresh = false } = {}) {
+  for (let attempt = 0; ; attempt++) {
+    // Only the first ask bypasses the cache: a repeat must keep the areas
+    // the first one already brought in.
+    const q = fresh && attempt === 0 ? { ...params, fresh: 1 } : params;
+    const answer = await getJsonPatiently(srv, pathname, q, log);
+    if (!answer?.partial || attempt >= 6) return answer;
+    const wait = Math.min(120, Math.max(10, Number(answer.retryAfter) || 30));
+    log(`    ${pathname}: ${answer.cells - answer.missing} of ${answer.cells} areas in, waiting ${wait}s for the rest`);
+    await sleep(wait * 1000);
   }
 }
 
@@ -422,7 +453,10 @@ export async function capture(opts, log = console.log) {
           // A hair inside the cell, so the server snaps to exactly this one.
           const inset = { south: c.south + 1e-4, west: c.west + 1e-4, north: c.north - 1e-4, east: c.east - 1e-4 };
           try {
-            mergeInto(acc, name, await getJsonPatiently(srv, REGION_SPECS[name].path, { ...params, bbox: bboxStr(inset) }, log));
+            const answer = await getCellPatiently(srv, REGION_SPECS[name].path, { ...params, bbox: bboxStr(inset) }, log,
+              { fresh: !opts.resume });
+            if (answer?.partial) failures++;
+            mergeInto(acc, name, answer);
           } catch (e) { failures++; lastErr = e; }
           if ((i + 1) % 5 === 0) log(`    ${name}: ${i + 1}/${cells.length} cells, ${acc.items?.size || 0} so far`);
         }
@@ -619,7 +653,7 @@ export async function capture(opts, log = console.log) {
           const url = c[key];
           if (!url || !/^https?:/.test(url)) { c[key] = null; return; }
           const rel = `data/cams/${crypto.createHash('sha1').update(String(c.id)).digest('hex').slice(0, 16)}.jpg`;
-          const ok = await download(url, path.join(out, rel), { accept: /^image\//, maxBytes: 3e6 });
+          const ok = await download(url, path.join(out, rel), { accept: /^image\//, maxBytes: 3e6, replace: !opts.resume });
           c[key] = ok ? rel : null;
           if (ok) saved++;
         });

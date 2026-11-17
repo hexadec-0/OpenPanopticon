@@ -219,6 +219,9 @@ class OpenPanopticon {
     this.refreshAll();
     this.refreshSignals().catch(() => {});
     if (this.layers.shodan.enabled) this.refreshShodanCredits().catch(() => {});
+    if (!this.pendingBasemap && !this.saved?.basemap?.provider && globalThis.OP_DEMO?.defaultBasemap) {
+      this.pendingBasemap = globalThis.OP_DEMO.defaultBasemap;
+    }
     if (this.pendingBasemap && !this.basemapAvailable(this.pendingBasemap)) {
       this.pendingBasemap = null;
     }
@@ -416,6 +419,11 @@ class OpenPanopticon {
    * Gulf of Guinea — no matter where the operator was actually looking.
    */
   currentBbox() {
+    // The static demo holds one fixed snapshot: every query asks for all of
+    // it, so the first load brings in everything and moving the camera has
+    // nothing new to fetch.
+    const r = globalThis.OP_DEMO?.region;
+    if (r) return [r.south, r.west, r.north, r.east].map((v) => Number(v).toFixed(4)).join(',');
     const cam = this.viewer.camera;
     const carto = cam.positionCartographic;
     if (!carto) return null;
@@ -645,7 +653,7 @@ class OpenPanopticon {
   }
 
   /** Too high for a query to be worth making. */
-  tooHigh() { return this.altitude() > this.queryCeilingM; }
+  tooHigh() { return !globalThis.OP_DEMO && this.altitude() > this.queryCeilingM; }
 
   /** Step the ceiling up through the presets, wrapping round. */
   cycleQueryCeiling() {
@@ -822,7 +830,7 @@ class OpenPanopticon {
     // Debounced refetch after the camera settles.
     this.viewer.camera.moveEnd.addEventListener(() => {
       this.renderHud();
-      if (!this.autoRefresh) return;
+      if (!this.autoRefresh || globalThis.OP_DEMO) return;
       clearTimeout(this.moveTimer);
       this.moveTimer = setTimeout(() => this.refreshAll(), 700);
     });
@@ -2309,11 +2317,14 @@ class OpenPanopticon {
       const cnt = box.querySelector('.layer-count');
       if (this.locked?.[id]) { box.classList.remove('on'); cnt.textContent = this.lockedTag?.[id] || 'NO KEY'; continue; }
       box.classList.toggle('on', layer.enabled);
-      box.classList.toggle('loading', layer.status === 'loading');
+      // Under HOLD a live feed's readout is how old its data is. A poll that
+      // happens to be in flight must not hide that behind a loading spinner.
+      const frozen = !this.autoRefresh && (id === 'flights' || id === 'vessels');
+      box.classList.toggle('loading', layer.status === 'loading' && !frozen);
       box.classList.toggle('failed', layer.status === 'error');
       box.classList.toggle('held', layer.status === 'held');
       if (!layer.enabled) { cnt.textContent = '—'; cnt.title = ''; }
-      else if (layer.status === 'held' && !this.tooHigh()) {
+      else if (layer.status === 'held' && !this.tooHigh() && !frozen) {
         // Below the ceiling, so not held whatever the status says: the
         // refresh that clears it is on its way.
         cnt.textContent = '···';
@@ -2327,7 +2338,7 @@ class OpenPanopticon {
           + `currently ${Math.round(this.altitude() / 1000).toLocaleString()} km. `
           + 'Descend to query. Anything already found stays drawn.';
       }
-      else if (layer.status === 'loading') {
+      else if (layer.status === 'loading' && !frozen) {
         cnt.textContent = '···';
         const secs = layer.loadingSince ? Math.round((Date.now() - layer.loadingSince) / 1000) : 0;
         cnt.title = `Loading for this view${secs >= 3 ? ` — ${secs}s so far` : '…'}`
@@ -2365,7 +2376,7 @@ class OpenPanopticon {
         box.classList.remove('waiting');
         // Checked first: under HOLD a live feed's count is true but not
         // current, and saying how old it is matters more than anything else.
-        if (!this.autoRefresh && (id === 'flights' || id === 'vessels')) {
+        if (frozen) {
           // The count is still true, but it is not *current*, and for a live
           // feed that distinction is the whole point. Show how old it is.
           const anchor = id === 'flights'
@@ -2567,10 +2578,12 @@ class OpenPanopticon {
       // Auto-refresh being off is also a reason nothing is being fetched, so
       // it is shown here too. A cell claiming the terminal is querying when
       // it is not is worse than no cell at all.
-      gate.textContent = !this.autoRefresh ? 'PAUSED'
+      gate.textContent = globalThis.OP_DEMO ? 'SNAPSHOT' : !this.autoRefresh ? 'PAUSED'
         : high ? `HOLD ▲${km}km` : `ON <${km}km`;
       gate.classList.toggle('holding', high || !this.autoRefresh);
-      gate.title = !this.autoRefresh
+      gate.title = globalThis.OP_DEMO
+        ? 'Static snapshot: everything was loaded at once, so nothing more is fetched.'
+        : !this.autoRefresh
         ? 'Auto-refresh is off (the AUTO button reads HOLD), so nothing is being '
           + 'fetched — live aircraft and vessels included. Press AUTO to resume, '
           + 'or SYNC for a single update.'

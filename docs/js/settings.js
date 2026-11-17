@@ -110,6 +110,7 @@ export function collect(wv) {
       from: wv.basemap?.from || null,
       to: wv.basemap?.to || null,
       maxCloud: wv.basemap?.maxCloud ?? 40,
+      uniform: wv.uniform ? wv.uniform.enabled : true,
     },
 
     overlays: {
@@ -123,6 +124,9 @@ export function collect(wv) {
       labelStyle: wv.labels.style,
       labelContrast: wv.labels.contrast,
       labelBoost: wv.labels.boost,
+      night: !!wv.night?.on,
+      nightDarkness: wv.night?.darkness ?? 0.7,
+      nightLights: wv.night?.lights ?? 0.7,
     },
   };
 }
@@ -205,12 +209,19 @@ export function apply(wv, s) {
     wv.basemap.from = s.basemap.from || wv.basemap.from;
     wv.basemap.to = s.basemap.to || wv.basemap.to;
     if (Number.isFinite(s.basemap.maxCloud)) wv.basemap.maxCloud = s.basemap.maxCloud;
+    if (wv.uniform && typeof s.basemap.uniform === 'boolean') wv.uniform.enabled = s.basemap.uniform;
   }
 
   const o = s.overlays || {};
   if (o.labelStyle) wv.labels.style = o.labelStyle;
   if (Number.isFinite(o.labelContrast)) wv.labels.setContrast(o.labelContrast);
   if (typeof o.labelBoost === 'boolean') wv.labels.boost = o.labelBoost;
+  if (wv.night && Number.isFinite(o.nightDarkness)) {
+    wv.night.darkness = Math.min(1, Math.max(0, o.nightDarkness));
+  }
+  if (wv.night && Number.isFinite(o.nightLights)) {
+    wv.night.lights = Math.min(1, Math.max(0, o.nightLights));
+  }
   if (o.imageryLayer) wv.imagery.selected = o.imageryLayer;
   if (o.imageryDate) wv.imagery.date = o.imageryDate;
   if (Number.isFinite(o.imageryAlpha)) wv.imagery.alpha = o.imageryAlpha;
