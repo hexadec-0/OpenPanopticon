@@ -68,9 +68,26 @@ e2e('layers and the detail panel', () => {
     await page.select(`${row('shodan')} select.ctl`, 'risk');
     const risk = await page.$$eval(`${row('shodan')} .legend-item`, (ns) => ns.map((n) => n.textContent));
     assert.deepEqual(risk, ['known CVEs 1', 'no known CVEs 1']);
-    assert.match(await text$(page, `${row('shodan')} .note`), /3 total matches in view; the first page is drawn/);
+    assert.match(await text$(page, `${row('shodan')} .note`), /About \d+ matches in view; the first page of each cell is drawn/);
     // Switching the layer on reads the credit count without a full refresh.
     await page.waitForFunction(() => /100 query credits left/.test(document.querySelector('.layer[data-layer="shodan"] .layer-count').title));
+  });
+
+  test('SYNC leaves Shodan on its paid-for answers; Shift+SYNC re-buys them', async () => {
+    const searches = () => stack.server.mock.callsTo('/shodan/host/search').length;
+    const settle = () => new Promise((r) => setTimeout(r, 500));
+    const before = searches();
+    await page.click('#refresh-now');
+    await waitForLayer(page, 'shodan');
+    await settle();
+    assert.equal(searches(), before, 'a plain SYNC spent no Shodan credit');
+
+    await page.keyboard.down('Shift');
+    await page.click('#refresh-now');
+    await page.keyboard.up('Shift');
+    for (let i = 0; i < 50 && searches() === before; i++) await new Promise((r) => setTimeout(r, 100));
+    assert.ok(searches() > before, 'Shift+SYNC asked Shodan again');
+    await waitForLayer(page, 'shodan');
   });
 
   test('Shodan detail: host, CVE links and the reputation lookup', async () => {

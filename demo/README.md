@@ -102,9 +102,10 @@ otherwise tiles already on disk are reused, which is quicker.
 returned. Read the main README's *Terms of service* before publishing. Also:
 
 - one still frame per webcam
-- three base maps, picked in the BASEMAP menu: the dark vector map (the
-  default), the standard OpenStreetMap street map, and EOX's Sentinel-2
-  cloudless satellite mosaic
+- four base maps, picked in the BASEMAP menu: USGS aerial imagery (the
+  default; public domain, about 1 m per pixel, deepest over Manhattan), the
+  dark vector map (drawn sharp at any zoom), the standard OpenStreetMap
+  street map, and EOX's Sentinel-2 cloudless satellite mosaic
 - labels, radar, clouds, and NASA imagery tiles
 - OpenStreetMap buildings for Manhattan and the waterfront
 - place names, for the search box

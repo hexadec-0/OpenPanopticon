@@ -213,6 +213,24 @@ describe('ShortbreadImageryProvider', () => {
     assert.ok(!SHORTBREAD_LAYERS.has('pois'));
   });
 
+  test('past the data\'s last level it redraws part of the parent tile, fetched once', async () => {
+    const tile = encodeMvt([
+      { name: 'buildings', features: [{ type: 'polygon', rings: [[2048, 2048, 3072, 2048, 3072, 3072]] }] },
+    ]);
+    const fetchMock = mock.fn(async () => new Response(tile, { status: 200 }));
+    globalThis.fetch = fetchMock;
+    const p = new ShortbreadImageryProvider({ url: 'https://t.example/{z}/{x}/{y}', dataMaximumLevel: 14, maximumLevel: 19 });
+    assert.equal(p.maximumLevel, 19);
+    // Level 16, x/y 4n+2: the lower-right quarter's top-left of parent (n, n) at 14.
+    const canvas = await p.requestImage(4 * 10 + 2, 4 * 11 + 2, 16);
+    await p.requestImage(4 * 10 + 3, 4 * 11 + 2, 16);
+    assert.equal(fetchMock.mock.calls.length, 1, 'siblings share one parent fetch');
+    assert.equal(fetchMock.mock.calls[0].arguments[0], 'https://t.example/14/10/11');
+    // The parent's centre (2048, 2048 of 4096) lands at this tile's top-left.
+    const moves = draws(canvas).filter(([op]) => op === 'moveTo');
+    assert.deepEqual(moves[0].slice(1), [0, 0]);
+  });
+
   test('204 and 404 are "nothing here": a blank tile, no warning', async () => {
     const warn = mock.method(console, 'warn', () => {});
     for (const code of [204, 404]) {

@@ -12,7 +12,7 @@ import os from 'node:os';
 import path from 'node:path';
 import vm from 'node:vm';
 import zlib from 'node:zlib';
-import { capture, REGION } from '../../demo/capture.mjs';
+import { capture, REGION, grid, alignTo } from '../../demo/capture.mjs';
 import { build } from '../../demo/build.mjs';
 
 const SITE = 'http://demo.test/OpenPanopticon/';
@@ -127,7 +127,7 @@ describe('capture --maps-only', () => {
     assert.deepEqual(m.buildings, manifest.buildings);
     assert.deepEqual(Object.keys(m.steps).sort(), Object.keys(manifest.steps).sort(), 'earlier steps kept');
     const ran = lines.filter((l) => / …$/.test(l)).map((l) => l.trim().replace(/ …$/, ''));
-    assert.deepEqual(ran.sort(), ['basemap', 'labels', 'satellite mosaic', 'street map']);
+    assert.deepEqual(ran.sort(), ['aerial imagery', 'basemap', 'labels', 'satellite mosaic', 'street map']);
     build({ out, env: path.join(out, 'no.env') }, quiet);
   });
 });
@@ -179,7 +179,7 @@ describe('demo runtime', () => {
     assert.equal(status, 200);
     assert.equal(body.demo, true);
     const avail = body.presets.basemaps.filter((b) => b.available).map((b) => b.key);
-    assert.deepEqual(avail, ['osm', 'shortbread', 's2cloudless']);
+    assert.deepEqual(avail, ['osm', 'shortbread', 'usgs', 's2cloudless']);
     const sat = body.presets.basemaps.find((b) => b.key === 's2cloudless');
     assert.match(sat.label, /^Satellite \(Sentinel-2 cloudless \d{4}\)$/);
   });
@@ -195,6 +195,12 @@ describe('demo runtime', () => {
     assert.equal(d.url, `${SITE}data/tiles/s2cloudless/{z}/{x}/{y}.jpg`);
     assert.equal(d.maxLevel, 14);
     assert.match(d.attribution, /s2maps\.eu/);
+    const u = (await get('/api/basemap', { provider: 'usgs' })).body;
+    assert.equal(u.url, `${SITE}data/tiles/usgs/{z}/{x}/{y}.jpg`);
+    assert.equal(u.maxLevel, 16);
+    assert.match(u.attribution, /USGS/);
+    assert.ok(fs.existsSync(path.join(out, 'data/tiles/usgs/0/0/0.jpg')));
+    assert.equal(win.OP_DEMO.defaultBasemap, 'usgs');
   });
 
   test('config carries no Ion token; geoip answers New York', async () => {
@@ -324,5 +330,21 @@ describe('demo runtime', () => {
     assert.equal(ls.getItem('openpanopticon.settings.v1'), null);
     ls.setItem('openpanopticon.detailWidth', '420');
     assert.equal(ls.getItem('openpanopticon.detailWidth'), '420');
+  });
+});
+
+describe('capture: Shodan cells', () => {
+  test('the Shodan sweep is whole server cells, so none is bought twice', () => {
+    const step = 0.25;
+    const cells = grid(alignTo(REGION, step), step);
+    // 40.25..41.0 by -74.5..-73.5 around New York: 3 rows of 4.
+    assert.equal(cells.length, 12);
+    const onGrid = (v) => Math.abs(v / step - Math.round(v / step)) < 1e-9;
+    for (const c of cells) {
+      for (const v of [c.south, c.west, c.north, c.east]) assert.ok(onGrid(v), `${v} is off the grid`);
+      assert.ok(Math.abs(c.north - c.south - step) < 1e-9 && Math.abs(c.east - c.west - step) < 1e-9);
+    }
+    const box = alignTo(REGION, step);
+    assert.ok(box.south <= REGION.south && box.west <= REGION.west && box.north >= REGION.north && box.east >= REGION.east);
   });
 });

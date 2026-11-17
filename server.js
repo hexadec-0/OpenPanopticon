@@ -1013,9 +1013,6 @@ async function shodanSearch({ bbox, preset, custom, minGeo = true }) {
   const b = parseBbox(bbox);
   if (!b) throw new UpstreamError(400, 'bbox required as south,west,north,east');
 
-  // A fixed cell, not one sized to the view: zooming must not re-charge for
-  // a place already paid for. Before settling on the snapped box, reuse any
-  // box already bought that covers this view — see shodanIndex().
   // Shodan has no bbox filter; geo:lat,lon,radius_km is the spatial primitive.
   // With the "all" preset the base is empty and the geo filter stands alone,
   // which Shodan accepts as a valid (credit-consuming) filtered query.
@@ -1027,77 +1024,154 @@ async function shodanSearch({ bbox, preset, custom, minGeo = true }) {
     return `${base} geo:"${cc.lat.toFixed(4)},${cc.lon.toFixed(4)},${rr}"`.trim();
   };
 
-  let q = snapFixed(b, SHODAN_CELL_DEG, SHODAN_MAX_DEG);
-  if (!wantsFresh()) {
-    const bought = await findBoughtShodanBox(b, base, (box) => isCached(`shodan:${buildQuery(box)}`, RETAIN['shodan.hosts']));
-    if (bought) q = bought;
+  // Bought square by square. The view is covered with fixed SHODAN_CELL_DEG
+  // cells, and each cell is one query, one credit, cached on its own. Cells
+  // already held are served as they are; only the rest are bought. Buying
+  // the whole view as one box instead meant that a view reaching a little
+  // past what was held bought a new box, overlap and all: 20 credits for 12
+  // cells over New York. Two requests wanting the same cell share one
+  // purchase, since cached() joins a fetch already in flight for its key.
+  const cover = snapFixed(b, SHODAN_CELL_DEG, SHODAN_MAX_DEG);
+  const cells = overpassCellsOf(cover);
+  const ttl = RETAIN['shodan.hosts'];
+  const keyOf = (c) => `shodan:${buildQuery(c)}`;
+
+  const held = new Map();   // cell key -> raw Shodan answer
+  const missing = [];
+  for (const c of cells) {
+    const v = await peekCached(keyOf(c), ttl);
+    if (v && typeof v === 'object') held.set(c.key, v);
+    else missing.push(c);
   }
-  const query = buildQuery(q);
 
-  const url = new URL('https://api.shodan.io/shodan/host/search');
-  url.searchParams.set('key', CFG.shodanKey);
-  url.searchParams.set('query', query);
-  url.searchParams.set('minify', 'true');
+  // Nearest the view's centre first, so a capped request fills in the middle
+  // of the screen before its edges.
+  const mid = bboxCenter(b);
+  const away = (c) => {
+    const cc = bboxCenter(c);
+    return (cc.lat - mid.lat) ** 2 + (cc.lon - mid.lon) ** 2;
+  };
+  missing.sort((x, y) => away(x) - away(y));
+  const toBuy = missing.slice(0, SHODAN_MAX_NEW_CELLS);
 
-  // TTL.static, and on disk. Shodan rescans a host over days, so a fresher
-  // answer would rarely differ — and every miss spends a query credit, which
-  // is the one resource here that cannot be earned back by waiting.
-  const key = `shodan:${query}`;
-  let fetched = false;
-  const raw = await cachedPersistent(key, RETAIN['shodan.hosts'], async () => {
-    // About to spend a credit. Stop short of the wall rather than through
-    // it: running out mid-session leaves the layer dead until the month
-    // rolls over, and the reserve is what a deliberate lookup draws on.
-    await assertShodanCredit();
-    const out = await grab(url, {}, { label: 'Shodan' });
-    fetched = true;
-    return out;
-  });
-  await rememberShodanBox(q, base, fetched);
+  let failure = null;
+  let bought = 0;
+  for (const c of toBuy) {
+    try {
+      held.set(c.key, await shodanCell(buildQuery(c), keyOf(c), ttl));
+      bought++;
+    } catch (e) {
+      // Keep what is already in hand rather than discarding it; only a view
+      // with nothing at all to show is an error.
+      if (!(e instanceof UpstreamError) || held.size === 0) throw e;
+      failure = e;
+      break;
+    }
+  }
 
-  const matches = (raw.matches || [])
-    .map((m) => {
-      const loc = m.location || {};
-      if (minGeo && (loc.latitude == null || loc.longitude == null)) return null;
-      return {
-        ip: m.ip_str,
-        lat: loc.latitude,
-        lon: loc.longitude,
-        city: loc.city || null,
-        country: loc.country_name || loc.country_code || null,
-        port: m.port,
-        transport: m.transport || 'tcp',
-        org: m.org || m.isp || null,
-        asn: m.asn || null,
-        product: m.product || null,
-        version: m.version || null,
-        os: m.os || null,
-        hostnames: m.hostnames || [],
-        vulns: m.vulns ? Object.keys(m.vulns) : [],
-        tags: m.tags || [],
-        timestamp: m.timestamp || null,
-        banner: typeof m.data === 'string' ? m.data.slice(0, 900) : null,
-        category: serviceCategory(m.port, m.product, m.data),
-      };
-    })
-    .filter(Boolean);
+  // Assemble the view. A geo: query is a circle around the cell, so it
+  // reaches into the neighbouring cells; each host is taken only from the
+  // cell it sits in, so neighbouring answers neither double up nor stand in
+  // for a cell that was never bought.
+  const seen = new Set();
+  const matches = [];
+  let total = 0;
+  for (const c of cells) {
+    const raw = held.get(c.key);
+    if (!raw) continue;
+    total += Number(raw.total) || 0;
+    for (const m of raw.matches || []) {
+      const rec = shodanRecord(m, minGeo);
+      if (!rec) continue;
+      if (rec.lat != null && rec.lon != null
+        && !(rec.lat >= c.south && rec.lat < c.north && rec.lon >= c.west && rec.lon < c.east)) continue;
+      const id = `${rec.ip}:${rec.port}/${rec.transport}`;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      matches.push(rec);
+    }
+  }
 
   const byCategory = {};
   for (const m of matches) byCategory[m.category] = (byCategory[m.category] || 0) + 1;
 
-  return {
-    query,
-    // The cell this answer covers. The browser marks *this* as covered, not
-    // the view it happened to ask about, so every zoom and pan inside the
-    // cell is served locally instead of being charged again.
-    queried: { south: q.south, west: q.west, north: q.north, east: q.east },
+  const pending = cells.filter((c) => !held.has(c.key)).length;
+  const out = {
+    query: base,
+    // The cells this answer covers, as one box. The browser marks *this* as
+    // covered, not the view it happened to ask about, so every zoom and pan
+    // inside it is served locally. Left out while cells are still owed.
+    queried: pending ? null : { south: cover.south, west: cover.west, north: cover.north, east: cover.east },
     cellDeg: SHODAN_CELL_DEG,
-    total: raw.total ?? matches.length,
+    cells: cells.length,
+    bought,
+    // Shodan's own count for each cell's circle, added up: an estimate, as
+    // neighbouring circles overlap.
+    total,
     returned: matches.length,
     note: custom ? null : presetDef.note,
     byCategory,
     vulnerable: matches.filter((m) => m.vulns.length).length,
     matches,
+  };
+  if (!pending) return out;
+  return {
+    ...out,
+    partial: true,
+    missing: pending,
+    // Over the per-request cap: the next batch can go straight away (the
+    // gate spaces the calls). After a refusal: whatever it said, or a minute.
+    retryAfter: failure ? (failure.retryAfter ?? 60) : 2,
+    partialReason: failure ? failure.message
+      : `${pending} more ${pending === 1 ? 'cell' : 'cells'} in view, bought ${SHODAN_MAX_NEW_CELLS} at a time.`,
+  };
+}
+
+/** One cell's raw answer: cached, or bought for one query credit. */
+function shodanCell(query, key, ttl) {
+  const url = new URL('https://api.shodan.io/shodan/host/search');
+  url.searchParams.set('key', CFG.shodanKey);
+  url.searchParams.set('query', query);
+  url.searchParams.set('minify', 'true');
+  // On disk, for RETAIN['shodan.hosts']. Shodan rescans a host over days, so
+  // a fresher answer would rarely differ, and every miss spends a credit.
+  return cachedPersistent(key, ttl, async () => {
+    // About to spend a credit. Stop short of the wall rather than through
+    // it: running out mid-session leaves the layer dead until the month
+    // rolls over, and the reserve is what a deliberate lookup draws on.
+    await assertShodanCredit();
+    const out = await shodanGrab(url);
+    // The credit count is cached for a minute; count this one off it, so a
+    // view bought cell by cell meets the reserve on the cell that reaches it.
+    const info = cache.get('shodan:apiinfo')?.value;
+    if (info && Number.isFinite(Number(info.query_credits))) info.query_credits = Number(info.query_credits) - 1;
+    return out;
+  });
+}
+
+/** A Shodan banner as the browser draws it, or null if it has no place. */
+function shodanRecord(m, minGeo) {
+  const loc = m.location || {};
+  if (minGeo && (loc.latitude == null || loc.longitude == null)) return null;
+  return {
+    ip: m.ip_str,
+    lat: loc.latitude,
+    lon: loc.longitude,
+    city: loc.city || null,
+    country: loc.country_name || loc.country_code || null,
+    port: m.port,
+    transport: m.transport || 'tcp',
+    org: m.org || m.isp || null,
+    asn: m.asn || null,
+    product: m.product || null,
+    version: m.version || null,
+    os: m.os || null,
+    hostnames: m.hostnames || [],
+    vulns: m.vulns ? Object.keys(m.vulns) : [],
+    tags: m.tags || [],
+    timestamp: m.timestamp || null,
+    banner: typeof m.data === 'string' ? m.data.slice(0, 900) : null,
+    category: serviceCategory(m.port, m.product, m.data),
   };
 }
 
@@ -1141,7 +1215,7 @@ async function shodanCredits() {
   if (!CFG.shodanKey) throw new UpstreamError(412, 'SHODAN_API_KEY is not set in .env');
   const url = new URL('https://api.shodan.io/api-info');
   url.searchParams.set('key', CFG.shodanKey);
-  return cached('shodan:apiinfo', RETAIN['shodan.credits'], () => grab(url, {}, { label: 'Shodan' }));
+  return cached('shodan:apiinfo', RETAIN['shodan.credits'], () => shodanGrab(url));
 }
 
 
@@ -1157,6 +1231,43 @@ const SHODAN_MAX_DEG = Number(process.env.SHODAN_MAX_DEG || '2');
 // Stop spending when the account gets this low, leaving a reserve for
 // deliberate lookups rather than map panning.
 const SHODAN_CREDIT_FLOOR = Number(process.env.SHODAN_CREDIT_FLOOR || '10');
+
+// Most new cells one request buys. A view needing more gets what is held
+// plus this many cells nearest its centre, marked partial, and the browser
+// asks for the rest straight after. This keeps one request to seconds (cells
+// are bought one at a time, SHODAN_MIN_GAP_MS apart); it paces spending, it
+// does not limit it. SHODAN_CREDIT_FLOOR is the limit.
+const SHODAN_MAX_NEW_CELLS = Math.max(1, Number(process.env.SHODAN_MAX_NEW_CELLS || '12') || 12);
+
+// Shodan allows about one request a second per key and answers a faster
+// burst with refusals. Every call to it, search or credit check, waits its
+// turn here, at least this far apart. The demo capture's cell sweep used to
+// fire them back to back, well over the limit.
+const shodanGate = {
+  chain: Promise.resolve(),
+  lastDoneAt: 0,
+  minGapMs: (() => {
+    const v = Number(process.env.SHODAN_MIN_GAP_MS || '1100');
+    return Number.isFinite(v) && v >= 0 ? v : 1100;
+  })(),
+};
+
+/** grab() for api.shodan.io, one at a time and spaced by shodanGate.minGapMs. */
+function shodanGrab(url) {
+  const run = shodanGate.chain.then(async () => {
+    const wait = shodanGate.lastDoneAt + shodanGate.minGapMs - Date.now();
+    if (wait > 0) await sleep(wait);
+    try {
+      return await grab(url, {}, { label: 'Shodan' });
+    } finally {
+      // Counted from the end of the call, not its start: a slow answer is
+      // no reason to send the next one sooner.
+      shodanGate.lastDoneAt = Date.now();
+    }
+  });
+  shodanGate.chain = run.then(() => {}, () => {});
+  return run;
+}
 
 /**
  * Refuse to spend a credit when the account is nearly out.
@@ -1190,61 +1301,6 @@ async function assertShodanCredit() {
 function boxContains(outer, b) {
   return outer.south <= b.south && outer.north >= b.north
       && outer.west <= b.west && outer.east >= b.east;
-}
-
-/**
- * The boxes Shodan has already been paid for, per query filter.
- *
- * Queries are the minimal whole-cell cover of the view, so a later view that
- * sits inside an earlier, larger box snaps to a different (smaller) box and
- * would be charged again. Keeping a list of what was bought lets that view be
- * answered from the box that already covers it. The list lives in memory and
- * on disk, so it outlasts a restart just as the answers themselves do; an
- * entry is only used while its answer is still cached.
- */
-const SHODAN_INDEX_KEY = 'shodan:index';
-const SHODAN_INDEX_MAX = 500;
-let shodanIdx = null;
-
-async function shodanIndex() {
-  if (!shodanIdx) {
-    const stored = await readDiskCache(SHODAN_INDEX_KEY, RETAIN['shodan.hosts']);
-    // The filter can be a query the operator typed, so the index keeps only
-    // a hash of it. Entries saved before that carry it in clear: convert them.
-    shodanIdx = (Array.isArray(stored) ? stored : []).map((e) => {
-      if (!e || typeof e.base !== 'string') return e;
-      const { base, ...rest } = e;
-      return { ...rest, baseHash: diskKeyHash(base) };
-    });
-  }
-  const cutoff = Date.now() - RETAIN['shodan.hosts'];
-  shodanIdx = shodanIdx.filter((e) => e && e.savedAt > cutoff);
-  return shodanIdx;
-}
-
-/** The smallest bought box for this filter that covers the view, if any. */
-async function findBoughtShodanBox(view, base, stillCached) {
-  const hits = (await shodanIndex())
-    .filter((e) => e.baseHash === diskKeyHash(base) && boxContains(e, view))
-    .sort((x, y) => (x.north - x.south) * (x.east - x.west) - (y.north - y.south) * (y.east - y.west));
-  for (const e of hits) {
-    const box = { south: e.south, west: e.west, north: e.north, east: e.east, step: e.step };
-    if (await stillCached(box)) return box;
-  }
-  return null;
-}
-
-/** Record a box as bought. `fresh` means its answer was just fetched. */
-async function rememberShodanBox(q, base, fresh) {
-  const idx = await shodanIndex();
-  const baseHash = diskKeyHash(base);
-  const i = idx.findIndex((e) => e.baseHash === baseHash && e.south === q.south && e.west === q.west
-    && e.north === q.north && e.east === q.east);
-  if (i >= 0 && !fresh) return;            // already known, nothing new to save
-  if (i >= 0) idx.splice(i, 1);
-  idx.push({ south: q.south, west: q.west, north: q.north, east: q.east, step: q.step, baseHash, savedAt: Date.now() });
-  if (idx.length > SHODAN_INDEX_MAX) idx.splice(0, idx.length - SHODAN_INDEX_MAX);
-  await writeDiskCache(SHODAN_INDEX_KEY, idx);
 }
 
 /** Is this key already answered, in memory or on disk? */
@@ -6249,7 +6305,6 @@ const ROUTES = {
     const files = await clearDiskCache();
     const entries = cache.size;
     cache.clear();
-    shodanIdx = null;
     return { ok: true, memoryEntries: entries, diskEntries: files };
   },
   '/api/basemap': (q) => basemap({
@@ -6925,7 +6980,8 @@ module.exports = {
   reqCtx, wantsFresh, isCached, peekCached, overpassCellsOf, overpassBackoffMs, overpassLimits, nearestFirst,
   parse511, loadDotEnv, clip, htmlText, refusalReason, UpstreamError, grab, USER_AGENT,
   parseBbox, clamp, bboxCenter, bboxRadiusKm, snapFixed, viewCell, VIEW_CELL_DEG, VIEW_MAX_DEG,
-  boxContains, shodanIndex, findBoughtShodanBox, rememberShodanBox, serviceCategory, SHODAN_PRESETS, SHODAN_CELL_DEG,
+  boxContains, shodanCell, shodanRecord, SHODAN_MAX_NEW_CELLS, serviceCategory, SHODAN_PRESETS, SHODAN_CELL_DEG,
+  shodanGate, shodanGrab,
   openSky, openSkyPollSec, openSkyRefillSec, noteOpenSkyHeaders, assertOpenSkyCredit, OPENSKY_FLOOR,
   SAT_GROUPS, fetchTle, readCachedTle, writeCachedTle, tleCachePath,
   nearbyPhotos, photoTakenAt, orbitalElements, SPACETRACK_GROUPS, celestrakHold, CREDENTIAL_RESETS,

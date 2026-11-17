@@ -70,6 +70,11 @@ export class ShortbreadImageryProvider {
   constructor({
     url = 'https://tiles.versatiles.org/tiles/osm/{z}/{x}/{y}',
     maximumLevel = 14,
+    // The deepest level the server has tiles for. Past it the provider keeps
+    // drawing: a vector tile holds its shapes at full precision, so the
+    // parent tile redrawn larger stays sharp where stretching the picture
+    // Cesium already has would go soft.
+    dataMaximumLevel = maximumLevel,
     tileSize = 512,
     credit = '© OpenStreetMap contributors · Shortbread via VersaTiles',
   } = {}) {
@@ -89,7 +94,11 @@ export class ShortbreadImageryProvider {
     this._errorEvent = new Cesium.Event();
     this._credit = new Cesium.Credit(credit, false);
     this._maximumLevel = maximumLevel;
+    this._dataMaximumLevel = Math.min(dataMaximumLevel, maximumLevel);
     this._failures = 0;
+    // Decoded data tiles, newest last. Every overzoomed tile shares its
+    // parent with 4^n siblings, so each parent is fetched and decoded once.
+    this._decoded = new Map();
   }
 
   /* Cesium's ImageryProvider surface. */
@@ -110,30 +119,48 @@ export class ShortbreadImageryProvider {
   pickFeatures() { return undefined; }
 
   async requestImage(x, y, level) {
+    // Past the data's deepest level, draw the matching part of the parent.
+    const over = Math.max(0, level - this._dataMaximumLevel);
+    const n = 2 ** over;
+    const px = Math.floor(x / n);
+    const py = Math.floor(y / n);
+    const z = level - over;
     const url = this._url
-      .replace('{z}', level).replace('{x}', x).replace('{y}', y);
+      .replace('{z}', z).replace('{x}', px).replace('{y}', py);
 
-    let buf;
-    try {
-      const res = await fetch(viaCache(url), { mode: 'cors' });
-      // 204/404 is how a tile server says "nothing here", which is ordinary
-      // over ocean. Draw the empty tile rather than leaving a hole.
-      if (res.status === 204 || res.status === 404) return this._blank();
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      buf = new Uint8Array(await res.arrayBuffer());
-    } catch (e) {
-      // Returning undefined makes Cesium retry and eventually surface an
-      // error; a blank tile keeps the globe coherent while the rest loads.
-      if (++this._failures < 4) console.warn('shortbread tile failed', url, e.message);
-      return this._blank();
+    let layers = this._decoded.get(url);
+    if (layers) {
+      this._decoded.delete(url);
+      this._decoded.set(url, layers);
+    } else {
+      let buf;
+      try {
+        const res = await fetch(viaCache(url), { mode: 'cors' });
+        // 204/404 is how a tile server says "nothing here", which is ordinary
+        // over ocean. Draw the empty tile rather than leaving a hole.
+        if (res.status === 204 || res.status === 404) return this._blank();
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        buf = new Uint8Array(await res.arrayBuffer());
+      } catch (e) {
+        // Returning undefined makes Cesium retry and eventually surface an
+        // error; a blank tile keeps the globe coherent while the rest loads.
+        if (++this._failures < 4) console.warn('shortbread tile failed', url, e.message);
+        return this._blank();
+      }
+      try {
+        layers = decodeMvt(buf, { layers: DRAWN, tags: TAGS });
+      } catch (e) {
+        console.warn('shortbread tile undecodable', url, e.message);
+        return this._blank();
+      }
+      if (over) {
+        this._decoded.set(url, layers);
+        if (this._decoded.size > 32) this._decoded.delete(this._decoded.keys().next().value);
+      }
     }
 
-    try {
-      return this._draw(decodeMvt(buf, { layers: DRAWN, tags: TAGS }));
-    } catch (e) {
-      console.warn('shortbread tile undecodable', url, e.message);
-      return this._blank();
-    }
+    const size = this._tileSize;
+    return this._draw(layers, { scale: n, ox: (x - px * n) * size, oy: (y - py * n) * size });
   }
 
   _canvas() {
@@ -151,7 +178,12 @@ export class ShortbreadImageryProvider {
     return c;
   }
 
-  _draw(layers) {
+  /**
+   * Draw decoded layers onto one tile. `scale` and the offsets place a part
+   * of a parent tile when overzooming; line widths stay in screen pixels, so
+   * roads keep their weight at every level instead of fattening.
+   */
+  _draw(layers, { scale = 1, ox = 0, oy = 0 } = {}) {
     const c = this._canvas();
     const g = c.getContext('2d');
     const size = this._tileSize;
@@ -164,12 +196,12 @@ export class ShortbreadImageryProvider {
     // One scale for the whole tile: Shortbread uses extent 4096 throughout,
     // but read it per layer rather than assuming.
     const path = (rings, extent) => {
-      const k = size / extent;
+      const k = (size / extent) * scale;
       g.beginPath();
       for (const ring of rings) {
         for (let i = 0; i < ring.length; i += 2) {
-          const px = ring[i] * k;
-          const py = ring[i + 1] * k;
+          const px = ring[i] * k - ox;
+          const py = ring[i + 1] * k - oy;
           if (i === 0) g.moveTo(px, py); else g.lineTo(px, py);
         }
       }
@@ -246,5 +278,11 @@ export class ShortbreadImageryProvider {
     return c;
   }
 }
+
+/**
+ * How deep the vector map is drawn, past the data's own last level. 19 is
+ * street-front detail; beyond it a z14 tile's 4096-unit grid starts to show.
+ */
+export const SHORTBREAD_DRAW_MAX = 19;
 
 export { PALETTE as SHORTBREAD_PALETTE, DRAWN as SHORTBREAD_LAYERS };

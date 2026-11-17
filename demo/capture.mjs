@@ -13,7 +13,7 @@
  *
  *   data/manifest.json        when and where, and what worked
  *   data/api/...              one JSON file per answer the page needs
- *   data/tiles/...            base maps (vector, OSM streets, Sentinel-2 cloudless),
+ *   data/tiles/...            base maps (vector, OSM streets, USGS aerial, Sentinel-2 cloudless),
  *                             radar, clouds, NASA imagery
  *   tiles/carto/...           label tiles, at the path the page expects
  *   data/cams/...             one still frame per public camera
@@ -22,7 +22,9 @@
  * Then `node demo/build.mjs` copies the app next to it. Each capture asks
  * the upstreams afresh for the layer data (bypassing the server's disk cache)
  * and downloads every camera still again, so the snapshot shows the moment
- * it was taken. Map tiles and buildings already on disk are kept.
+ * it was taken. Map tiles and buildings already on disk are kept. Shodan is
+ * the exception: its answers cost a query credit each, so a cell the server
+ * still holds is reused rather than bought again.
  *
  * --resume picks up an interrupted capture cheaply instead: layer answers
  * come out of the server's disk cache and camera stills on disk are kept.
@@ -81,18 +83,27 @@ const TILE_PLANS = {
   clouds: (max) => [[0, 3, WORLD], [4, max, METRO]],
   imagery: (max) => [[0, 3, WORLD], [4, Math.min(7, max), METRO], [8, max, CITY]],
   // OpenStreetMap's own tile servers are donated and their usage policy
-  // discourages bulk downloads, so this set is kept small: the deep zooms
-  // cover Manhattan and the waterfront only (about 1,300 tiles in all).
-  osm: [[0, 4, WORLD], [5, 9, METRO], [10, 12, CITY], [13, 13, REGION], [14, 15, BUILDINGS_BOX]],
+  // discourages bulk downloads, so this set is kept modest: street level
+  // (14) over the five boroughs, and the deepest zoom over Manhattan and the
+  // waterfront only (about 2,000 tiles in all).
+  osm: [[0, 4, WORLD], [5, 9, METRO], [10, 12, CITY], [13, 14, REGION], [15, 15, BUILDINGS_BOX]],
+  // The USGS National Map's orthoimagery: public domain, about 1 m per pixel
+  // over New York, cached by USGS to level 16. Level 15 over the boroughs and
+  // 16 over Manhattan keep it near 5,200 tiles (~130 MB); 16 everywhere would
+  // be well over 10,000.
+  usgs: [[0, 4, WORLD], [5, 9, METRO], [10, 12, CITY], [13, 15, REGION], [16, 16, BUILDINGS_BOX]],
   cloudless: [[0, 4, WORLD], [5, 9, METRO], [10, 12, CITY], [13, 14, REGION]],
 };
 const LABELS_MAX = 14;
 const SHORTBREAD_MAX = 14;
 const OSM_MAX = 15;
 const CLOUDLESS_MAX = 14;
+const USGS_MAX = 16;
+// ArcGIS tile caches put the row before the column.
+const USGS_TILES = 'https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{z}/{y}/{x}';
 const OSM_TILES = 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
 /** What --maps-only runs. */
-const MAP_STEPS = new Set(['basemap', 'labels', 'street map', 'satellite mosaic']);
+const MAP_STEPS = new Set(['basemap', 'labels', 'street map', 'aerial imagery', 'satellite mosaic']);
 /** EOX publishes one cloud-free mosaic per year; the newest that answers is used. */
 const CLOUDLESS_YEARS = [2025, 2024, 2023, 2022, 2021, 2020];
 const cloudlessUrl = (year, set = 'g') =>
@@ -141,6 +152,15 @@ export function grid(b, step) {
     }
   }
   return out;
+}
+
+/** The box widened outward to whole multiples of `step`, so grid() lines up with it. */
+export function alignTo(b, step) {
+  const r = (v) => Number(v.toFixed(6));
+  return {
+    south: r(Math.floor(b.south / step) * step), west: r(Math.floor(b.west / step) * step),
+    north: r(Math.ceil(b.north / step) * step), east: r(Math.ceil(b.east / step) * step),
+  };
 }
 
 const lon2x = (lon, z) => Math.floor(((lon + 180) / 360) * 2 ** z);
@@ -288,10 +308,11 @@ async function startLocalServer({ fixtures }) {
       env: { ...TEST_KEYS, CARTO_API_KEY: 'test-carto' },
       mock: registerDefaults(new UpstreamMock()),
     });
-    // Stand-ins for the two raster base maps, which the server never proxies.
+    // Stand-ins for the raster base maps, which the server never proxies.
     const { png } = require(path.join(ROOT, 'test/helpers/responses.cjs'));
     s.mock.on((url) => url.hostname === 'tile.openstreetmap.org', () => png());
     s.mock.on((url) => url.hostname === 'tiles.maps.eox.at', () => png());
+    s.mock.on((url) => url.hostname === 'basemap.nationalmap.gov', () => png());
     return { ...s, fixtures: true };
   }
 
@@ -428,6 +449,13 @@ export async function capture(opts, log = console.log) {
 
     // ---------------------------------------------------------------- region layers, cell by cell
     const cells = grid(REGION, 0.125);
+    // Shodan charges a credit per query and the server snaps every request
+    // out to whole SHODAN_CELL_DEG cells. A 0.125-degree grid that does not
+    // line up with those cells made neighbouring pieces buy the same cells
+    // again (20 credits for 12 cells over New York), so Shodan gets a grid
+    // of exactly the server's cells: one credit each, none bought twice.
+    const shodanStep = Number(srv.mod?.SHODAN_CELL_DEG) || 0.25;
+    const shodanCells = grid(alignTo(REGION, shodanStep), shodanStep);
     const regionParams = {
       shodan: src.shodan === 'configured' && { preset: 'all' },
       overpass: { presets: Object.keys(presets.overpass || {}).join(','), limit: 3000 },
@@ -449,16 +477,25 @@ export async function capture(opts, log = console.log) {
         const acc = {};
         let failures = 0;
         let lastErr = null;
-        for (const [i, c] of cells.entries()) {
+        const layerCells = name === 'shodan' ? shodanCells : cells;
+        for (const [i, c] of layerCells.entries()) {
           // A hair inside the cell, so the server snaps to exactly this one.
           const inset = { south: c.south + 1e-4, west: c.west + 1e-4, north: c.north - 1e-4, east: c.east - 1e-4 };
           try {
+            // Never forced for Shodan: a forced ask re-buys a cell the server
+            // already holds for 30 days, and Shodan rescans over weeks.
             const answer = await getCellPatiently(srv, REGION_SPECS[name].path, { ...params, bbox: bboxStr(inset) }, log,
-              { fresh: !opts.resume });
+              { fresh: !opts.resume && name !== 'shodan' });
             if (answer?.partial) failures++;
+            // Whole Shodan cells reach past the region's edge; keep only the
+            // hosts inside it, as the snapshot covers nothing else.
+            if (name === 'shodan' && Array.isArray(answer?.matches)) {
+              answer.matches = answer.matches.filter((m) => m.lat >= REGION.south && m.lat <= REGION.north
+                && m.lon >= REGION.west && m.lon <= REGION.east);
+            }
             mergeInto(acc, name, answer);
           } catch (e) { failures++; lastErr = e; }
-          if ((i + 1) % 5 === 0) log(`    ${name}: ${i + 1}/${cells.length} cells, ${acc.items?.size || 0} so far`);
+          if ((i + 1) % 5 === 0) log(`    ${name}: ${i + 1}/${layerCells.length} cells, ${acc.items?.size || 0} so far`);
         }
         if (!acc.items) throw lastErr || new Error('no answers');
         writeJson(D('api', 'region', `${name}.json`), { meta: acc.meta, items: [...acc.items.values()], params });
@@ -603,6 +640,7 @@ export async function capture(opts, log = console.log) {
     // Fetched straight from their publishers: the app's browser loads these
     // directly too, so there is no server route to go through.
     manifest.osm = null;
+    manifest.usgs = null;
     manifest.cloudless = null;
     if (opts.tiles) {
       await step('street map', async () => {
@@ -610,6 +648,15 @@ export async function capture(opts, log = console.log) {
           { accept: /image/, concurrency: 2 });
         manifest.tiles.osm = t;
         if (t.saved) manifest.osm = { maxLevel: OSM_MAX, attribution: '© OpenStreetMap contributors' };
+        return { count: t.saved };
+      });
+      await step('aerial imagery', async () => {
+        const t = await captureTiles('usgs', USGS_TILES, TILE_PLANS.usgs, D('tiles', 'usgs'), 'jpg', log,
+          { accept: /image/, concurrency: 4 });
+        manifest.tiles.usgs = t;
+        if (t.saved) {
+          manifest.usgs = { maxLevel: USGS_MAX, attribution: 'USGS The National Map: Orthoimagery (public domain)' };
+        }
         return { count: t.saved };
       });
       await step('satellite mosaic', async () => {

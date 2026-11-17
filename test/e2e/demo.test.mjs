@@ -143,12 +143,12 @@ e2e('static demo', () => {
     assert.equal(site.seen.filter((p) => /\/data\/api\//.test(p)).length, before);
   });
 
-  test('opens with ships on and the Sentinel-2 mosaic as the base map', async () => {
+  test('opens with ships on and the USGS aerial imagery as the base map', async () => {
     const { page } = app;
     assert.equal(await page.evaluate(() => WV.layers.vessels.enabled), true);
-    await page.waitForFunction(() => WV.basemap.provider === 's2cloudless'
-      && /data\/tiles\/s2cloudless\//.test(WV.viewer.imageryLayers.get(0).imageryProvider.url || ''), { timeout: 20_000 });
-    assert.equal(await page.$eval('#bm-provider', (n) => n.value), 's2cloudless');
+    await page.waitForFunction(() => WV.basemap.provider === 'usgs'
+      && /data\/tiles\/usgs\//.test(WV.viewer.imageryLayers.get(0).imageryProvider.url || ''), { timeout: 20_000 });
+    assert.equal(await page.$eval('#bm-provider', (n) => n.value), 'usgs');
   });
 
   test('saved targets and the reset button are not shown', async () => {
@@ -173,7 +173,7 @@ e2e('static demo', () => {
   test('the base-map menu offers the captured street map and satellite mosaic', async () => {
     const { page } = app;
     const opts = await page.$$eval('#bm-provider option', (os) => os.filter((o) => !o.disabled).map((o) => o.value));
-    assert.deepEqual(opts.sort(), ['osm', 's2cloudless', 'shortbread']);
+    assert.deepEqual(opts.sort(), ['osm', 's2cloudless', 'shortbread', 'usgs']);
     await page.select('#bm-provider', 's2cloudless');
     await page.waitForFunction(() => WV.basemap.status === 'ok'
       && /data\/tiles\/s2cloudless\//.test(WV.viewer.imageryLayers.get(0).imageryProvider.url || ''), { timeout: 20_000 });

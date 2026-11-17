@@ -20,8 +20,15 @@ beforeEach(async () => {
 });
 
 describe('/api/shodan', () => {
+  // Inside one 0.25° cell, away from HOME so the fixture's hosts sit inside
+  // it; BBOX straddles four (it sits on HOME, 35,-100).
+  const CELL = '40.05,-79.95,40.15,-79.85';
+  const CELL_BOX = { south: 40, west: -80, north: 40.25, east: -79.75 };
+  const NEXT_DOOR = '40.05,-79.85,40.15,-79.65';   // CELL's cell and the one east of it
+  const searches = () => s.mock.callsTo('/shodan/host/search').length;
+
   test('returns geolocated hosts for the cell, with categories and CVEs', async () => {
-    const r = await s.api('/api/shodan', { bbox: BBOX, preset: 'all' });
+    const r = await s.api('/api/shodan', { bbox: CELL, preset: 'all' });
     assert.equal(r.status, 200);
     const d = r.json();
     assert.equal(d.returned, 2, 'the host without a location is dropped');
@@ -34,47 +41,58 @@ describe('/api/shodan', () => {
     assert.equal(web.city, 'Testville');
     assert.equal(d.matches.find((m) => m.port === 502).country, 'TL');
     assert.equal(d.cellDeg, 0.25);
-    assert.deepEqual(d.queried, { south: 34.75, west: -100.25, north: 35.25, east: -99.75 });
+    assert.equal(d.cells, 1);
+    assert.equal(d.bought, 1);
+    assert.deepEqual(d.queried, CELL_BOX);
+    assert.equal(d.partial, undefined);
   });
 
-  test('queries Shodan by centre and radius, with the key, minified', async () => {
-    await s.api('/api/shodan', { bbox: BBOX, preset: 'all' });
+  test('queries Shodan by the cell\'s centre and radius, with the key, minified', async () => {
+    await s.api('/api/shodan', { bbox: CELL, preset: 'all' });
     const call = s.mock.callsTo('/shodan/host/search')[0];
     const u = new URL(call.url);
     assert.equal(u.searchParams.get('key'), TEST_KEYS.SHODAN_API_KEY);
     assert.equal(u.searchParams.get('minify'), 'true');
-    assert.match(u.searchParams.get('query'), /^geo:"35\.0000,-100\.0000,\d+"$/);
+    assert.match(u.searchParams.get('query'), /^geo:"40\.1250,-79\.8750,\d+"$/);
   });
 
   test('a named preset adds its filter; an unknown one falls back to "all"', async () => {
-    const ics = (await s.api('/api/shodan', { bbox: BBOX, preset: 'ics' })).json();
-    assert.match(ics.query, /^tag:ics geo:/);
+    const ics = (await s.api('/api/shodan', { bbox: CELL, preset: 'ics' })).json();
+    assert.equal(ics.query, 'tag:ics');
+    assert.match(new URL(s.mock.callsTo('/shodan/host/search')[0].url).searchParams.get('query'), /^tag:ics geo:/);
     assert.equal(ics.note, s.mod.SHODAN_PRESETS.ics.note);
-    const unknown = (await s.api('/api/shodan', { bbox: '40,-80,40.1,-79.9', preset: 'bogus' })).json();
-    assert.match(unknown.query, /^geo:/);
+    const unknown = (await s.api('/api/shodan', { bbox: CELL, preset: 'bogus' })).json();
+    assert.equal(unknown.query, '');
+  });
+
+  test('a view across four cells buys each once, and each host comes once', async () => {
+    const d = (await s.api('/api/shodan', { bbox: BBOX })).json();
+    assert.equal(searches(), 4);
+    assert.equal(d.cells, 4);
+    assert.equal(d.bought, 4);
+    assert.deepEqual(d.queried, { south: 34.75, west: -100.25, north: 35.25, east: -99.75 });
+    assert.equal(d.returned, 2, 'the same banners from four cells are drawn once');
+    assert.equal(d.total, 12, 'Shodan\'s counts are added up');
+  });
+
+  // Regression: the whole view was bought as one box, so a view reaching
+  // a little past what was held bought the overlap again with it.
+  test('panning onto one new cell buys only that cell', async () => {
+    await s.api('/api/shodan', { bbox: CELL });
+    const d = (await s.api('/api/shodan', { bbox: NEXT_DOOR })).json();
+    assert.equal(searches(), 2);
+    assert.equal(d.cells, 2);
+    assert.equal(d.bought, 1);
   });
 
   test('a repeat view costs no credit (memory), nor after a restart (disk)', async () => {
     await s.api('/api/shodan', { bbox: BBOX });
-    await s.api('/api/shodan', { bbox: BBOX });
-    assert.equal(s.mock.callsTo('/shodan/host/search').length, 1);
+    await s.api('/api/shodan', { bbox: '35.06,-99.94,35.1,-99.9' });   // inside a held cell
+    assert.equal(searches(), 4);
     s.mod.cache.clear();
     await s.api('/api/shodan', { bbox: BBOX });
-    assert.equal(s.mock.callsTo('/shodan/host/search').length, 1);
-  });
+    assert.equal(searches(), 4);
 
-  // Regression: a view inside a box already paid for snapped to a smaller box
-  // and was charged again. Bought boxes are now indexed and reused.
-  test('a nearby view inside an already-bought cell reuses it', async () => {
-    await s.api('/api/shodan', { bbox: BBOX });
-    const before = s.mock.callsTo('/shodan/host/search').length;
-    const d = (await s.api('/api/shodan', { bbox: '35.06,-99.94,35.1,-99.9' })).json();
-    assert.equal(s.mock.callsTo('/shodan/host/search').length, before);
-    assert.deepEqual(d.queried, { south: 34.75, west: -100.25, north: 35.25, east: -99.75 });
-  });
-
-  test('the bought-box index survives a restart', async () => {
-    await s.api('/api/shodan', { bbox: BBOX });
     const fs = require('node:fs');
     const t = await startServer({ env: TEST_KEYS });
     try {
@@ -82,32 +100,71 @@ describe('/api/shodan', () => {
       for (const f of fs.readdirSync(s.mod.DISK_CACHE_DIR)) {
         fs.copyFileSync(`${s.mod.DISK_CACHE_DIR}/${f}`, `${t.mod.DISK_CACHE_DIR}/${f}`);
       }
-      const d = (await t.api('/api/shodan', { bbox: '35.06,-99.94,35.1,-99.9' })).json();
+      const d = (await t.api('/api/shodan', { bbox: BBOX })).json();
       assert.equal(t.mock.callsTo('/shodan/host/search').length, 0, 'no credit spent after the restart');
       assert.equal(d.returned, 2);
+      assert.equal(d.bought, 0);
     } finally { await t.close(); }
   });
 
-  test('a box bought under one filter is not reused for another', async () => {
-    await s.api('/api/shodan', { bbox: BBOX, preset: 'all' });
-    await s.api('/api/shodan', { bbox: '35.06,-99.94,35.1,-99.9', preset: 'ics' });
-    assert.equal(s.mock.callsTo('/shodan/host/search').length, 2);
+  test('a cell bought under one filter is not reused for another', async () => {
+    await s.api('/api/shodan', { bbox: CELL, preset: 'all' });
+    await s.api('/api/shodan', { bbox: CELL, preset: 'ics' });
+    assert.equal(searches(), 2);
   });
 
-  test('the smallest covering box wins, and an expired answer is not reused', async () => {
-    await s.api('/api/shodan', { bbox: '34.6,-100.4,35.4,-99.6' });     // a wide box
-    await s.api('/api/shodan', { bbox: BBOX });                          // inside it: reused
-    assert.equal(s.mock.callsTo('/shodan/host/search').length, 1);
-    s.mod.cache.clear();
-    await s.mod.clearDiskCache();                                        // answers gone
-    await s.api('/api/shodan', { bbox: BBOX });
-    assert.equal(s.mock.callsTo('/shodan/host/search').length, 2, 'refetched rather than trusting the index');
+  test('two requests wanting the same cell at once buy it once', async () => {
+    await Promise.all([
+      s.api('/api/shodan', { bbox: CELL }),
+      s.api('/api/shodan', { bbox: '40.06,-79.94,40.1,-79.9' }),
+    ]);
+    assert.equal(searches(), 1);
   });
 
-  test('fresh=1 (SYNC) refetches', async () => {
-    await s.api('/api/shodan', { bbox: BBOX });
-    await s.api('/api/shodan', { bbox: BBOX, fresh: 1 });
-    assert.equal(s.mock.callsTo('/shodan/host/search').length, 2);
+  test('past the per-request cap: the nearest cells now, the rest on the next ask', async () => {
+    const t = await startServer({ env: { ...TEST_KEYS, SHODAN_MAX_NEW_CELLS: '2' } });
+    try {
+      const first = (await t.api('/api/shodan', { bbox: BBOX })).json();
+      assert.equal(first.partial, true);
+      assert.equal(first.cells, 4);
+      assert.equal(first.missing, 2);
+      assert.equal(first.bought, 2);
+      assert.equal(first.queried, null, 'no coverage claimed while cells are owed');
+      assert.equal(first.retryAfter, 2);
+      assert.match(first.partialReason, /2 more cells in view/);
+      const second = (await t.api('/api/shodan', { bbox: BBOX })).json();
+      assert.equal(second.partial, undefined);
+      assert.equal(second.bought, 2);
+      assert.equal(t.mock.callsTo('/shodan/host/search').length, 4, 'each cell bought once');
+    } finally { await t.close(); }
+  });
+
+  test('a refusal part-way keeps the cells in hand and says the rest is owed', async () => {
+    await s.api('/api/shodan', { bbox: CELL });
+    s.mock.on('/shodan/host/search', () => json({ error: 'Rate limit reached' }, { status: 429 }));
+    const r = await s.api('/api/shodan', { bbox: NEXT_DOOR });
+    assert.equal(r.status, 200);
+    const d = r.json();
+    assert.equal(d.partial, true);
+    assert.equal(d.missing, 1);
+    assert.equal(d.returned, 2, 'the held cell is still drawn');
+    assert.match(d.partialReason, /429/);
+  });
+
+  test('each credit spent is counted off the cached balance, so the reserve holds mid-view', async () => {
+    s.mock.on('/api-info', () => json({ query_credits: 12 }));
+    const d = (await s.api('/api/shodan', { bbox: BBOX })).json();
+    assert.equal(searches(), 2, 'stopped at the reserve of 10');
+    assert.equal(d.partial, true);
+    assert.equal(d.missing, 2);
+    assert.match(d.partialReason, /credits are down to 10/);
+    assert.equal(s.mock.callsTo('/api-info').length, 1, 'the balance was read once');
+  });
+
+  test('fresh=1 (Shift+SYNC) buys every cell in view again', async () => {
+    await s.api('/api/shodan', { bbox: CELL });
+    await s.api('/api/shodan', { bbox: CELL, fresh: 1 });
+    assert.equal(searches(), 2);
   });
 
   test('refuses to spend below the credit reserve, and spends nothing', async () => {
@@ -291,5 +348,39 @@ describe('/api/satellites', () => {
     assert.equal(d.stale, true);
     assert.equal(d.returned, 2);
     assert.ok(d.elementsAt);
+  });
+});
+
+describe('Shodan request spacing', () => {
+  test('calls to Shodan wait their turn, at least minGapMs apart', async () => {
+    const gate = s.mod.shodanGate;
+    const savedGap = gate.minGapMs;
+    gate.minGapMs = 150;
+    gate.lastDoneAt = 0;
+    const times = [];
+    s.mock.on('/api-info', () => { times.push(Date.now()); return json({ query_credits: 100 }); });
+    s.mock.on('/shodan/host/search', () => { times.push(Date.now()); return json({ matches: [], total: 0 }); });
+    try {
+      // Two different cells at once: both need a credit check and a search.
+      const [a, b] = await Promise.all([
+        s.api('/api/shodan', { bbox: BBOX }),
+        s.api('/api/shodan', { bbox: '40.1,-80.2,40.2,-80.1' }),
+      ]);
+      assert.equal(a.status, 200);
+      assert.equal(b.status, 200);
+      assert.ok(times.length >= 3, `${times.length} Shodan calls`);
+      for (let i = 1; i < times.length; i++) {
+        assert.ok(times[i] - times[i - 1] >= 140, `gap ${times[i] - times[i - 1]}ms between calls ${i} and ${i + 1}`);
+      }
+    } finally {
+      gate.minGapMs = savedGap;
+    }
+  });
+
+  test('defaults to just over a second, and the test harness turns it off', () => {
+    assert.equal(s.mod.shodanGate.minGapMs, 0);
+    const { loadServer } = require('../helpers/harness.cjs');
+    const t = loadServer({ env: { SHODAN_MIN_GAP_MS: '' } });
+    try { assert.equal(t.mod.shodanGate.minGapMs, 1100); } finally { t.restore?.(); }
   });
 });

@@ -66,8 +66,8 @@
     defaultLayers: {
       flights: true, vessels: true, events: true, shodan: true, alpr: true, webcams: true, overpass: true, netinfra: true,
     },
-    // Opens on the captured satellite mosaic when there is one.
-    defaultBasemap: M.cloudless ? 's2cloudless' : null,
+    // Opens on the sharpest captured aerial imagery there is.
+    defaultBasemap: M.usgs ? 'usgs' : M.cloudless ? 's2cloudless' : null,
     overpassAllClasses: true,
     // YouTube is never captured: its API terms do not allow keeping results
     // indefinitely, which a published snapshot would do. Locking it here also
@@ -318,6 +318,8 @@
   const LIVE_ONLY = new Set(['/api/flush']);
   const CLOUDLESS_NOTE = 'A cloud-free mosaic of a year of Sentinel-2 passes, by EOX, captured with the snapshot. '
     + 'About 10 m per pixel, so it blurs below street level.';
+  const USGS_NOTE = 'Aerial photography from the USGS National Map (mostly NAIP), captured with the snapshot. '
+    + 'About 1 m per pixel; sharpest over Manhattan and the waterfront.';
 
   async function api(u, init) {
     const route = u.pathname.replace(/\/+$/, '');
@@ -337,6 +339,11 @@
         const basemaps = (h.presets?.basemaps || []).map((b) => (captured[b.key]
           ? { ...b, available: true, note: captured[b.key] }
           : { ...b, available: false, note: 'Not part of the demo snapshot.' }));
+        if (M.usgs) {
+          basemaps.push({
+            key: 'usgs', label: 'Aerial (USGS National Map)', kind: 'static', available: true, note: USGS_NOTE,
+          });
+        }
         if (M.cloudless) {
           basemaps.push({
             key: 's2cloudless', label: `Satellite (Sentinel-2 cloudless ${M.cloudless.year})`, kind: 'static',
@@ -385,6 +392,12 @@
         return json(200, { ...d, selected: { ...d.selected, url: site(d.selected.url) } });
       }
       case '/api/basemap': {
+        if (q.get('provider') === 'usgs' && M.usgs) {
+          return json(200, {
+            provider: 'usgs', label: 'Aerial (USGS National Map)', attribution: M.usgs.attribution, note: USGS_NOTE,
+            url: site('data/tiles/usgs/{z}/{x}/{y}.jpg'), maxLevel: M.usgs.maxLevel ?? 16, tiles: true, scenes: [],
+          });
+        }
         if (q.get('provider') === 's2cloudless' && M.cloudless) {
           return json(200, {
             provider: 's2cloudless', label: `Satellite (Sentinel-2 cloudless ${M.cloudless.year})`,

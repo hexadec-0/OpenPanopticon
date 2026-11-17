@@ -10,7 +10,7 @@ import * as Settings from './settings.js';
 import { SelectionMarker } from './selection.js';
 import { AutoCycle, CYCLE_STEPS_S } from './autocycle.js';
 import { LocationInset } from './inset.js';
-import { ShortbreadImageryProvider } from './shortbread.js';
+import { ShortbreadImageryProvider, SHORTBREAD_DRAW_MAX } from './shortbread.js';
 import { NightOverlay } from './night.js';
 import { UniformDetail } from './uniform.js';
 import { installTileCache } from './tilecache.js';
@@ -46,6 +46,10 @@ const el = (tag, cls, text) => {
  */
 const QUERY_CEILING_DEFAULT_M = 45_000;
 const QUERY_CEILING_STEPS_M = [45_000, 100_000, 250_000, 500_000];
+
+// Layers whose every upstream miss is paid for (a Shodan query credit). A
+// plain SYNC leaves them on their cached answers; Shift+SYNC forces them too.
+const METERED_LAYERS = new Set(['shodan']);
 
 
 const TARGETS = [
@@ -302,7 +306,8 @@ class OpenPanopticon {
       ? Cesium.ImageryLayer.fromWorldImagery({})
       : demoBase
         ? new Cesium.ImageryLayer(new ShortbreadImageryProvider({
-          url: demoBase.url, maximumLevel: demoBase.maxLevel, credit: demoBase.credit,
+          url: demoBase.url, dataMaximumLevel: demoBase.maxLevel, maximumLevel: SHORTBREAD_DRAW_MAX,
+          credit: demoBase.credit,
         }))
         : new Cesium.ImageryLayer(
           new Cesium.OpenStreetMapImageryProvider({ url: 'https://tile.openstreetmap.org/' }),
@@ -668,7 +673,13 @@ class OpenPanopticon {
     this.toast(`Queries now start below ${Math.round(this.queryCeilingM / 1000)} km.`);
   }
 
-  async refreshAll({ force = false } = {}) {
+  /**
+   * @param {boolean} force       refetch past every cache tier
+   * @param {boolean} forceMetered  also force the layers in METERED_LAYERS.
+   *   Off for a plain SYNC: forcing Shodan re-buys every cell in view at a
+   *   query credit each, for answers Shodan rarely changes inside a month.
+   */
+  async refreshAll({ force = false, forceMetered = false } = {}) {
     const bbox = this.currentBbox();
     if (!bbox) return;
     const ctx = { bbox, onStatus: () => this.renderLayerStatus() };
@@ -687,7 +698,8 @@ class OpenPanopticon {
     } else this._heldNotice = null;
 
     await Promise.all(Object.values(this.layers).map((l) => (
-      high && l.viewportBound ? l.holdForAltitude() : l.refresh(ctx, { force })
+      high && l.viewportBound ? l.holdForAltitude()
+        : l.refresh(ctx, { force: force && (forceMetered || !METERED_LAYERS.has(l.id)) })
     )));
 
     // Scenes are per-view: what covers Atlanta does not cover Rotterdam.
@@ -1120,16 +1132,22 @@ class OpenPanopticon {
     };
     // With a 24h retention policy, a refresh that honoured the cache would
     // do nothing visible. SYNC is the manual override.
-    $('#refresh-now').onclick = () => {
+    // Shift+SYNC (or Shift+R) forces Shodan as well; a plain SYNC leaves it
+    // on its cached answers, since forcing it spends a credit per cell.
+    this.syncNow = (withMetered = false) => {
       if (this.tooHigh()) {
         this.toast(`Nothing to refresh: holding above `
           + `${Math.round(this.queryCeilingM / 1000)} km. Zoom in, or click FETCH to raise it.`);
         return;
       }
       this.weather.forced = true;
-      this.refreshAll({ force: true }).finally(() => { this.weather.forced = false; });
-      this.toast('Refreshing from source…');
+      this.refreshAll({ force: true, forceMetered: withMetered })
+        .finally(() => { this.weather.forced = false; });
+      this.toast(withMetered || !this.layers.shodan.enabled
+        ? 'Refreshing from source…'
+        : 'Refreshing from source… Shodan kept its cached results (Shift+SYNC to re-buy them).');
     };
+    $('#refresh-now').onclick = (e) => this.syncNow(!!e?.shiftKey);
     $('#reset-settings').onclick = () => {
       // From here until the reload nothing may save again — not a pending
       // debounce, and not the beforeunload handler, which would otherwise
@@ -1168,7 +1186,12 @@ class OpenPanopticon {
       const modeKeys = Object.keys(OPTICAL_MODES);
       const idx = Number(e.key) - 1;
       if (Number.isInteger(idx) && idx >= 0 && idx < modeKeys.length) this.setMode(modeKeys[idx]);
+      // Through the button, not syncNow() directly, so whatever guards the
+      // button (the static demo switches it off) guards the shortcut too.
       if (e.key === 'r') $('#refresh-now').click();
+      if (e.key === 'R') {
+        $('#refresh-now').dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, shiftKey: true }));
+      }
       if (e.key === 'c') $('#cycle-toggle').click();
       if (e.key === 'Escape') this.closeDetail();
       if (e.key === 'h') document.body.classList.toggle('chrome-hidden');
@@ -1397,7 +1420,7 @@ class OpenPanopticon {
         }
       }
       note.textContent = l.total > l.count
-        ? `${l.total.toLocaleString()} total matches in view; the first page is drawn.`
+        ? `About ${l.total.toLocaleString()} matches in view; the first page of each cell is drawn.`
         : 'Every host Shodan has indexed in this view.';
     };
     this.renderShodanLegend = renderLegend;
@@ -2426,11 +2449,11 @@ class OpenPanopticon {
               : '\nElements fetched fresh from CelesTrak.');
         } else if (id === 'shodan') {
           const bits = [layer.total > layer.count
-            ? `${layer.total.toLocaleString()} total matches; first page shown`
+            ? `About ${layer.total.toLocaleString()} matches; first page of each cell shown`
             : `${layer.count.toLocaleString()} hosts`];
           if (layer.cellDeg) {
-            bits.push(`One query covers a ${layer.cellDeg}° cell (~${
-              Math.round(layer.cellDeg * 111)}km) and serves every zoom inside it`);
+            bits.push(`Bought one ${layer.cellDeg}° cell (~${
+              Math.round(layer.cellDeg * 111)}km) at a time, one query credit each, never twice`);
           }
           if (this.shodanCredits != null) {
             bits.push(`${this.shodanCredits.toLocaleString()} query credits left`);

@@ -55,7 +55,7 @@ describe('ShodanLayer', () => {
     await l.refresh(ctx());
     assert.equal(l.status, 'ok', l.error);
     assert.equal(l.count, 2);
-    assert.equal(l.total, 3);
+    assert.equal(l.total, 12, 'the view straddles four cells; their counts add up');
     assert.equal(l.vulnerable, 1);
     const colours = ents(l).map((e) => e.point.outlineColor.css).sort();
     assert.deepEqual(colours, ['#4cc9f0', '#ff2d55'], 'web blue, ICS red');
@@ -888,7 +888,9 @@ describe('BasemapOverlay', () => {
     await bm.setProvider('shortbread', { bbox: BBOX });
     assert.equal(bm.status, 'ok');
     assert.ok(bm.layer.imageryProvider.requestImage, 'a self-drawn provider');
-    assert.equal(bm.layer.imageryProvider.maximumLevel, 14);
+    // Fetched to the data's last level, drawn sharp beyond it.
+    assert.equal(bm.layer.imageryProvider._dataMaximumLevel, 14);
+    assert.equal(bm.layer.imageryProvider.maximumLevel, 19);
   });
 
   test('the other builtin is built rather than handed back', async () => {

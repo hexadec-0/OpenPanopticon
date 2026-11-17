@@ -85,7 +85,9 @@ describe('loopback server', () => {
       assert.equal(r.status, 405);
       const p = await s.api('/api/shodan', { bbox: '35,-100,35.1,-99.9', q: 'port:22' }, { method: 'POST' });
       assert.equal(p.status, 200);
-      assert.match(p.json().query, /^port:22 geo:/);
+      assert.equal(p.json().query, 'port:22');
+      const sent = s.mock.callsTo('/shodan/host/search').map((c) => new URL(c.url).searchParams.get('query'));
+      assert.ok(sent.length && sent.every((q) => /^port:22 geo:/.test(q)), sent.join(' | '));
     });
 
     test('other routes accept GET and POST but not PUT or DELETE', async () => {
@@ -354,7 +356,9 @@ describe('lookup tables answer only for their own keys', () => {
   test('a Shodan preset of "constructor" is the default preset, not "undefined"', async () => {
     const r = await s.api('/api/shodan', { bbox, preset: 'constructor' });
     assert.equal(r.status, 200);
-    assert.match(r.json().query, /^geo:"/);
+    assert.equal(r.json().query, '');
+    const sent = s.mock.callsTo('/shodan/host/search').map((c) => new URL(c.url).searchParams.get('query'));
+    assert.ok(sent.length && sent.every((q) => /^geo:"/.test(q)), sent.join(' | '));
   });
 
   for (const [p, q] of [
