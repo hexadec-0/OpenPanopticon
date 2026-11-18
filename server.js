@@ -961,8 +961,8 @@ const SHODAN_PRESETS = {
   all: {
     label: 'Everything in view',
     query: '',
-    note: 'No type filter — every host Shodan has indexed in this area. '
-      + 'Points are coloured by service category.',
+    note: 'No type filter: every service Shodan places in this area, drawn from '
+      + 'the first search pages as one marker per machine, coloured by category.',
   },
   ics: {
     label: 'ICS / SCADA',
@@ -1016,46 +1016,86 @@ async function shodanSearch({ bbox, preset, custom, minGeo = true }) {
   // A fixed cell, not one sized to the view: zooming must not re-charge for
   // a place already paid for. Before settling on the snapped box, reuse any
   // box already bought that covers this view — see shodanIndex().
-  // Shodan has no bbox filter; geo:lat,lon,radius_km is the spatial primitive.
+  // Shodan's geo filter accepts a bounding box (north,west,south,east), so a
+  // snapped cell maps onto the query exactly — see buildQuery below.
   // With the "all" preset the base is empty and the geo filter stands alone,
   // which Shodan accepts as a valid (credit-consuming) filtered query.
   const presetDef = SHODAN_PRESETS[preset] || SHODAN_PRESETS.all;
   const base = custom && custom.trim() ? custom.trim() : presetDef.query;
   const buildQuery = (box) => {
-    const cc = bboxCenter(box);
-    const rr = bboxRadiusKm(box);
-    return `${base} geo:"${cc.lat.toFixed(4)},${cc.lon.toFixed(4)},${rr}"`.trim();
+    // Shodan's geo filter takes a true bounding box: four values given as
+    // top-left lat,lon then bottom-right lat,lon — i.e. north,west,south,east.
+    // That asks for exactly the cell. The old centre+radius circle had to
+    // circumscribe the cell, so it covered ~1.6x the area: it spent the first
+    // pages on out-of-view hosts and made a cell harder to answer in full.
+    // Same filter, same credit cost, tighter and on-screen result set.
+    const g = `geo:"${box.north.toFixed(4)},${box.west.toFixed(4)},`
+      + `${box.south.toFixed(4)},${box.east.toFixed(4)}"`;
+    return `${base} ${g}`.trim();
   };
 
+  // A bought box stands in for a smaller view only when its answer listed
+  // every match in it. A box answered with the first pages of millions holds
+  // a sample of the whole box, so a view inside it would be shown that
+  // sample (mostly whatever Shodan lists first, often somewhere else in the
+  // box) instead of what is actually in view.
   let q = snapFixed(b, SHODAN_CELL_DEG, SHODAN_MAX_DEG);
   if (!wantsFresh()) {
-    const bought = await findBoughtShodanBox(b, base, (box) => isCached(`shodan:${buildQuery(box)}`, RETAIN['shodan.hosts']));
+    const bought = await findBoughtShodanBox(b, base, (box) => shodanAnswerComplete(buildQuery(box)));
     if (bought) q = bought;
   }
   const query = buildQuery(q);
 
-  const url = new URL('https://api.shodan.io/shodan/host/search');
-  url.searchParams.set('key', CFG.shodanKey);
-  url.searchParams.set('query', query);
-  url.searchParams.set('minify', 'true');
-
   // TTL.static, and on disk. Shodan rescans a host over days, so a fresher
   // answer would rarely differ — and every miss spends a query credit, which
   // is the one resource here that cannot be earned back by waiting.
-  const key = `shodan:${query}`;
+  //
+  // Up to SHODAN_PAGES pages of 100, each a credit and each cached on its
+  // own, so raising the page count later buys only the pages not yet held.
+  // A later page that cannot be bought (the credit reserve, an upstream
+  // refusal) ends the run and keeps the pages already in hand.
   let fetched = false;
-  const raw = await cachedPersistent(key, RETAIN['shodan.hosts'], async () => {
+  const buyPage = (page) => cachedPersistent(shodanPageKey(query, page), RETAIN['shodan.hosts'], async () => {
     // About to spend a credit. Stop short of the wall rather than through
     // it: running out mid-session leaves the layer dead until the month
     // rolls over, and the reserve is what a deliberate lookup draws on.
     await assertShodanCredit();
-    const out = await shodanGrab(url);
+    const out = await shodanGrab(shodanSearchUrl(query, page));
     fetched = true;
     return out;
   });
+  const pages = [await buyPage(1)];
+  const upstreamTotal = Number(pages[0].total) || 0;
+  let held = (pages[0].matches || []).length;
+  let stopped = null;
+  for (let page = 2; page <= SHODAN_PAGES && held < upstreamTotal
+      && (pages[pages.length - 1].matches || []).length >= SHODAN_PAGE_SIZE; page++) {
+    try {
+      const raw = await buyPage(page);
+      pages.push(raw);
+      held += (raw.matches || []).length;
+    } catch (e) {
+      stopped = e.message;
+      break;
+    }
+  }
+  const complete = held >= upstreamTotal;
   await rememberShodanBox(q, base, fetched);
 
-  const matches = (raw.matches || [])
+  // The whole area's totals, from the count endpoint, which spends no query
+  // credit. A failure here costs the legend its totals, not the answer.
+  let area = null;
+  try { area = await shodanAreaCount(query); } catch { area = null; }
+
+  // Pages are fetched apart and can overlap, so one banner is kept once.
+  const seen = new Set();
+  const matches = pages.flatMap((p) => p.matches || [])
+    .filter((m) => {
+      const k = `${m.ip_str}:${m.port}/${m.transport || 'tcp'}`;
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    })
     .map((m) => {
       const loc = m.location || {};
       if (minGeo && (loc.latitude == null || loc.longitude == null)) return null;
@@ -1092,8 +1132,15 @@ async function shodanSearch({ bbox, preset, custom, minGeo = true }) {
     // cell is served locally instead of being charged again.
     queried: { south: q.south, west: q.west, north: q.north, east: q.east },
     cellDeg: SHODAN_CELL_DEG,
-    total: raw.total ?? matches.length,
+    radiusKm: bboxRadiusKm(q),
+    total: pages[0].total ?? matches.length,
     returned: matches.length,
+    // Whether every match in the area is here, or only the first pages.
+    complete,
+    pages: pages.length,
+    pagesMax: SHODAN_PAGES,
+    partial: stopped,
+    area,
     note: custom ? null : presetDef.note,
     byCategory,
     vulnerable: matches.filter((m) => m.vulns.length).length,
@@ -1137,6 +1184,182 @@ function serviceCategory(port, product, data) {
   return PORT_CATEGORY[port] || 'other';
 }
 
+// One search page is 100 banners and one query credit.
+const SHODAN_PAGE_SIZE = 100;
+
+// How many pages a new area buys: up to 100 banners and one credit each.
+const SHODAN_PAGES = (() => {
+  const v = Number(process.env.SHODAN_PAGES);
+  return clamp(Number.isFinite(v) && v >= 1 ? Math.round(v) : 3, 1, 10);
+})();
+
+// Page 1 keeps the key it has always had, so answers bought before paging
+// existed still count as page 1.
+const shodanPageKey = (query, page) => (page === 1 ? `shodan:${query}` : `shodan:${query}#p${page}`);
+
+function shodanSearchUrl(query, page) {
+  const url = new URL('https://api.shodan.io/shodan/host/search');
+  url.searchParams.set('key', CFG.shodanKey);
+  url.searchParams.set('query', query);
+  url.searchParams.set('minify', 'true');
+  if (page > 1) url.searchParams.set('page', String(page));
+  return url;
+}
+
+/** A cached value, from memory or disk, without fetching anything. */
+async function peekCached(key, ttlMs) {
+  const hit = cache.get(key);
+  if (hit && hit.expires > Date.now()) return hit.value;
+  return readDiskCache(key, ttlMs);
+}
+
+/**
+ * Whether the cached answer for a query lists every match it reported.
+ *
+ * Read from the answers themselves rather than a flag in the index, so boxes
+ * bought before this check existed are judged the same way.
+ */
+async function shodanAnswerComplete(query) {
+  const ttl = RETAIN['shodan.hosts'];
+  const first = await peekCached(shodanPageKey(query, 1), ttl);
+  if (!first) return false;
+  const total = Number(first.total) || 0;
+  let held = (first.matches || []).length;
+  for (let page = 2; held < total && page <= 10; page++) {
+    const raw = await peekCached(shodanPageKey(query, page), ttl);
+    if (!raw) break;
+    held += (raw.matches || []).length;
+  }
+  return held >= total;
+}
+
+/**
+ * Totals for a whole search area, from Shodan's count endpoint.
+ *
+ * The count endpoint returns no banners and spends no query credit, so it
+ * describes everything Shodan places in the area while the search pages
+ * hold only the first few hundred. Its totals count services (one per open
+ * port), not machines. Categories come from the port breakdown alone, which
+ * is coarser than the per-banner category that also reads the product.
+ */
+async function shodanAreaCount(query) {
+  const url = new URL('https://api.shodan.io/shodan/host/count');
+  url.searchParams.set('key', CFG.shodanKey);
+  url.searchParams.set('query', query);
+  url.searchParams.set('facets', 'port:100,ip:10,org:10');
+  const raw = await cachedPersistent(`shodan:count:${query}`, RETAIN['shodan.hosts'], () => shodanGrab(url));
+  const total = Number(raw?.total) || 0;
+  const facets = raw?.facets || {};
+  const byCategory = {};
+  let counted = 0;
+  for (const row of facets.port || []) {
+    const n = Number(row?.count) || 0;
+    const cat = PORT_CATEGORY[Number(row?.value)] || 'other';
+    byCategory[cat] = (byCategory[cat] || 0) + n;
+    counted += n;
+  }
+  // Services on ports outside the top hundred.
+  if (total > counted) byCategory.other = (byCategory.other || 0) + (total - counted);
+  const top = (rows, name) => (rows || []).slice(0, 10)
+    .map((r) => ({ [name]: String(r?.value ?? ''), count: Number(r?.count) || 0 }))
+    .filter((r) => r[name]);
+  return {
+    total,
+    byCategory,
+    topIps: top(facets.ip, 'ip'),
+    topOrgs: top(facets.org, 'org'),
+  };
+}
+
+// Most notable first: a machine is coloured by the most notable category
+// among its services.
+const CATEGORY_RANK = ['ics', 'database', 'remote', 'camera', 'file', 'mail', 'network', 'infra', 'web', 'other'];
+
+function topCategory(cats) {
+  let best = null;
+  for (const c of cats) {
+    const r = CATEGORY_RANK.indexOf(c);
+    if (r >= 0 && (best === null || r < CATEGORY_RANK.indexOf(best))) best = c;
+  }
+  return best || 'other';
+}
+
+// A host lookup can list over a thousand services on one address. The
+// summary keeps this many, lowest ports first; the full count is reported.
+const SHODAN_HOST_SERVICES_MAX = 300;
+
+/**
+ * Everything Shodan holds on one address: every open port, not only the one
+ * that matched a search.
+ *
+ * /shodan/host/{ip} spends no query credit. Cached for as long as search
+ * results, as a summary rather than the full banners.
+ */
+async function shodanHost({ ip }) {
+  if (!CFG.shodanKey) throw new UpstreamError(412, 'SHODAN_API_KEY is not set in .env');
+  const addr = String(ip || '').trim();
+  if (!net.isIP(addr)) throw new UpstreamError(400, 'ip must be an IPv4 or IPv6 address');
+  return cachedPersistent(`shodan:host:${addr}`, RETAIN['shodan.hosts'], async () => {
+    const url = new URL(`https://api.shodan.io/shodan/host/${encodeURIComponent(addr)}`);
+    url.searchParams.set('key', CFG.shodanKey);
+    let raw;
+    try {
+      raw = await shodanGrab(url);
+    } catch (e) {
+      // Shodan answers 404 for an address it holds nothing on. That is an
+      // answer, and is kept like one.
+      if (e?.status === 404) return { ip: addr, found: false };
+      throw e;
+    }
+    return summariseShodanHost(addr, raw);
+  });
+}
+
+function summariseShodanHost(ip, raw) {
+  const data = Array.isArray(raw?.data) ? raw.data : [];
+  const services = data
+    .map((m) => ({
+      port: Number(m.port),
+      transport: m.transport || 'tcp',
+      product: m.product || null,
+      version: m.version || null,
+      category: serviceCategory(m.port, m.product, m.data),
+      vulns: m.vulns && typeof m.vulns === 'object' ? Object.keys(m.vulns) : [],
+      timestamp: m.timestamp || null,
+      banner: typeof m.data === 'string' ? m.data.slice(0, 300) : null,
+    }))
+    .filter((v) => Number.isFinite(v.port))
+    .sort((a, b) => a.port - b.port)
+    .slice(0, SHODAN_HOST_SERVICES_MAX);
+  const vulns = Array.isArray(raw?.vulns)
+    ? raw.vulns.map(String)
+    : [...new Set(services.flatMap((v) => v.vulns))];
+  const ports = Array.isArray(raw?.ports)
+    ? [...new Set(raw.ports.map(Number).filter(Number.isFinite))].sort((a, b) => a - b)
+    : [...new Set(services.map((v) => v.port))];
+  const lat = Number(raw?.latitude);
+  const lon = Number(raw?.longitude);
+  return {
+    ip,
+    found: true,
+    lat: Number.isFinite(lat) ? lat : null,
+    lon: Number.isFinite(lon) ? lon : null,
+    city: raw?.city || null,
+    country: raw?.country_name || raw?.country_code || null,
+    org: raw?.org || raw?.isp || null,
+    asn: raw?.asn || null,
+    os: raw?.os || null,
+    hostnames: Array.isArray(raw?.hostnames) ? raw.hostnames.map(String) : [],
+    tags: Array.isArray(raw?.tags) ? raw.tags.map(String) : [],
+    ports,
+    servicesTotal: data.length,
+    services,
+    vulns,
+    category: topCategory(services.map((v) => v.category)),
+    lastUpdate: raw?.last_update || null,
+  };
+}
+
 async function shodanCredits() {
   if (!CFG.shodanKey) throw new UpstreamError(412, 'SHODAN_API_KEY is not set in .env');
   const url = new URL('https://api.shodan.io/api-info');
@@ -1156,7 +1379,7 @@ const SHODAN_MAX_DEG = Number(process.env.SHODAN_MAX_DEG || '2');
 
 // Stop spending when the account gets this low, leaving a reserve for
 // deliberate lookups rather than map panning.
-const SHODAN_CREDIT_FLOOR = Number(process.env.SHODAN_CREDIT_FLOOR || '10');
+const SHODAN_CREDIT_FLOOR = Number(process.env.SHODAN_CREDIT_FLOOR || '5');
 
 // Shodan allows about one request a second per key and answers a faster
 // burst with refusals. Every call to it, search or credit check, waits its
@@ -5545,6 +5768,15 @@ const WAYBACK_ATTRIBUTION = 'Esri World Imagery Wayback: Esri, Maxar, Earthstar 
 // walking forever.
 const WAYBACK_MAX_STEPS = 80;
 
+// How long a Wayback search waits for the version history before answering
+// with the newest mosaic alone. A new place (or a new zoom level, which is a
+// new tile) walks back one request per version and then looks up a capture
+// date for each: 15 to 35 seconds is normal, longer than the browser waits.
+// The newest mosaic needs none of that, so it is drawn at once and the
+// history follows: the walk carries on in the background, is cached, and
+// the browser asks again until it has it. An object so tests can shorten it.
+const waybackTiming = { waitMs: 4000 };
+
 /** A release's tile URL as Cesium wants it, or null if it is not Esri's. */
 function waybackTemplate(itemURL) {
   if (typeof itemURL !== 'string' || !/\{level\}.*\{row\}.*\{col\}/.test(itemURL)) return null;
@@ -5667,7 +5899,7 @@ async function waybackScenes({ bbox }) {
   const row = lat2tile(clamp(c.lat, -85, 85), z);
   const key = `wayback:changes:v1:${releases[0].release}:${z}/${row}/${col}`;
 
-  const raw = await cachedPersistent(key, RETAIN['maps.scenes'], async () => {
+  const work = cachedPersistent(key, RETAIN['maps.scenes'], async () => {
     const byRelease = new Map(releases.map((r) => [r.release, r]));
     const changes = await waybackLocalChanges(releases, z, row, col);
     // Nothing recorded for this tile (open ocean, mostly): the current
@@ -5686,6 +5918,31 @@ async function waybackScenes({ bbox }) {
     }
     return { at: { lat, lon, zoom: z }, total: releases.length, changed: changes.length, scenes };
   });
+
+  // Cached answers come straight back; a new walk gets waybackTiming.waitMs.
+  let timer;
+  const raw = await Promise.race([
+    work,
+    new Promise((r) => { timer = setTimeout(() => r(null), waybackTiming.waitMs); }),
+  ]).finally(() => clearTimeout(timer));
+  if (!raw) {
+    // Still walking. It finishes on its own and is cached for the next ask;
+    // a failure there is reported then, not as an unhandled rejection now.
+    work.catch(() => {});
+    const newest = releases[0];
+    return {
+      provider: 'wayback',
+      label: 'Esri World Imagery Wayback',
+      attribution: WAYBACK_ATTRIBUTION,
+      maxLevel: 19,
+      at: { lat: tile2lat(row + 0.5, z), lon: tile2lon(col + 0.5, z), zoom: z },
+      releases: releases.length,
+      changed: null,
+      // The browser draws this and asks again for the full list.
+      pending: true,
+      scenes: [{ id: String(newest.release), release: newest.release, date: newest.date, url: newest.url }],
+    };
+  }
 
   return {
     provider: 'wayback',
@@ -6246,6 +6503,7 @@ const ROUTES = {
   // A free-form query (q=) is accepted only by POST — see apiAllowed().
   '/api/shodan': (q) => shodanSearch({ bbox: q.get('bbox'), preset: q.get('preset'), custom: q.get('q') }),
   '/api/shodan/credits': () => shodanCredits(),
+  '/api/shodan/host': (q) => shodanHost({ ip: q.get('ip') }),
   '/api/flights': (q) => flights({ bbox: q.get('bbox') }),
   '/api/satellites': (q) => satellites({ group: q.get('group'), limit: q.get('limit') }),
   '/api/overpass': (q) => overpass({
@@ -6956,6 +7214,8 @@ module.exports = {
   parse511, loadDotEnv, clip, htmlText, refusalReason, UpstreamError, grab, USER_AGENT,
   parseBbox, clamp, bboxCenter, bboxRadiusKm, snapFixed, viewCell, VIEW_CELL_DEG, VIEW_MAX_DEG,
   boxContains, shodanIndex, findBoughtShodanBox, rememberShodanBox, serviceCategory, SHODAN_PRESETS, SHODAN_CELL_DEG,
+  SHODAN_PAGES, shodanHost, shodanAreaCount, shodanAnswerComplete, summariseShodanHost, topCategory,
+  waybackTiming,
   shodanGate, shodanGrab,
   openSky, openSkyPollSec, openSkyRefillSec, noteOpenSkyHeaders, assertOpenSkyCredit, OPENSKY_FLOOR,
   SAT_GROUPS, fetchTle, readCachedTle, writeCachedTle, tleCachePath,

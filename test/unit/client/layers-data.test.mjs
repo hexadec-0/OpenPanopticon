@@ -50,53 +50,127 @@ function assertInert(html) {
 }
 
 describe('ShodanLayer', () => {
-  test('draws a point per banner, coloured by category or by risk', async () => {
-    const l = on(new L.ShodanLayer(viewer));
+  // A Shodan search is answered cell by cell, so these tests use a view that
+  // is a single 0.25 deg grid cell: one request, and totals that are the
+  // cell's own rather than a sum over several. Multi-cell views are exercised
+  // explicitly in the coverage and pan tests below.
+  const ctx = (bbox = '34.80,-100.20,34.95,-100.05') => ({ bbox, onStatus() {} });
+  // Most tests read the layer before any port lookup lands; the lookups have
+  // their own tests below.
+  const quiet = (l) => { l.lookupsOn = false; return l; };
+  const until = async (pred, ms = 5000) => {
+    const t0 = Date.now();
+    while (!pred()) {
+      if (Date.now() - t0 > ms) throw new Error('timed out');
+      await new Promise((r) => setTimeout(r, 20));
+    }
+  };
+
+  test('draws one marker per machine, coloured by category or by risk', async () => {
+    const l = on(quiet(new L.ShodanLayer(viewer)));
     await l.refresh(ctx());
     assert.equal(l.status, 'ok', l.error);
     assert.equal(l.count, 2);
     assert.equal(l.total, 3);
     assert.equal(l.vulnerable, 1);
+    assert.equal(l.complete, true);
     const colours = ents(l).map((e) => e.point.outlineColor.css).sort();
     assert.deepEqual(colours, ['#4cc9f0', '#ff2d55'], 'web blue, ICS red');
-    assert.deepEqual(l.categoryLegend().map((c) => c.cat).sort(), ['ics', 'web']);
+    const web = l.categoryLegend().find((c) => c.cat === 'web');
+    assert.deepEqual([web.n, web.area], [1, 10118 + 9928], 'machines drawn, and services in the area');
+    assert.equal(l.area.total, 125591);
     l.colorBy = 'risk';
     l.redraw();
     assert.deepEqual(ents(l).map((e) => e.point.outlineColor.css).sort(), ['#00e5ff', '#ff2d55']);
     assert.equal(ents(l).find((e) => e.properties.record.value.vulns.length).point.pixelSize, 11);
   });
 
-  test('co-located banners are spread out so each stays clickable', async () => {
-    s.mock.on('/shodan/host/search', () => json({ total: 3, matches: [80, 443, 8080].map((port) => ({
-      ip_str: '198.51.100.1', port, location: { latitude: HOME.lat, longitude: HOME.lon }, data: '' })) }));
-    const l = on(new L.ShodanLayer(viewer));
+  test('machines on one point share a counted marker; one machine is one machine', async () => {
+    const at = { latitude: HOME.lat, longitude: HOME.lon };
+    s.mock.on('/shodan/host/search', () => json({ total: 4, matches: [
+      { ip_str: '198.51.100.1', port: 80, location: at, data: '' },
+      { ip_str: '198.51.100.1', port: 443, location: at, data: '' },
+      { ip_str: '198.51.100.2', port: 22, location: at, data: 'SSH-2.0' },
+      { ip_str: '198.51.100.3', port: 8080, location: at, data: '' },
+    ] }));
+    const l = on(quiet(new L.ShodanLayer(viewer)));
     await l.refresh(ctx());
-    const pos = ents(l).map((e) => `${e.position.value.lat},${e.position.value.lon}`);
-    assert.equal(new Set(pos).size, 3);
+    assert.equal(l.count, 3, 'three machines');
+    assert.equal(ents(l).length, 1, 'one marker');
+    const e = ents(l)[0];
+    assert.equal(e.label.text, '3');
+    const rec = e.properties.record.value;
+    assert.equal(rec.kind, 'place');
+    assert.deepEqual(rec.hosts.map((h) => h.ip).sort(), ['198.51.100.1', '198.51.100.2', '198.51.100.3']);
+    assert.deepEqual(rec.hosts.find((h) => h.ip === '198.51.100.1').ports, [80, 443]);
   });
 
-  test('detail: service, CVE links, banner, and a reputation slot', async () => {
-    const l = on(new L.ShodanLayer(viewer));
+  test('a grouped point lists its machines, each one a button', async () => {
+    const at = { latitude: HOME.lat, longitude: HOME.lon };
+    s.mock.on('/shodan/host/search', () => json({ total: 2, matches: [
+      { ip_str: '198.51.100.1', port: 80, location: at, data: '', org: XSS },
+      { ip_str: '198.51.100.2', port: 22, location: at, data: '', vulns: { 'CVE-2020-1': {} } },
+    ] }));
+    const l = on(quiet(new L.ShodanLayer(viewer)));
     await l.refresh(ctx());
-    const rec = l.records().find((r) => r.port === 443);
-    const d = l.detail(rec);
+    const d = l.detail(ents(l)[0].properties.record.value);
+    assert.equal(d.kind, 'SHODAN LOCATION');
+    assert.equal(d.title, '2 machines');
+    assert.equal(d.accent, '#ff2d55');
+    assert.match(d.html, /data-ip="198\.51\.100\.1"/);
+    assert.ok(d.html.indexOf('198.51.100.2') < d.html.indexOf('198.51.100.1'), 'CVE hosts first');
+    assertInert(d.html);
+  });
+
+  test('detail before the lookup: the matched service, and that more is coming', async () => {
+    const l = on(new L.ShodanLayer(viewer));
+    l.lookupsOn = true;
+    const d = l.detail({ ip: '198.51.100.10', port: 443, transport: 'tcp', product: 'nginx', version: '1.18.0',
+      vulns: ['CVE-2021-44228', 'CVE-2023-0001'], category: 'web', hostnames: [], tags: [] });
     assert.equal(d.kind, 'SHODAN HOST');
-    assert.equal(d.title, '198.51.100.10:443');
+    assert.equal(d.title, '198.51.100.10');
     assert.equal(d.accent, '#ff2d55');
     assert.match(d.html, /nginx 1\.18\.0/);
     assert.match(d.html, /2 known CVEs/);
     assert.match(d.html, /https:\/\/nvd\.nist\.gov\/vuln\/detail\/CVE-2021-44228/);
+    assert.match(d.html, /Looking up every port/);
+    assert.match(d.html, /data-slot="ports"/);
     assert.match(d.html, /data-slot="enrich"/);
     assert.match(d.html, /https:\/\/www\.shodan\.io\/host\/198\.51\.100\.10/);
     assertInert(d.html);
   });
 
-  test('detail escapes a hostile banner, product and hostname', () => {
+  test('detail once looked up: every port on the machine', async () => {
+    const l = on(quiet(new L.ShodanLayer(viewer)));
+    await l.refresh(ctx());
+    await l.lookupHost('198.51.100.10');
+    const rec = ents(l).map((e) => e.properties.record.value).find((r) => r.ip === '198.51.100.10');
+    const d = l.detail(rec);
+    assert.match(d.html, /3 services on this machine/);
+    assert.match(d.html, /OpenSSH 8\.9p1/);
+    assert.match(d.html, /22, 443, 8080/);
+    assertInert(d.html);
+  });
+
+  test('detail escapes a hostile banner, product and hostname', async () => {
     const l = new L.ShodanLayer(viewer);
     const d = l.detail({ ip: '1.2.3.4', port: 80, transport: 'tcp', vulns: [`CVE-1"${XSS}`], hostnames: [XSS],
       tags: [], product: XSS, banner: `</pre>${XSS}`, category: 'web', city: XSS });
     assertInert(d.html);
     assert.match(d.html, /&lt;img src=x/);
+    // And what a host lookup brings back.
+    await l.lookupHost('198.51.100.11');
+    const h = l.detail({ kind: 'host', ip: '198.51.100.11', matches: [] });
+    assertInert(h.html);
+    assert.match(h.html, /&lt;\/pre&gt;&lt;img src=x/);
+  });
+
+  test('enrich fetches every port into the panel, and checks reputation', async () => {
+    const l = new L.ShodanLayer(viewer);
+    const root = new FakeElement('div');
+    await l.enrich({ kind: 'host', ip: '198.51.100.10', matches: [] }, root);
+    assert.match(root.querySelector('[data-slot="ports"]').innerHTML, /3 services on this machine/);
+    assert.notEqual(root.querySelector('[data-slot="enrich"]').innerHTML, '');
   });
 
   test('enrich fills the slot with GreyNoise and C2 verdicts', async () => {
@@ -117,6 +191,116 @@ describe('ShodanLayer', () => {
     await Promise.all([p1, p2]);
     assert.equal(first.querySelector('[data-slot="enrich"]').innerHTML, '');
     assert.match(second.querySelector('[data-slot="enrich"]').innerHTML, /Not observed scanning/);
+  });
+
+  test('every machine drawn is looked up once, and its colour follows', async () => {
+    const l = on(new L.ShodanLayer(viewer));
+    await l.refresh(ctx());
+    await until(() => l.hosts.size === 2 && !l._pumping);
+    assert.equal(s.mock.callsTo('/shodan/host/198.51.100.10').length, 1);
+    assert.equal(s.mock.callsTo('/shodan/host/198.51.100.11').length, 1);
+    assert.deepEqual(l.lookupProgress(), { done: 2, total: 2, queued: 0, error: null });
+    l.redraw();
+    const rec = ents(l).map((e) => e.properties.record.value).find((r) => r.ip === '198.51.100.10');
+    assert.equal(rec.category, 'remote', 'SSH, found by the lookup, outranks the matched web service');
+    l.setEnabled(false);
+  });
+
+  test('paused lookups wait in the queue and carry on when resumed', async () => {
+    const l = on(new L.ShodanLayer(viewer));
+    l.lookupsPaused = true;
+    await l.refresh(ctx());
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(s.mock.callsTo('/shodan/host/198.51.100.10').length, 0, 'nothing looked up while paused');
+    assert.equal(l.lookupQueue.length, 2, 'waiting, not dropped');
+    l.lookupsPaused = false;
+    l.pumpLookups();
+    await until(() => l.hosts.size === 2 && !l._pumping);
+    assert.equal(s.mock.callsTo('/shodan/host/198.51.100.10').length, 1);
+    l.setEnabled(false);
+  });
+
+  test('switched off, the lookups stop', async () => {
+    const l = on(new L.ShodanLayer(viewer));
+    l.lookupsOn = false;
+    await l.refresh(ctx());
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(s.mock.callsTo('/shodan/host/1').length + s.mock.callsTo('/shodan/host/198').length, 0);
+    assert.equal(l.lookupQueue.length, 2, 'waiting, not dropped');
+  });
+
+  // A cell is the unit of coverage: once bought it is covered at every zoom
+  // inside it (re-asking would only re-charge for the same sample), while a
+  // cell that was never fetched is not.
+  test('a bought cell stays covered at every zoom inside it; new ground is not', async () => {
+    s.mock.on('/shodan/host/search', ({ params }) => {
+      const page = Number(params.get('page') || 1);
+      return json({ total: 5000, matches: Array.from({ length: 100 }, (_, i) => ({
+        ip_str: `10.${page}.0.${i}`, port: 80, data: '', location: { latitude: 35.1, longitude: -99.9 } })) });
+    });
+    const l = on(quiet(new L.ShodanLayer(viewer)));
+    // One cell: 35.0..35.25 x -100.0..-99.75.
+    await l.refresh(ctx('35.05,-99.95,35.2,-99.8'));
+    assert.equal(l.complete, false, 'only the first pages of a busy cell');
+    assert.equal(l.isCovered('35.05,-99.95,35.2,-99.8'), true, 'the same view');
+    assert.equal(l.isCovered('35.11,-99.89,35.13,-99.87'), true, 'zoomed in, still the bought cell');
+    assert.equal(l.isCovered('35.3,-99.9,35.4,-99.8'), false, 'a neighbouring cell was never fetched');
+  });
+
+  // The feature: panning sideways fetches only the newly exposed cells and
+  // keeps everything already drawn.
+  test('a lateral pan fetches only the new cells and retains the old', async () => {
+    s.mock.on('/shodan/host/search', ({ params }) => {
+      const m = params.get('query').match(/geo:"(-?[\d.]+),(-?[\d.]+),(-?[\d.]+),(-?[\d.]+)"/);
+      const [n, w, so, e] = m.slice(1).map(Number);
+      const lat = (so + n) / 2;
+      const lon = (w + e) / 2;
+      return json({ total: 1, matches: [{ ip_str: `10.0.${Math.round((lon + 180) * 100)}.${Math.round((lat + 90) * 100)}`,
+        port: 80, data: '', location: { latitude: lat, longitude: lon } }] });
+    });
+    const l = on(quiet(new L.ShodanLayer(viewer)));
+    // View A: two cells, -100.0..-99.75 and -99.75..-99.5.
+    await l.refresh(ctx('35.05,-99.95,35.2,-99.55'));
+    const afterA = s.mock.callsTo('/shodan/host/search').length;
+    assert.equal(afterA, 2, 'two cells bought');
+    assert.equal(l.store.size, 2, 'two machines drawn');
+    // View B: pan east one cell — shares -99.75..-99.5, adds -99.5..-99.25.
+    await l.refresh(ctx('35.05,-99.7,35.2,-99.3'));
+    assert.equal(s.mock.callsTo('/shodan/host/search').length, afterA + 1, 'only the new cell is bought');
+    assert.equal(l.store.size, 3, 'the old cell is still drawn alongside the new');
+  });
+
+  test('above 45 km: no search and no port lookups; below: both resume', async () => {
+    const l = on(new L.ShodanLayer(viewer));
+    viewer.camera = { ...viewer.camera, positionCartographic: { height: 60_000 } };
+    await l.refresh(ctx());
+    assert.equal(l.status, 'held');
+    assert.equal(s.mock.callsTo('/shodan/host/search').length, 0, 'not searched from altitude');
+    // Even a lookup queued earlier waits.
+    l.enqueueLookups(['198.51.100.10']);
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(s.mock.callsTo('/shodan/host/198.51.100.10').length, 0, 'no lookup from altitude');
+    const d = l.detail({ ip: '198.51.100.10', port: 443, category: 'web', vulns: [] });
+    assert.match(d.html, /looked up with the camera below\s+45 km/);
+
+    viewer.camera = { ...viewer.camera, positionCartographic: { height: 30_000 } };
+    await l.refresh(ctx());
+    assert.equal(l.status, 'ok', l.error);
+    assert.equal(s.mock.callsTo('/shodan/host/search').length, 1);
+    await until(() => l.hosts.has('198.51.100.10'));
+    l.setEnabled(false);
+  });
+
+  test('the limit is 45 km, its own and not the FETCH ceiling', () => {
+    assert.equal(L.SHODAN_MAX_ALTITUDE_M, 45_000);
+    assert.equal(new L.ShodanLayer(viewer).maxAltitudeM, 45_000);
+  });
+
+  test('a complete answer covers every zoom inside its cell', async () => {
+    const l = on(quiet(new L.ShodanLayer(viewer)));
+    await l.refresh(ctx('34.9,-100.1,35.1,-99.9'));
+    assert.equal(l.complete, true);
+    assert.equal(l.isCovered('34.995,-100.005,35.005,-99.995'), true);
   });
 });
 
@@ -308,6 +492,61 @@ describe('SatelliteLayer', () => {
       assert.match(l.error, /satellite\.js not loaded/);
       clearTimeout(l._retryTimer);
     } finally { globalThis.satellite = sat; }
+  });
+});
+
+describe('cameras drawn by both the OSM and the ALPR layer', () => {
+  const cam = (id, lat, lon, extra = {}) => ({ id, lat, lon, preset: 'surveillance', presets: ['surveillance'], ...extra });
+
+  test('spotTaken: same OSM id, or within 2 m, across cell edges; not 5 m away', () => {
+    const spots = L.cameraSpots([{ id: 'node/1', lat: 35.00004999, lon: -100 }]);
+    assert.equal(L.spotTaken(spots, { id: 'node/1', lat: 0, lon: 0 }), true, 'same id anywhere');
+    assert.equal(L.spotTaken(spots, { id: 'node/2', lat: 35.00005001, lon: -100 }), true, '~0 m, other side of a cell edge');
+    assert.equal(L.spotTaken(spots, { id: 'node/3', lat: 35.0000500 + 1.5 / 111_320, lon: -100 }), true, '1.5 m');
+    assert.equal(L.spotTaken(spots, { id: 'node/4', lat: 35.00005 + 5 / 111_320, lon: -100 }), false, '5 m');
+    assert.equal(L.spotTaken(null, { id: 'node/1' }), false);
+  });
+
+  test('the OSM layer leaves out cameras the ALPR layer draws with cones, nothing else', () => {
+    const o = on(new L.OverpassLayer(viewer));
+    o.presets = new Set(['surveillance', 'power']);
+    o.hiddenBy = () => L.cameraSpots([{ id: 'node/1', lat: 35, lon: -100 }]);
+    const n = o.draw([
+      cam('node/1', 35, -100),                                   // same node: hidden
+      cam('node/9', 35 + 1 / 111_320, -100),                     // same spot, mapped twice: hidden
+      cam('node/2', 35.01, -100),                                // elsewhere: kept
+      { id: 'node/3', lat: 35, lon: -100, preset: 'power', presets: ['power'] }, // not a camera: kept
+    ]);
+    assert.equal(n, 2);
+    assert.equal(o.suppressed, 2);
+    assert.deepEqual(ents(o).map((e) => e.properties.record.value.id).sort(), ['node/2', 'node/3']);
+    o.hiddenBy = () => null;                                     // ALPR off: all back
+    assert.equal(o.draw([cam('node/1', 35, -100)]), 1);
+    assert.equal(o.suppressed, 0);
+  });
+
+  test('the ALPR layer reports only cameras it draws with a cone, and only on change', () => {
+    const a = on(new L.AlprLayer(viewer));
+    a.vendors = [{ key: 'flock', label: 'Flock', color: '#ff0' }];
+    let changes = 0;
+    a.onConedChange = () => { changes++; };
+    const cams = [
+      { id: 'node/1', lat: 35, lon: -100, vendor: 'flock', directions: [90] },
+      { id: 'node/2', lat: 35.01, lon: -100, vendor: 'flock', directions: [] },
+    ];
+    a.draw(cams);
+    assert.equal(L.spotTaken(a.conedSpots, { id: 'node/1' }), true);
+    assert.equal(L.spotTaken(a.conedSpots, { id: 'node/2', lat: 35.01, lon: -100 }), false, 'no cone, no claim');
+    const after = changes;
+    a.clear(); a.draw(cams);
+    assert.equal(changes, after, 'same cameras: no change reported');
+    a.showCones = false;
+    a.clear(); a.draw(cams);
+    assert.equal(a.conedSpots, null, 'cones hidden: the OSM pins come back');
+    assert.equal(changes, after + 1);
+    a.showCones = true; a.clear(); a.draw(cams);
+    a.setEnabled(false);
+    assert.equal(a.conedSpots, null, 'layer off: the OSM pins come back');
   });
 });
 
@@ -858,6 +1097,65 @@ describe('BasemapOverlay', () => {
     await bm.search({ bbox: BBOX });
     assert.equal(bm.sceneId, 'S2B_TEST_2', 'a re-search keeps the operator\'s pick');
     assert.equal(bm.active, true);
+  });
+
+  test('a re-search that lands on the same scene keeps the layer instead of reloading it', async () => {
+    const { bm } = setup();
+    await bm.setProvider('sentinel2', { bbox: BBOX });
+    const layer = bm.layer;
+    await bm.search({ bbox: BBOX });
+    assert.equal(bm.layer, layer, 'same tiles, same layer');
+    await bm.selectScene('S2B_TEST_2');
+    assert.notEqual(bm.layer, layer, 'a different scene does replace it');
+  });
+
+  test('Wayback still walking: the newest mosaic at once, quiet follow-ups, then the list', async () => {
+    const { bm } = setup();
+    const timing = s.mod.waybackTiming;
+    const wait = timing.waitMs;
+    timing.waitMs = 30;
+    const { waybackTilemap } = createRequire(import.meta.url)('../../helpers/fixtures.cjs');
+    s.mock.on('/MapServer/tilemap/', async (req) => {
+      await new Promise((r) => setTimeout(r, 120));
+      return waybackTilemap(req);
+    });
+    const realSetTimeout = globalThis.setTimeout;
+    try {
+      // Follow-ups at 4 s are run straight away here.
+      globalThis.setTimeout = (fn, ms, ...a) => realSetTimeout(fn, ms === 4000 ? 10 : ms, ...a);
+      await bm.setProvider('wayback', { bbox: BBOX });
+      assert.equal(bm.status, 'ok', bm.error);
+      assert.equal(bm.meta.pending, true);
+      assert.equal(bm.sceneId, '100', 'newest mosaic on screen');
+      const first = bm.layer;
+      const t0 = Date.now();
+      while (bm.meta.pending && Date.now() - t0 < 5000) await new Promise((r) => realSetTimeout(r, 20));
+      assert.equal(bm.meta.pending, undefined, 'the full list arrived');
+      assert.deepEqual(bm.scenes.map((x) => x.id), ['90', '70']);
+      assert.equal(bm.status, 'ok', 'never shown as an error');
+      assert.notEqual(bm.layer, first, 'now on the newest version that differs here');
+    } finally {
+      globalThis.setTimeout = realSetTimeout;
+      timing.waitMs = wait;
+    }
+  });
+
+  test('a slow answer for a view already left is dropped', async () => {
+    const { bm } = setup();
+    await bm.setProvider('sentinel2', { bbox: BBOX });
+    let release;
+    s.mock.on('earth-search', async (req) => {
+      await new Promise((r) => { release = r; });
+      return json({ features: [] });
+    });
+    s.mod.cache.clear(); await s.mod.clearDiskCache();
+    const slow = bm.search({ bbox: '10,10,10.1,10.1' });
+    await new Promise((r) => setTimeout(r, 50));
+    bm.searchSeq += 1;                     // a newer search has begun
+    release();
+    await slow;
+    assert.equal(bm.status, 'loading', 'the stale reply changed nothing');
+    assert.equal(bm.scenes.length, 2);
   });
 
   test('going back to the boot layer is exact and drops ours', async () => {

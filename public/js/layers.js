@@ -42,6 +42,10 @@ const API_TIMEOUTS = {
   '/api/vessels': 60000,
   // CelesTrak at 30s, then parsing a few thousand TLEs.
   '/api/satellites': 60000,
+  // Scene searches (Sentinel-2's STAC, Esri Wayback's version walk) can be
+  // slow on a first look at a place. Wayback answers within seconds with the
+  // newest mosaic and fills in the rest later; this is the backstop.
+  '/api/basemap': 90000,
 };
 const DEFAULT_API_TIMEOUT = 20000;
 
@@ -70,6 +74,9 @@ const BULK_LIMIT = MAX_INFLIGHT - 1;
 // Short lookups behind a click.
 const INTERACTIVE = new Set([
   '/api/route', '/api/aircraft', '/api/vessel-photo', '/api/nearby-photos', '/api/enrich', '/api/geocode',
+  // A click's port lookup; the background ones go one at a time, so they
+  // never hold more than one lane.
+  '/api/shodan/host',
   '/api/health', '/api/config', '/api/geoip',
 ]);
 // Time-critical polls. These are worthless late: an aircraft position that
@@ -824,133 +831,664 @@ class Layer {
 /* SHODAN — internet-exposed hosts                                     */
 /* ================================================================== */
 
+// Most notable first, as on the server: a machine takes the colour of the
+// most notable category among its services.
+const CATEGORY_RANK = ['ics', 'database', 'remote', 'camera', 'file', 'mail', 'network', 'infra', 'web', 'other'];
+
+function topCategory(cats) {
+  let best = null;
+  for (const c of cats) {
+    const r = CATEGORY_RANK.indexOf(c);
+    if (r >= 0 && (best === null || r < CATEGORY_RANK.indexOf(best))) best = c;
+  }
+  return best || 'other';
+}
+
+/** 125591 -> "126k", 14395297 -> "14M": legend chips have room for a few characters. */
+export function compactCount(n) {
+  const v = Number(n) || 0;
+  if (v >= 1e7) return `${Math.round(v / 1e6)}M`;
+  if (v >= 1e6) return `${(v / 1e6).toFixed(1)}M`;
+  if (v >= 1e4) return `${Math.round(v / 1e3)}k`;
+  return v.toLocaleString();
+}
+
+const parseBox = (bbox) => {
+  if (bbox && typeof bbox === 'object') return [bbox.south, bbox.west, bbox.north, bbox.east].map(Number);
+  const p = String(bbox ?? '').split(',').map(Number);
+  return p.length === 4 && p.every(Number.isFinite) ? p : null;
+};
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Most host summaries the browser holds at once. Each is a few kilobytes;
+// the server keeps them all on disk, so one dropped here costs a fast,
+// free re-read, not a credit.
+const HOST_INFO_MAX = 5000;
+
+/**
+ * Shodan is searched only with the camera below this height, whatever the
+ * FETCH ceiling is set to.
+ *
+ * A search covers the view's grid cells, and above about 45 km that is a
+ * region: one search page then holds the first 100 of millions of services,
+ * mostly hosting blocks somewhere else in the region, and every new region
+ * spends credits on such a sample. Below it a search covers roughly a city,
+ * where the first pages are a fair picture. The free per-machine port
+ * lookups pause above it as well, so nothing at all is asked of Shodan from
+ * altitude.
+ */
+export const SHODAN_MAX_ALTITUDE_M = 45_000;
+
+// How long Shodan results count as fetched and stay drawn: 30 days, the
+// server's default for cache.conf [shodan] hosts. Every miss spends a query
+// credit and Shodan rescans a host over days, so a month-old answer is still
+// worth keeping. The browser follows the server's actual setting at boot
+// (/api/config retention); this is the value without one.
+const SHODAN_RETENTION_MS = 30 * 24 * 60 * 60_000;
+
+// The Shodan search grid, mirroring the server's SHODAN_CELL_DEG / SHODAN_MAX_DEG
+// env defaults. The view is covered one whole cell at a time: each cell is a
+// single cached server query, so a pan only buys the cells it newly exposes
+// and keeps everything already fetched. Keep these in step with the server.
+const SHODAN_CELL_DEG = 0.25;
+const SHODAN_MAX_DEG = 2;
+
 export class ShodanLayer extends Layer {
   constructor(viewer) {
     super(viewer, 'shodan', 'Shodan exposure');
-    // Every miss spends a query credit. Held for 72 hours (TTL.static), refreshed on demand.
-    this.coverageTtlMs = INVENTORY_COVERAGE_MS;
+    // Its own altitude limit, in place of the FETCH ceiling: see
+    // SHODAN_MAX_ALTITUDE_M. `altitudeHeld` is set while the camera is above it.
+    this.maxAltitudeM = SHODAN_MAX_ALTITUDE_M;
+    this.altitudeHeld = false;
+    // Every miss spends a query credit. Held for 30 days (SHODAN_RETENTION_MS),
+    // refreshed on demand with Shift+SYNC.
+    this.coverageTtlMs = SHODAN_RETENTION_MS;
+    this.cacheTtlMs = SHODAN_RETENTION_MS;
     this.padFactor = 0.6;
     this.accumulate = true;
-    // No type filter and no query box: the layer always asks for everything
-    // Shodan has indexed in view, and reading it is done by colour instead.
+    // No type filter and no query box: the layer searches for every service
+    // in view and draws the machines from the first pages of the answer;
+    // reading them is done by colour instead.
     this.preset = 'all';
     this.lastQuery = null;
     this.total = 0;
     this.colorBy = 'category';   // 'risk' | 'category' — category by default,
                                  // since everything is on screen at once
+    // Drawn machines, per category and with known CVEs.
     this.byCategory = {};
     this.vulnerable = 0;
+    // The last answer's area: totals from the count endpoint, and whether
+    // the search pages held every match or only the first few hundred.
+    this.area = null;
+    this.complete = true;
+    this.pages = 1;
+    this.pagesMax = null;
+    this.radiusKm = null;
+    this.partial = null;
+    this.returned = 0;
+    // Free count-endpoint data per cell box, so a pan that retains a cell
+    // still counts it in the area legend without spending a credit to refetch.
+    this.cellArea = new Map();
+    // The grid to tile with; refreshed from each answer's cellDeg.
+    this.cellDeg = SHODAN_CELL_DEG;
+
+    // Every port on each machine, looked up one address at a time. Host
+    // lookups spend no query credit, but Shodan takes about one request a
+    // second, so a few hundred machines fill in over a few minutes.
+    this.lookupsOn = true;
+    this.hosts = new Map();          // ip -> /api/shodan/host summary
+    this.lookupQueue = [];
+    this.queued = new Set();
+    this.lookupTries = new Map();
+    this.lookupInflight = new Map();
+    this.lookupError = null;
+    this.ipLoc = new Map();          // ip -> { lat, lon }, to look up what is in view first
+    // Set by the app while the camera moves and during Shodan's settle wait:
+    // lookups are queries too, and wait for the camera like the search does.
+    this.lookupsPaused = false;
   }
 
   settingsSig() { return 'all'; }
 
-  async load({ bbox }) {
-    const box = this.padBbox(bbox);
-    this.lastFetchedBbox = box;
-    // Replaced below with the cell the server actually charged for, which is
-    // wider than this and covers every zoom level inside it.
-    const data = await this.fetch('/api/shodan', { bbox: box, preset: 'all' });
-    if (data.queried) {
-      const q = data.queried;
-      this.lastFetchedBbox = [q.south, q.west, q.north, q.east].join(',');
-      this.cellDeg = data.cellDeg || null;
-    }
-    this.lastQuery = data.query;
-    this.total = data.total;
-    this.byCategory = data.byCategory || {};
-    this.vulnerable = data.vulnerable || 0;
-    // Shodan records have no natural id across services on one host, so key
-    // by ip:port, which is exactly one banner.
-    for (const m of data.matches) m.id = `${m.ip}:${m.port}`;
-    this.remember(data.matches);
-    this.redraw();
+  setEnabled(on) {
+    super.setEnabled(on);
+    if (on) this.pumpLookups();
   }
 
-  draw(matches) {
-    // Shodan returns per-service banners; several can share one IP and
-    // one coordinate, so jitter co-located points to keep them pickable.
-    const seen = new Map();
+  /** Above the limit: no search, and the port lookups wait too. */
+  async holdForAltitude() {
+    this.altitudeHeld = true;
+    return super.holdForAltitude();
+  }
 
-    for (const m of matches) {
-      const key = `${m.lat.toFixed(4)},${m.lon.toFixed(4)}`;
-      const n = seen.get(key) || 0;
-      seen.set(key, n + 1);
-      const spiral = n === 0 ? [0, 0] : [
-        Math.cos(n * 2.4) * 0.0016 * Math.sqrt(n),
-        Math.sin(n * 2.4) * 0.0016 * Math.sqrt(n),
-      ];
+  /** Whether the camera is above the limit right now (or was, at the last refresh). */
+  aboveLimit() {
+    if (globalThis.OP_DEMO) return false;
+    const h = this.cameraHeight();
+    return this.altitudeHeld || (h != null && h > this.maxAltitudeM);
+  }
 
-      const risky = m.vulns.length > 0;
-      // Risk colouring answers "what's dangerous here"; category colouring
-      // answers "what *is* all this", which is the useful question once the
-      // type filter is off and everything in view is on the globe at once.
-      const css = this.colorBy === 'category'
-        ? (SERVICE_COLORS[m.category] || SERVICE_COLORS.other)
-        : (risky ? '#ff2d55' : '#00e5ff');
+  /** Camera height, when the viewer has one (the test stub may not). */
+  cameraHeight() {
+    const h = this.viewer?.camera?.positionCartographic?.height;
+    return Number.isFinite(h) ? h : null;
+  }
+
+  /**
+   * Checked here as well as in the app: a retry or a queued view can reach
+   * refresh() without passing the app's altitude gate, and none of them may
+   * search Shodan from above the limit.
+   */
+  async refresh(ctx, opts) {
+    const h = this.cameraHeight();
+    if (!globalThis.OP_DEMO && h != null && h > this.maxAltitudeM) return this.holdForAltitude();
+    const wasHeld = this.altitudeHeld;
+    this.altitudeHeld = false;
+    if (wasHeld) this.pumpLookups();
+    return super.refresh(ctx, opts);
+  }
+
+  // The server snaps to a fixed SHODAN_CELL_DEG grid, so the grid is the unit
+  // of work: the view is covered cell by cell, each cell is one cached query,
+  // and a pan only fetches the cells it newly exposes. Cells already fetched
+  // stay drawn (the accumulating store) and keep their free area counts in
+  // this.cellArea, so panning never re-pays for ground already in hand.
+  //
+  // Cells are axis-aligned to multiples of SHODAN_CELL_DEG from 0, matching
+  // the server's snapFixed, so a single-cell bbox round-trips to exactly one
+  // query capped at the SHODAN_PAGES env (the first 3 pages / 300 results).
+  // The span is trimmed to SHODAN_MAX_DEG so one gesture can never fan out
+  // into an unbounded number of credit-spending cells.
+  cellsFor(bbox) {
+    const p = parseBox(bbox);
+    if (!p) return [];
+    const g = this.cellDeg || SHODAN_CELL_DEG;
+    const r = (v) => Number(v.toFixed(4));
+    let [s, w, n, e] = p;
+    const span = SHODAN_MAX_DEG;
+    if (n - s > span) { const c = (s + n) / 2; s = c - span / 2; n = c + span / 2; }
+    if (e - w > span) { const c = (w + e) / 2; w = c - span / 2; e = c + span / 2; }
+    const out = [];
+    for (let y = Math.floor(s / g + 1e-9); y * g < n - 1e-9; y++) {
+      for (let x = Math.floor(w / g + 1e-9); x * g < e - 1e-9; x++) {
+        const cell = {
+          south: r(Math.max(-85, y * g)), north: r(Math.min(85, (y + 1) * g)),
+          west: r(Math.max(-180, x * g)), east: r(Math.min(180, (x + 1) * g)),
+        };
+        if (cell.north <= cell.south || cell.east <= cell.west) continue;
+        cell.key = `${cell.south},${cell.west},${cell.north},${cell.east}`;
+        out.push(cell);
+      }
+    }
+    return out;
+  }
+
+  /** Covered only when every grid cell the view touches has been fetched. */
+  isCovered(bbox) {
+    const cells = this.cellsFor(bbox);
+    return cells.length > 0 && cells.every((c) => super.isCovered(c.key));
+  }
+
+  async load(ctx) {
+    const { bbox } = ctx;
+    const cells = this.cellsFor(bbox);
+    this.lastFetchedBbox = bbox;
+    // Coverage is recorded per cell below, not as one box by the base class.
+    this.coveredBbox = false;
+
+    // Nearest the centre of the view first, so the ground being looked at
+    // fills in before the edges.
+    const mid = (c) => [(c.west + c.east) / 2, (c.south + c.north) / 2];
+    const cx = cells.length ? cells.reduce((a, c) => a + mid(c)[0], 0) / cells.length : 0;
+    const cy = cells.length ? cells.reduce((a, c) => a + mid(c)[1], 0) / cells.length : 0;
+    cells.sort((a, b) => Math.hypot(mid(a)[0] - cx, mid(a)[1] - cy)
+      - Math.hypot(mid(b)[0] - cx, mid(b)[1] - cy));
+
+    let fetched = false;
+    for (const cell of cells) {
+      // The camera has moved on: keep what is in hand and let refresh() ask
+      // for the new view. Cells already drawn stay drawn.
+      if (this._viewBbox !== bbox) break;
+      if (super.isCovered(cell.key)) continue;   // bought already and retained
+
+      const data = await this.fetch('/api/shodan', { bbox: cell.key, preset: 'all' });
+      fetched = true;
+      this.cellDeg = data.cellDeg || this.cellDeg || SHODAN_CELL_DEG;
+      this.lastQuery = data.query;
+      this.pagesMax = data.pagesMax || this.pagesMax;
+      // Keep this cell's free count-endpoint totals so a later pan that
+      // retains the cell still counts it in the area legend.
+      this.cellArea.set(cell.key, {
+        total: Number(data.total) || 0,
+        pages: data.pages || 1,
+        area: data.area || null,
+        complete: data.complete ?? true,
+        partial: data.partial || null,
+      });
+
+      const matches = data.matches || [];
+      for (const m of matches) {
+        m.id = `${m.ip}:${m.port}/${m.transport || 'tcp'}`;
+        if (Number.isFinite(m.lat) && Number.isFinite(m.lon)) this.ipLoc.set(m.ip, { lat: m.lat, lon: m.lon });
+      }
+      this.remember(matches);
+      this.markCovered(cell.key);
+      this.enqueueLookups(matches.map((m) => m.ip));
+      this.aggregateArea(bbox);
+      this.redraw();
+      ctx.onStatus?.();
+    }
+
+    // Every cell was already held: still refresh the legend for the cells now
+    // in view and repaint from the retained store.
+    if (!fetched) { this.aggregateArea(bbox); this.redraw(); }
+  }
+
+  /**
+   * Roll the per-cell count-endpoint data for the cells currently in view
+   * into the layer's area totals, covering retained and freshly fetched cells
+   * alike, so the legend describes the whole view rather than the last cell
+   * bought.
+   */
+  aggregateArea(bbox) {
+    const cells = this.cellsFor(bbox);
+    let total = 0;        // matching services across the in-view cells (search total)
+    let areaTotal = 0;    // services in the area, from the free count endpoint
+    let pages = 1;
+    let complete = true;
+    let partial = null;
+    let have = 0;
+    const byCategory = {};
+    const ipRows = new Map();
+    const orgRows = new Map();
+    for (const cell of cells) {
+      const a = this.cellArea.get(cell.key);
+      if (!a) { complete = false; continue; }   // a cell in view not yet fetched
+      have++;
+      total += a.total || 0;
+      areaTotal += Number(a.area?.total) || 0;
+      pages = Math.max(pages, a.pages || 1);
+      if (a.complete === false) complete = false;
+      if (a.partial) partial = a.partial;
+      for (const [cat, n] of Object.entries(a.area?.byCategory || {})) byCategory[cat] = (byCategory[cat] || 0) + n;
+      for (const row of a.area?.topIps || []) ipRows.set(row.ip, (ipRows.get(row.ip) || 0) + (row.count || 0));
+      for (const row of a.area?.topOrgs || []) orgRows.set(row.org, (orgRows.get(row.org) || 0) + (row.count || 0));
+    }
+    const top = (m, name) => [...m.entries()].map(([v, count]) => ({ [name]: v, count }))
+      .sort((x, y) => y.count - x.count).slice(0, 10);
+    this.total = total;
+    this.pages = pages;
+    this.complete = complete;
+    this.partial = partial;
+    this.area = have ? { total: areaTotal, byCategory, topIps: top(ipRows, 'ip'), topOrgs: top(orgRows, 'org') } : null;
+    this.returned = this.records().length;
+  }
+
+  clearCache() {
+    super.clearCache();
+    this.cellArea.clear();
+  }
+
+  /* ---------------- per-machine lookups ---------------- */
+
+  enqueueLookups(ips) {
+    if (globalThis.OP_DEMO) return;
+    for (const ip of new Set(ips)) {
+      if (!ip || this.hosts.has(ip) || this.queued.has(ip)) continue;
+      this.queued.add(ip);
+      this.lookupQueue.push(ip);
+    }
+    this.pumpLookups();
+  }
+
+  /** The next address to look up: one in view if there is one, else the oldest. */
+  nextLookup() {
+    const v = parseBox(this._viewBbox);
+    let i = 0;
+    if (v) {
+      const [s, w, n, e] = v;
+      const at = this.lookupQueue.findIndex((ip) => {
+        const p = this.ipLoc.get(ip);
+        return p && p.lat >= s && p.lat <= n && p.lon >= w && p.lon <= e;
+      });
+      if (at > 0) i = at;
+    }
+    const [ip] = this.lookupQueue.splice(i, 1);
+    this.queued.delete(ip);
+    return ip;
+  }
+
+  /** Work through the queue one address at a time, for as long as the layer is on. */
+  async pumpLookups() {
+    if (this._pumping) return;
+    this._pumping = true;
+    try {
+      while (this.enabled && this.lookupsOn && !this.lookupsPaused && !this.aboveLimit()
+          && this.lookupQueue.length) {
+        const ip = this.nextLookup();
+        try {
+          await this.lookupHost(ip);
+        } catch (e) {
+          if (e.status === 400) continue;
+          // No key, or a server without the route (the static demo): no
+          // point asking about the rest.
+          if (e.status === 404 || e.status === 412 || e.status === 403) {
+            this.lookupError = e.message;
+            this.lookupQueue.length = 0;
+            this.queued.clear();
+            break;
+          }
+          const tries = (this.lookupTries.get(ip) || 0) + 1;
+          this.lookupTries.set(ip, tries);
+          if (tries < 3 && !this.queued.has(ip)) { this.queued.add(ip); this.lookupQueue.push(ip); }
+          this.lookupError = e.message;
+          this.lookupsChanged();
+          // Refused or failing: slow down rather than retry at full speed.
+          await sleep(e.status === 429 ? 15_000 : 5_000);
+        }
+      }
+    } finally {
+      this._pumping = false;
+      this.lookupsChanged();
+    }
+  }
+
+  /** One address's full record, fetched once however many callers ask. */
+  lookupHost(ip) {
+    if (this.hosts.has(ip)) return Promise.resolve(this.hosts.get(ip));
+    let p = this.lookupInflight.get(ip);
+    if (!p) {
+      p = api('/api/shodan/host', { ip })
+        .then((info) => {
+          this.hosts.set(ip, info);
+          while (this.hosts.size > HOST_INFO_MAX) this.hosts.delete(this.hosts.keys().next().value);
+          this.lookupError = null;
+          this.lookupsChanged();
+          return info;
+        })
+        .finally(() => this.lookupInflight.delete(ip));
+      this.lookupInflight.set(ip, p);
+    }
+    return p;
+  }
+
+  /** A click: this address goes ahead of the queue. */
+  lookupNow(ip) {
+    const i = this.lookupQueue.indexOf(ip);
+    if (i >= 0) { this.lookupQueue.splice(i, 1); this.queued.delete(ip); }
+    return this.lookupHost(ip);
+  }
+
+  /** Redraw and re-label as lookups land, at most every 1.5 s. */
+  lookupsChanged() {
+    if (this._lookupTimer) return;
+    this._lookupTimer = setTimeout(() => {
+      this._lookupTimer = null;
+      if (this.enabled) this.redraw();
+      this.onLookupProgress?.();
+    }, 1500);
+  }
+
+  /** How far the lookups have got, over the machines drawn now. */
+  lookupProgress() {
+    const ips = new Set(this.records().map((m) => m.ip));
+    let done = 0;
+    for (const ip of ips) if (this.hosts.has(ip)) done++;
+    return { done, total: ips.size, queued: this.lookupQueue.length, error: this.lookupError };
+  }
+
+  /* ---------------- drawing ---------------- */
+
+  /** Fill in a machine from its banners and, once looked up, everything Shodan holds on it. */
+  describeMachine(h) {
+    const info = this.hosts.get(h.ip);
+    const full = info?.found ? info : null;
+    h.lookedUp = !!info;
+    h.info = full;
+    const matched = h.matches || [];
+    h.category = full?.category || topCategory(matched.map((m) => m.category));
+    h.vulns = [...new Set([...(full?.vulns || []), ...matched.flatMap((m) => m.vulns || [])])];
+    h.ports = full?.ports?.length
+      ? full.ports
+      : [...new Set(matched.map((m) => m.port))].sort((a, b) => a - b);
+    return h;
+  }
+
+  /** A banner record as a machine of its own. */
+  asMachine(m) {
+    return {
+      kind: 'host', ip: m.ip, lat: m.lat, lon: m.lon, city: m.city, country: m.country,
+      org: m.org, asn: m.asn, os: m.os, hostnames: m.hostnames || [], tags: m.tags || [],
+      matches: [m],
+    };
+  }
+
+  draw(banners) {
+    // Banners are per service; group them into machines by address.
+    const machines = new Map();
+    for (const m of banners) {
+      if (!Number.isFinite(m.lat) || !Number.isFinite(m.lon)) continue;
+      const h = machines.get(m.ip);
+      if (h) h.matches.push(m);
+      else machines.set(m.ip, this.asMachine(m));
+    }
+
+    // Shodan places many addresses on one point (a city's or a provider's
+    // registered location). Machines on the same point share one marker
+    // with a count, rather than a spiral of dots.
+    const places = new Map();
+    const byCategory = {};
+    let vulnerable = 0;
+    for (const h of machines.values()) {
+      this.describeMachine(h);
+      byCategory[h.category] = (byCategory[h.category] || 0) + 1;
+      if (h.vulns.length) vulnerable++;
+      const key = `${h.lat.toFixed(4)},${h.lon.toFixed(4)}`;
+      const list = places.get(key);
+      if (list) list.push(h);
+      else places.set(key, [h]);
+    }
+
+    for (const [key, hs] of places) {
+      const n = hs.length;
+      const risky = hs.some((h) => h.vulns.length);
+      let css;
+      if (this.colorBy === 'category') {
+        // The most common category on the point; a tie goes to the more notable.
+        const tally = {};
+        for (const h of hs) tally[h.category] = (tally[h.category] || 0) + 1;
+        const cat = Object.keys(tally).sort((a, b) => tally[b] - tally[a]
+          || CATEGORY_RANK.indexOf(a) - CATEGORY_RANK.indexOf(b))[0];
+        css = SERVICE_COLORS[cat] || SERVICE_COLORS.other;
+      } else {
+        css = risky ? '#ff2d55' : '#00e5ff';
+      }
       const color = Cesium.Color.fromCssColorString(css);
+      const record = n === 1 ? hs[0] : {
+        kind: 'place', lat: hs[0].lat, lon: hs[0].lon,
+        city: hs[0].city, country: hs[0].country, hosts: hs,
+      };
+      const size = n === 1 ? (risky ? 11 : 7) : Math.min(34, Math.round(12 + 5 * Math.log2(n)));
 
       this.source.entities.add({
-        position: Cesium.Cartesian3.fromDegrees(m.lon + spiral[0], m.lat + spiral[1], 0),
+        // Stable per point, so a redraw as lookups land keeps the selection.
+        id: `shodan:${key}`,
+        position: Cesium.Cartesian3.fromDegrees(hs[0].lon, hs[0].lat, 0),
         point: {
-          pixelSize: risky ? 11 : 7,
-          color: color.withAlpha(0.85),
+          pixelSize: size,
+          color: color.withAlpha(n > 1 ? 0.55 : 0.85),
           outlineColor: color,
           outlineWidth: risky ? 2 : 1,
           disableDepthTestDistance: DEPTH_FREE_M,
           heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
           scaleByDistance: new Cesium.NearFarScalar(1e3, 1.6, 6e5, 0.5),
         },
-        properties: { layer: 'shodan', record: m },
+        label: n > 1 ? {
+          text: String(n),
+          font: '11px "JetBrains Mono", monospace',
+          fillColor: Cesium.Color.WHITE,
+          outlineColor: Cesium.Color.BLACK,
+          outlineWidth: 3,
+          style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+          horizontalOrigin: Cesium.HorizontalOrigin.CENTER,
+          verticalOrigin: Cesium.VerticalOrigin.CENTER,
+          disableDepthTestDistance: DEPTH_FREE_M,
+          heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+          scaleByDistance: new Cesium.NearFarScalar(1e3, 1.3, 6e5, 0.6),
+        } : undefined,
+        properties: { layer: 'shodan', record },
       });
     }
 
-    return matches.length;
+    this.byCategory = byCategory;
+    this.vulnerable = vulnerable;
+    this.places = places.size;
+    return machines.size;
   }
 
+  /**
+   * Legend rows: machines drawn per category and, where the count endpoint
+   * answered, services in the whole area per category.
+   */
   categoryLegend() {
-    return Object.entries(this.byCategory)
-      .sort((a, b) => b[1] - a[1])
-      .map(([cat, n]) => ({ cat, n, color: SERVICE_COLORS[cat] || SERVICE_COLORS.other }));
+    const area = this.area?.byCategory || {};
+    const drawn = this.byCategory || {};
+    return [...new Set([...Object.keys(drawn), ...Object.keys(area)])]
+      .map((cat) => ({ cat, n: drawn[cat] || 0, area: area[cat] ?? null, color: SERVICE_COLORS[cat] || SERVICE_COLORS.other }))
+      .sort((a, b) => (b.area ?? -1) - (a.area ?? -1) || b.n - a.n);
   }
+
+  /* ---------------- detail ---------------- */
 
   detail(rec) {
-    const vulnList = rec.vulns.length
-      ? `<div class="vulns">${rec.vulns.slice(0, 24)
+    if (rec?.kind === 'place') return this.placeDetail(rec);
+    return this.hostDetail(rec?.kind === 'host' ? rec : this.asMachine(rec || {}));
+  }
+
+  hostDetail(h) {
+    this.describeMachine(h);
+    const info = h.info;
+    const vulnList = h.vulns.length
+      ? `<div class="vulns">${h.vulns.slice(0, 24)
           .map((v) => `<a href="https://nvd.nist.gov/vuln/detail/${encodeURIComponent(v)}"
                           target="_blank" rel="noopener">${esc(v)}</a>`).join('')}</div>`
       : '';
-
+    const seen = (h.matches || []).map((m) => m.timestamp).filter(Boolean).sort().pop();
     return {
       kind: 'SHODAN HOST',
-      title: `${rec.ip}:${rec.port}`,
-      accent: rec.vulns.length ? '#ff2d55' : '#00e5ff',
+      title: h.ip,
+      accent: h.vulns.length ? '#ff2d55' : '#00e5ff',
       html: `
         <table>${rows([
-          ['Service', [rec.product, rec.version].filter(Boolean).join(' ') || '—'],
-          ['Category', rec.category],
-          ['Transport', `${rec.transport}/${rec.port}`],
-          ['Organisation', rec.org],
-          ['ASN', rec.asn],
-          ['OS', rec.os],
-          ['Location', [rec.city, rec.country].filter(Boolean).join(', ')],
-          ['Hostnames', rec.hostnames],
-          ['Tags', rec.tags],
-          ['Last seen', rec.timestamp?.replace('T', ' ').slice(0, 19)],
+          ['Organisation', info?.org || h.org],
+          ['ASN', info?.asn || h.asn],
+          ['OS', info?.os || h.os],
+          ['Location', [h.city, h.country].filter(Boolean).join(', ')],
+          ['Hostnames', info?.hostnames?.length ? info.hostnames : h.hostnames],
+          ['Tags', info?.tags?.length ? info.tags : h.tags],
+          ['Open ports', h.ports.join(', ')],
+          ['Last seen', (info?.lastUpdate || seen)?.replace('T', ' ').slice(0, 19)],
         ])}</table>
-        ${rec.vulns.length ? `<h4>${rec.vulns.length} known CVE${rec.vulns.length > 1 ? 's' : ''}</h4>${vulnList}` : ''}
-        ${rec.banner ? `<h4>Banner</h4><pre>${esc(rec.banner)}</pre>` : ''}
+        ${h.vulns.length ? `<h4>${h.vulns.length} known CVE${h.vulns.length > 1 ? 's' : ''}</h4>${vulnList}` : ''}
+        <div data-slot="ports">${this.servicesHtml(h)}</div>
         <div data-slot="enrich"><p class="hint pending">Checking reputation…</p></div>
-        <a class="ext" href="https://www.shodan.io/host/${encodeURIComponent(rec.ip)}"
+        <a class="ext" href="https://www.shodan.io/host/${encodeURIComponent(h.ip)}"
            target="_blank" rel="noopener">Open in Shodan ↗</a>`,
     };
   }
 
-  /** Cross-reference the host against GreyNoise and abuse.ch. */
+  /** The services list: every port once looked up, the matched ones until then. */
+  servicesHtml(h) {
+    const info = h.info;
+    const services = info ? info.services : (h.matches || []);
+    const plural = (n) => (n === 1 ? '' : 's');
+    let head;
+    if (info) {
+      head = `<h4>${info.servicesTotal} service${plural(info.servicesTotal)} on this machine</h4>`
+        + (info.servicesTotal > services.length
+          ? `<p class="hint">The ${services.length} lowest ports are listed.</p>` : '');
+    } else if (h.lookedUp) {
+      head = `<h4>Matched service${plural(services.length)}</h4>
+        <p class="hint">Shodan holds nothing more on this address than the area search returned.</p>`;
+    } else if (this.aboveLimit() && this.lookupsOn) {
+      head = `<h4>Matched service${plural(services.length)}</h4>
+        <p class="hint">Every port on this machine is looked up with the camera below
+          ${Math.round(SHODAN_MAX_ALTITUDE_M / 1000)} km. Zoom in to fetch them.</p>`;
+    } else {
+      const waiting = this.lookupsOn && !globalThis.OP_DEMO;
+      head = `<h4>Matched service${plural(services.length)}</h4>
+        <p class="hint${waiting ? ' pending' : ''}">${waiting
+          ? 'Looking up every port Shodan has on this machine…'
+          : 'Only the services the area search matched are known.'}</p>`;
+    }
+    const items = services.map((v) => {
+      const what = [v.product, v.version].filter(Boolean).join(' ') || '—';
+      const cves = v.vulns?.length ? ` <span class="svc-cve">${v.vulns.length} CVE${plural(v.vulns.length)}</span>` : '';
+      return `<details class="svc"><summary><b>${esc(`${v.port}/${v.transport || 'tcp'}`)}</b> ${esc(what)}
+        <span class="svc-cat">${esc(v.category || 'other')}</span>${cves}</summary>${
+        v.banner ? `<pre>${esc(v.banner)}</pre>` : '<p class="hint">No banner.</p>'}</details>`;
+    }).join('');
+    return `${head}<div class="svc-list">${items}</div>`;
+  }
+
+  placeDetail(p) {
+    const hosts = p.hosts.map((h) => this.describeMachine(h))
+      .sort((a, b) => (b.vulns.length > 0) - (a.vulns.length > 0) || b.ports.length - a.ports.length);
+    const n = hosts.length;
+    const risky = hosts.filter((h) => h.vulns.length).length;
+    const shown = hosts.slice(0, 200);
+    const items = shown.map((h) => `<li><button type="button" class="host-pick" data-ip="${esc(h.ip)}">${esc(h.ip)}</button>
+        <span class="hl-meta">${esc([h.info?.org || h.org, `${h.ports.length} port${h.ports.length === 1 ? '' : 's'}`, h.category]
+          .filter(Boolean).join(' · '))}</span>${h.vulns.length ? ' <span class="svc-cve">CVE</span>' : ''}</li>`).join('');
+    return {
+      kind: 'SHODAN LOCATION',
+      title: `${n} machines`,
+      accent: risky ? '#ff2d55' : '#00e5ff',
+      html: `
+        <p class="hint">Shodan places these ${n} addresses on the same point. That is usually the
+          registered location of a city, an ISP or a hosting provider, not where each machine sits.</p>
+        <table>${rows([
+          ['Location', [p.city, p.country].filter(Boolean).join(', ')],
+          ['With known CVEs', String(risky)],
+        ])}</table>
+        <h4>Machines</h4>
+        <ul class="host-list">${items}</ul>
+        ${n > shown.length ? `<p class="hint">The first ${shown.length} of ${n} are listed.</p>` : ''}`,
+    };
+  }
+
+  /** Cross-reference the host against GreyNoise and abuse.ch, and fetch every port it has. */
   async enrich(rec, root) {
     // Re-query rather than reuse a captured node: see FlightLayer.enrich.
     const seq = ++this.enrichSeq;
-    await enrichHost(rec.ip, () =>
-      (this.enrichSeq === seq ? root.querySelector('[data-slot="enrich"]') : null));
+    if (rec?.kind === 'place') {
+      // Each machine in the list opens its own panel.
+      for (const b of root.querySelectorAll?.('.host-pick') || []) {
+        b.addEventListener('click', () => {
+          const h = rec.hosts.find((x) => x.ip === b.getAttribute('data-ip'));
+          if (h) this.openRecord?.(h);
+        });
+      }
+      return;
+    }
+    const h = rec?.kind === 'host' ? rec : this.asMachine(rec || {});
+    const tasks = [enrichHost(h.ip, () =>
+      (this.enrichSeq === seq ? root.querySelector('[data-slot="enrich"]') : null))];
+    if (h.ip && !this.hosts.has(h.ip) && !globalThis.OP_DEMO && !this.aboveLimit()) {
+      const slot = () => (this.enrichSeq === seq ? root.querySelector('[data-slot="ports"]') : null);
+      tasks.push(this.lookupNow(h.ip)
+        .then(() => {
+          const s = slot();
+          if (s) s.innerHTML = this.servicesHtml(this.describeMachine(h));
+        })
+        .catch((e) => {
+          const s = slot();
+          const hint = s?.querySelector?.('.pending');
+          if (hint) { hint.classList.remove('pending'); hint.textContent = `Port lookup failed: ${e.message}`; }
+        }));
+    }
+    await Promise.all(tasks);
   }
 }
 
@@ -1688,6 +2226,53 @@ const OSM_MAX_SPAN = 1.0;
 const OSM_REDRAW_MS = 800;     // repaint at most this often while tiles arrive
 const OSM_PAD = 0.25;          // margin beyond each edge of the view, as a share of its span
 
+/* ------------------------------------------------------------------ */
+/* Cameras drawn twice                                                 */
+/*                                                                     */
+/* A licence-plate reader mapped in OSM is a man_made=surveillance node, */
+/* so the OSM layer and the ALPR layer both draw it. Where the ALPR     */
+/* layer draws it with a view cone, that pin and cone say more, and the */
+/* OSM pin underneath is only clutter, so the OSM layer leaves it out.  */
+/* Matched by OSM id, or by position for the same camera mapped twice.  */
+/* ------------------------------------------------------------------ */
+
+// Two camera records this close are the same camera.
+const SAME_SPOT_M = 2;
+const spotCell = (lat, lon) => `${Math.round(lat * 1e4)},${Math.round(lon * 1e4)}`;
+
+/** Ids and a position grid for a set of cameras, for spotTaken(). */
+export function cameraSpots(cams) {
+  const ids = new Set();
+  const grid = new Map();
+  for (const c of cams) {
+    if (c?.id) ids.add(c.id);
+    if (!Number.isFinite(c?.lat) || !Number.isFinite(c?.lon)) continue;
+    const k = spotCell(c.lat, c.lon);
+    const list = grid.get(k);
+    if (list) list.push([c.lat, c.lon]); else grid.set(k, [[c.lat, c.lon]]);
+  }
+  return { ids, grid, size: ids.size || grid.size };
+}
+
+/** Whether a feature is the same camera as one in `spots`: same OSM id, or within SAME_SPOT_M. */
+export function spotTaken(spots, f) {
+  if (!spots || !f) return false;
+  if (f.id && spots.ids.has(f.id)) return true;
+  if (!Number.isFinite(f.lat) || !Number.isFinite(f.lon)) return false;
+  const y = Math.round(f.lat * 1e4);
+  const x = Math.round(f.lon * 1e4);
+  const k = Math.cos((f.lat * Math.PI) / 180);
+  for (let dy = -1; dy <= 1; dy++) {
+    for (let dx = -1; dx <= 1; dx++) {
+      for (const [la, lo] of spots.grid.get(`${y + dy},${x + dx}`) || []) {
+        const m = Math.hypot((la - f.lat) * 111_320, (lo - f.lon) * 111_320 * k);
+        if (m <= SAME_SPOT_M) return true;
+      }
+    }
+  }
+  return false;
+}
+
 export class OverpassLayer extends Layer {
   constructor(viewer) {
     super(viewer, 'overpass', 'OSM infrastructure');
@@ -1849,7 +2434,18 @@ export class OverpassLayer extends Layer {
   /** Cached features are filtered by the currently selected classes here,
    *  so ticking a chip off repaints instantly instead of refetching. */
   draw(features) {
-    const visible = features.filter((f) => this.presets.has(f.preset));
+    // Cameras the ALPR layer is drawing with a view cone are left to it (see
+    // "Cameras drawn twice"): same OSM id, or the same spot. Only cameras:
+    // a mast or a substation at the same point stays.
+    const coned = this.hiddenBy?.() || null;
+    let suppressed = 0;
+    const visible = features.filter((f) => {
+      if (!this.presets.has(f.preset)) return false;
+      const camera = f.preset === 'surveillance' || (f.presets || []).includes('surveillance');
+      if (coned && camera && spotTaken(coned, f)) { suppressed++; return false; }
+      return true;
+    });
+    this.suppressed = suppressed;
     const byPreset = {};
     for (const f of visible) byPreset[f.preset] = (byPreset[f.preset] || 0) + 1;
     this.byPreset = byPreset;
@@ -2002,9 +2598,11 @@ export class AlprLayer extends Layer {
     this.withDirection = wanted.filter((c) => c.directions.length).length;
 
     let shown = 0;
+    const coned = [];
     for (const c of wanted) {
       if (this.onlyWithDirection && !c.directions.length) continue;
       shown++;
+      if (this.showCones && c.directions.length) coned.push(c);
 
       const css = colorFor[c.vendor] || '#8b949e';
       const color = Cesium.Color.fromCssColorString(css);
@@ -2046,7 +2644,27 @@ export class AlprLayer extends Layer {
       });
     }
 
+    this.setConed(coned);
     return shown;
+  }
+
+  /**
+   * The cameras drawn with a view cone, for the OSM layer to leave out. Tells
+   * the app only when the set changes, so the OSM layer (which can hold tens
+   * of thousands of features) is not redrawn for nothing.
+   */
+  setConed(cams) {
+    const sig = cams.map((c) => c.id || `${c.lat},${c.lon}`).sort().join('|');
+    this.conedSpots = cams.length ? cameraSpots(cams) : null;
+    if (sig === this._conedSig) return;
+    this._conedSig = sig;
+    this.onConedChange?.();
+  }
+
+  setEnabled(on) {
+    super.setEnabled(on);
+    // Switched off, its cones are gone, so the OSM pins come back.
+    if (!on) this.setConed([]);
   }
 
   /**
@@ -3738,22 +4356,52 @@ export class BasemapOverlay {
       this.viewer.imageryLayers.remove(this.layer, true);
       this.layer = null;
     }
+    this.appliedUrl = null;
+    clearTimeout(this._pendingTimer);
+    this.searchSeq = (this.searchSeq || 0) + 1;   // drop any reply still on its way
     this.onUpdate?.();
   }
 
-  /** Find what is available over the current view. */
-  async search(ctx) {
-    this.status = 'loading';
-    this.error = null;
-    this.onUpdate?.();
+  /**
+   * Find what is available over the current view.
+   *
+   * `quiet` is the follow-up for a Wayback answer still being completed: it
+   * keeps the status and the imagery as they are instead of flashing
+   * "searching" every few seconds. A newer search makes an older one's
+   * answer stale, and a stale answer is dropped, so a slow reply for a place
+   * already left cannot replace the imagery for where the camera is now.
+   */
+  async search(ctx, { quiet = false } = {}) {
+    const seq = this.searchSeq = (this.searchSeq || 0) + 1;
+    clearTimeout(this._pendingTimer);
+    if (!quiet) {
+      this.status = 'loading';
+      this.error = null;
+      this.onUpdate?.();
+    }
     try {
       const d = await api('/api/basemap', {
         provider: this.provider,
         bbox: ctx?.bbox || undefined,
         from: this.from, to: this.to, maxCloud: this.maxCloud,
       });
+      if (seq !== this.searchSeq) return;
       this.meta = d;
       this.scenes = d.scenes || [];
+      // Wayback has drawn the newest mosaic and is still finding the older
+      // versions: ask again shortly, quietly, for as long as it keeps saying
+      // so (about two minutes at most) and nothing newer has been asked.
+      if (d.pending) {
+        const provider = this.provider;
+        this._pendingTries = quiet ? (this._pendingTries || 0) + 1 : 0;
+        if (this._pendingTries < 30) {
+          this._pendingTimer = setTimeout(() => {
+            if (seq === this.searchSeq && this.provider === provider && this.active) {
+              this.search(ctx, { quiet: true }).catch(() => {});
+            }
+          }, 4000);
+        }
+      }
 
       if (d.vector && d.url) {
         // Vector tiles are drawn in the browser, so there is no scene to
@@ -3790,6 +4438,10 @@ export class BasemapOverlay {
       }
       this.status = 'ok';
     } catch (e) {
+      if (seq !== this.searchSeq) return;
+      // A failed follow-up leaves the newest mosaic on screen; only a search
+      // the operator is waiting on reports the failure.
+      if (quiet) return;
       this.status = 'error';
       this.error = e.message;
     }
@@ -3806,11 +4458,16 @@ export class BasemapOverlay {
   }
 
   applyTiles(url, maxLevel, credit) {
+    // The same tiles already on the globe: keep the layer as it is. Every
+    // camera settle searches again, and so does each Wayback follow-up;
+    // replacing an identical layer each time reloaded the imagery under you.
+    if (this.layer && this.appliedUrl === url) return;
     this.applyProvider(new Cesium.UrlTemplateImageryProvider({
       url,
       maximumLevel: maxLevel || 15,
       credit: credit || '',
     }));
+    this.appliedUrl = url;
   }
 
   /** Swap in any imagery provider, raster or self-drawn. */
@@ -3820,6 +4477,9 @@ export class BasemapOverlay {
 
   /** Swap in a ready-made layer. */
   applyLayer(next) {
+    // applyTiles names the URL after this returns; anything else (a vector
+    // map) has none.
+    this.appliedUrl = null;
     this.viewer.imageryLayers.add(next);
     this.viewer.imageryLayers.lowerToBottom(next);
     // Only now drop what it replaced: adding first means no bare globe.

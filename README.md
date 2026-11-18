@@ -109,9 +109,17 @@ The globe opens over wherever the machine running it appears to be, resolved
 by geoIP (or your pinned home; see [Home](#home)); the `⌂ Home` button returns
 there, and the HUD bottom bar shows the resolved city.
 
+**Set the camera height exactly.** Click the **ALT** value in the HUD, type a
+height in km (`45`, `2.5`) or metres (`800 m`) and press Enter: the camera moves
+straight up or down to it, keeping its place, heading and tilt. Escape cancels.
+Handy for parking just under the 45 km query limit instead of scrolling to it.
+Click **HDG** to face north (0°): the view turns about the point in the middle
+of the screen, keeping its tilt and distance.
+
 **Nothing loading?** Layers only fetch below the altitude ceiling (45 km by
 default). Click **FETCH** in the HUD to raise it to 100, 250, or 500 km; higher
-ceilings use more API credits. See [Altitude gate](#altitude-gate).
+ceilings use more API credits. Shodan is the exception: it is searched only
+below 45 km, whatever FETCH is set to. See [Altitude gate](#altitude-gate).
 
 > [!IMPORTANT]
 > `SHODAN_API_KEY` is the one key the headline layer needs. Every other key in
@@ -165,12 +173,12 @@ ceilings use more API credits. See [Altitude gate](#altitude-gate).
 
 | Layer | Source | Notes |
 |---|---|---|
-| **Shodan exposure** | Shodan `host/search` | Every host Shodan has indexed in view, with no filter. Colour by service category (web, remote, database, ICS, camera, network…) or by known CVEs, with a live legend. |
+| **Shodan exposure** | Shodan `host/search`, `host/count`, `host/{ip}` | Hosts Shodan has indexed in view, with no filter: the first three search pages (up to 300 services), drawn one marker per machine, with machines on the same point grouped under a count. Every port on each machine is then looked up, free, about one a second. Colour by service category (web, remote, database, ICS, camera, network…) or by known CVEs; the legend shows the whole area's totals from the free count endpoint next to the machines drawn. |
 | **Live aircraft** | OpenSky + adsbdb | Positions, callsigns, altitude, heading, vertical rate, motion trails, emergency squawk flagging (7500/7600/7700). Click one to resolve its **departure and destination airports**, airline, and airframe. Trails are trimmed to the last two minutes. |
 | **Weather** | RainViewer + NASA GIBS | Precipitation radar (RainViewer) and cloud imagery as toggleable globe overlays, with a frame scrubber and animation across the last ~2 hours plus nowcast. Cloud imagery is GOES-East GeoColor from NASA GIBS, which covers the Americas and the Atlantic; see [Overlay resolution limits](#overlay-resolution-limits). |
 | **Orbital assets** | CelesTrak, Space-Track as fallback | 24 catalogue groups. Real SGP4 propagation in the browser via satellite.js. Click a satellite to draw its ground track for one full revolution. CelesTrak asks for one download per group per two-hour cycle and firewalls clients that retry; the server serves a copy saved within the cycle without asking, and after any failure leaves CelesTrak alone for two hours (kept across restarts). With an optional free Space-Track login (`SPACETRACK_USER` / `SPACETRACK_PASSWORD`), the catalogue comes from Space-Track instead when CelesTrak cannot answer; groups CelesTrak curates by hand are then approximated, and the layer says so. |
 | **OSM infrastructure** | Overpass API | 10 toggleable feature classes: surveillance cameras, military sites, comms towers, power plants and substations, airfields, ports, government and diplomatic, emergency services, data centres, fuel storage. |
-| **ALPR / Flock** | DeFlock via OpenStreetMap | License-plate readers, coloured by vendor, each drawn with a field-of-view cone from its tagged bearing. Filter by vendor, or to only cameras whose facing is known. |
+| **ALPR / Flock** | DeFlock via OpenStreetMap | License-plate readers, coloured by vendor, each drawn with a field-of-view cone from its tagged bearing. Filter by vendor, or to only cameras whose facing is known. Where it draws a camera with a view cone, the OSM infrastructure layer leaves out its own pin for the same camera (same OSM node, or within 2 m), so each camera is drawn once. |
 | **Situational awareness** | GDACS, NASA EONET, USGS, NWS, NASA FIRMS | Live hazard and disaster events for the current view, normalised into one record shape and colour-graded by severity. Red-level events pulse on the globe; events that carry an affected area are drawn as polygons. |
 | **Public cameras** | NYC DOT + ALERTCalifornia + Windy + OpenWebcamDB | Click one to watch it live in the side panel: an embedded player where the operator provides one, otherwise the still frame refreshed on a timer. ALERTCalifornia adds ~1,290 wildfire-detection PTZ cameras, keyless. |
 | **YouTube geotags** | YouTube Data API v3 (`YOUTUBE_API_KEY`) | Videos uploaded in the last 72 hours whose uploader geotagged them near the view, the same search as [YouTube Geofind](https://mattw.io/youtube-geofind/location). Live streams are pink, upcoming ones yellow. Click for details; the player loads only when you press play. |
@@ -257,6 +265,33 @@ toggle, which pauses automatic refetching at any altitude; see
 drawn, and coverage is kept, so descending does not refetch ground already
 covered. Layers resume on their own as the camera settles below the ceiling.
 
+**Shodan has a fixed 45 km limit of its own.** It ignores the FETCH ceiling:
+raising FETCH to 500 km lets every other layer query from there, but Shodan
+still waits until the camera is below 45 km, and its per-machine port lookups
+pause above it too. The reason is what a Shodan search returns. A search covers
+the view's grid cells, and from higher up that is a whole region: one search
+page then holds the first 100 of millions of services, mostly big hosting
+blocks somewhere else in the region, and every new region spends query credits
+on that sample. Below 45 km a search covers roughly a city, where the first
+pages are a fair picture of what is there. Above the limit the Shodan panel
+reads "Searched only below 45 km. Zoom in to update.", and anything already
+drawn stays on the map.
+
+**A settle delay keeps panning from spending credits.** Below 45 km, Shodan is
+not queried the instant the camera stops — it waits until the camera has been
+still for a set delay (15 seconds by default) before fetching, so panning
+across several areas buys none of them until you settle on one. The delay is
+adjustable in the Shodan panel ("Query delay after camera stops"); set it to 0
+to query as soon as the camera settles, like the other layers. While the delay
+is counting down, the Shodan row shows a ◴ with the seconds left. Switching the
+layer on, SYNC and FETCH all query at once, ignoring the delay. A view that is
+already held from an earlier answer (a pan or zoom inside ground already
+fetched) skips the countdown and redraws at once, since nothing would be
+bought. The free per-machine port lookups wait as well: they pause as soon as
+the camera starts moving and resume when the countdown ends, or straight away
+when there is nothing to wait for. Clicking a machine still looks up its ports
+at once.
+
 Orbital assets are the exception: they are propagated from TLE elements rather
 than queried for a view box, and altitude is where you look at them from.
 
@@ -334,7 +369,8 @@ Classes are sorted not by importance but by how an answer goes wrong as it ages:
 
 | Class | Held | What |
 |---|---|---|
-| `static` | **72 hours** | Where fixed things are: OSM infrastructure, ALPR and webcam directories, Shodan hosts, cell and WiFi, Tor relays, seismometer stations, geocoding (memory only), airframes. |
+| `static` | **72 hours** | Where fixed things are: OSM infrastructure, ALPR and webcam directories, cell and WiFi, Tor relays, seismometer stations, geocoding (memory only), airframes. |
+| `shodan` | **30 days** | Shodan search pages, area totals and per-machine port lookups (`cache.conf` `[shodan] hosts`). Every miss spends a query credit, so an area is not paid for twice within the month. |
 | `orbit` | 24 hours | Orbital elements. |
 | `hazard` | 1 hour | Present-tense claims: active alerts and hazards, traffic incidents, outages, live sensor readings. |
 | `schedule` | 30 minutes | Flight schedules (see below). |
@@ -653,7 +689,7 @@ under [Caching](#caching).
 
 ### Rate limits worth knowing
 
-- **Shodan**: every search carries a `geo:` filter, so each one costs a query credit. Results are fetched per fixed grid cell and reused, so panning inside a cell you have already paid for is free; each new cell is one credit. To pause automatic refetching while you explore, switch the `AUTO` toggle in the top bar to `HOLD`, then press `SYNC` when you've framed the shot.
+- **Shodan**: every search page carries a `geo:` filter, so each page costs a query credit, and a new area buys up to `SHODAN_PAGES` of them (3 by default). Results are fetched per fixed grid cell and reused, so panning inside an area you have already paid for is free. An area whose pages held every match also answers any zoom inside it; one that held only a sample does not, so zooming into a city asks about the city instead of redrawing the wider area's sample. The area totals (`host/count`) and the per-machine port lookups (`host/{ip}`) spend no query credits. To pause automatic refetching while you explore, switch the `AUTO` toggle in the top bar to `HOLD`, then press `SYNC` when you've framed the shot.
 - **OpenSky**: a daily credit bucket, not a rate; see [Aircraft and the OpenSky budget](#aircraft-and-the-opensky-budget).
 - **NWS**: about 85% of active alerts reference forecast zones instead of carrying a polygon. Resolving each zone would be hundreds of extra requests, so those are counted in the layer note but not drawn. The layer says how many.
 - **OpenWebcamDB**: free for non-commercial use only, and the documented list route has no spatial filter, so the whole catalogue (~1,500 cameras) is paged once and cached (`static`, 72 hours), then filtered locally.

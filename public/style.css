@@ -352,6 +352,20 @@ select.ctl { cursor: pointer; }
   font-variant-numeric: tabular-nums; text-shadow: 0 0 10px rgba(57,255,136,.2);
 }
 #hud .keys { margin-left: auto; }
+
+/* HDG doubles as a compass: click to face north. */
+#hud-hdg.clickable { cursor: pointer; border-bottom: 1px dotted rgba(57,255,136,.35); }
+#hud-hdg.clickable:hover, #hud-hdg.clickable:focus-visible { color: #fff; outline: none; }
+
+/* ALT doubles as an entry: click, type a height in km, Enter. */
+#hud-alt.editable { cursor: text; border-bottom: 1px dotted rgba(57,255,136,.35); }
+#hud-alt.editable:hover, #hud-alt.editable:focus-visible { color: #fff; outline: none; }
+.hud-alt-input {
+  width: 70px; font: inherit; font-size: 11.5px; color: var(--hud);
+  background: rgba(0,0,0,.5); border: 1px solid rgba(57,255,136,.5); border-radius: 2px;
+  padding: 0 4px; font-variant-numeric: tabular-nums;
+}
+.hud-alt-input.bad { border-color: #ff2d55; color: #ff8fa8; }
 #hud .keys b { color: var(--dim); text-shadow: none; font-weight: 400; }
 
 /* ---------------------------------------------------------------- */
@@ -523,6 +537,19 @@ select.ctl { cursor: pointer; }
   background: rgba(126,231,135,.12); border-color: rgba(126,231,135,.4); color: #a5f3ad;
 }
 
+/* Shodan query-delay control --------------------------------------- */
+
+.settle-ctl {
+  display: flex; align-items: center; gap: 6px; justify-content: space-between;
+  font-size: 11px; color: var(--dim); margin: 4px 0 2px;
+}
+.settle-ctl .num {
+  width: 46px; text-align: right; background: rgba(255,255,255,.04);
+  color: inherit; border: 1px solid var(--line); border-radius: 2px; padding: 1px 4px;
+  font: inherit;
+}
+.settle-ctl .unit { color: var(--dim); }
+
 /* Shodan category legend ------------------------------------------ */
 
 .legend { display: flex; flex-wrap: wrap; gap: 3px 8px; }
@@ -533,6 +560,31 @@ select.ctl { cursor: pointer; }
 .legend-dot {
   width: 7px; height: 7px; border-radius: 50%; display: inline-block;
 }
+
+/* Shodan machine detail: one row per service, the banner on demand. */
+.svc-list { display: flex; flex-direction: column; gap: 2px; margin-bottom: 10px; }
+details.svc { border-bottom: 1px solid var(--line); padding: 3px 0; }
+details.svc summary { cursor: pointer; font-size: 11px; list-style-position: inside; }
+details.svc summary b { color: var(--accent, var(--hud)); margin-right: 4px; }
+details.svc pre { margin: 6px 0 4px; }
+.svc-cat { color: var(--dim); font-size: 10px; margin-left: 4px; }
+.svc-cve {
+  font-size: 9.5px; padding: 0 4px; margin-left: 4px; border-radius: 2px;
+  color: #ff8fa8; border: 1px solid rgba(255,45,85,.5); background: rgba(255,45,85,.12);
+}
+
+/* Machines sharing one point: a list that opens each machine's panel. */
+.host-list { list-style: none; margin: 0 0 10px; padding: 0; }
+.host-list li {
+  display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+  padding: 3px 0; border-bottom: 1px solid var(--line); font-size: 11px;
+}
+.host-pick {
+  background: none; border: 0; padding: 0; cursor: pointer;
+  font: inherit; color: var(--accent, var(--hud)); text-decoration: underline dotted;
+}
+.host-pick:hover { text-decoration: underline; }
+.hl-meta { color: var(--dim); font-size: 10.5px; }
 
 .target.home { color: var(--hud); border-color: rgba(57,255,136,.4); }
 

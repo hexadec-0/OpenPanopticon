@@ -109,10 +109,22 @@ function stationsTle() {
 
 function shodanSearch({ params }) {
   const q = params.get('query') || '';
-  const m = /geo:"(-?[\d.]+),(-?[\d.]+),(\d+)"/.exec(q);
-  const c = m ? { lat: num(m[1]), lon: num(m[2]), r: num(m[3]) } : { ...HOME, r: 10 };
-  const d = c.r / 111;
-  const box = { south: c.lat - d, north: c.lat + d, west: c.lon - d, east: c.lon + d };
+  // Shodan's geo filter arrives either as a 4-value bounding box
+  // (north,west,south,east) or the older centre+radius (lat,lon,km). Place the
+  // sample hosts inside whichever the query carried, so a per-cell sweep lands
+  // them in that cell rather than defaulting to HOME.
+  const bb = /geo:"(-?[\d.]+),(-?[\d.]+),(-?[\d.]+),(-?[\d.]+)"/.exec(q);
+  const rc = /geo:"(-?[\d.]+),(-?[\d.]+),(\d+(?:\.\d+)?)"/.exec(q);
+  let box;
+  if (bb) {
+    box = { north: num(bb[1]), west: num(bb[2]), south: num(bb[3]), east: num(bb[4]) };
+  } else if (rc) {
+    const d = num(rc[3]) / 111;
+    box = { south: num(rc[1]) - d, north: num(rc[1]) + d, west: num(rc[2]) - d, east: num(rc[2]) + d };
+  } else {
+    const d = 10 / 111;
+    box = { south: HOME.lat - d, north: HOME.lat + d, west: HOME.lon - d, east: HOME.lon + d };
+  }
   const p1 = place(box, 0.002, 0.002);
   const p2 = place(box, -0.002, 0.003);
   return json({
@@ -135,6 +147,47 @@ function shodanSearch({ params }) {
       { ip_str: '198.51.100.12', port: 22, product: 'OpenSSH', location: {} },
     ],
   });
+}
+
+// The count endpoint: totals and breakdowns for a whole search area.
+function shodanCount() {
+  return json({
+    total: 125591,
+    matches: [],
+    facets: {
+      port: [{ value: 80, count: 10118 }, { value: 443, count: 9928 }, { value: 22, count: 5099 },
+        { value: 502, count: 12 }, { value: 4567, count: 11809 }],
+      ip: [{ value: '198.51.100.99', count: 1246 }, { value: '198.51.100.10', count: 3 }],
+      org: [{ value: 'Test ISP', count: 40000 }],
+    },
+  });
+}
+
+// One address, every port: 198.51.100.10 answers on three ports, one of
+// them SSH; 198.51.100.11 carries hostile text; anything else is unknown.
+function shodanHostInfo({ url }) {
+  const ip = decodeURIComponent(url.pathname.split('/').pop());
+  if (ip === '198.51.100.10') {
+    return json({
+      ip_str: ip, latitude: 35.002, longitude: -100.002, city: 'Testville', country_name: 'Testland',
+      org: 'Test Hosting', asn: 'AS64500', os: 'Linux', hostnames: ['host.example'], tags: ['cloud'],
+      ports: [22, 443, 8080], vulns: ['CVE-2021-44228', 'CVE-2023-0001'], last_update: '2026-11-01T00:00:00',
+      data: [
+        { port: 443, transport: 'tcp', product: 'nginx', version: '1.18.0', data: 'HTTP/1.1 200 OK\r\nServer: nginx\r\n',
+          vulns: { 'CVE-2021-44228': {} } },
+        { port: 22, transport: 'tcp', product: 'OpenSSH', version: '8.9p1', data: 'SSH-2.0-OpenSSH_8.9p1' },
+        { port: 8080, transport: 'tcp', product: 'Apache Tomcat', data: 'HTTP/1.1 404' },
+      ],
+    });
+  }
+  if (ip === '198.51.100.11') {
+    const XSS = '<img src=x onerror="window.__xss=1">';
+    return json({
+      ip_str: ip, latitude: 34.998, longitude: -99.997, org: XSS, hostnames: [XSS], ports: [502],
+      data: [{ port: 502, transport: 'tcp', product: XSS, version: XSS, data: `</pre>${XSS}` }],
+    });
+  }
+  return json({ error: 'No information available for that IP.' }, { status: 404 });
 }
 
 function openSkyStates({ params }) {
@@ -674,6 +727,8 @@ function registerDefaults(mock) {
   const host = (h, path = '') => (url) => url.hostname === h && url.pathname.startsWith(path);
 
   mock.on(host('api.shodan.io', '/shodan/host/search'), shodanSearch);
+  mock.on(host('api.shodan.io', '/shodan/host/count'), shodanCount);
+  mock.on((url) => url.hostname === 'api.shodan.io' && /^\/shodan\/host\/[0-9a-fA-F.:%]+$/.test(url.pathname), shodanHostInfo);
   mock.on(host('api.shodan.io', '/api-info'), () => json({ query_credits: 100, scan_credits: 10, plan: 'test' }));
 
   mock.on(host('auth.opensky-network.org'), () => json({ access_token: 'opensky-test-token', expires_in: 1800 }));
@@ -854,6 +909,6 @@ function registerDefaults(mock) {
 }
 
 module.exports = {
-  HOME, TEST_KEYS, near, place, registerDefaults, stationsTle, tleEpoch, tleChecksum, FEODO,
+  HOME, TEST_KEYS, near, place, registerDefaults, stationsTle, tleEpoch, tleChecksum, FEODO, waybackTilemap,
   status,
 };

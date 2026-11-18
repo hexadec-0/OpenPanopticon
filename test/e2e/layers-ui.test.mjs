@@ -60,17 +60,60 @@ e2e('layers and the detail panel', () => {
     await waitForLayer(page, 'flights');
   });
 
-  test('Shodan: hosts drawn, legend by category or by CVEs, credits in the tooltip', async () => {
+  test('Shodan: machines drawn, legend by category or by CVEs, credits in the tooltip', async () => {
     await enable('shodan');
     assert.equal(await text$(page, `${row('shodan')} .layer-count`), '2');
+    // Area services (from the count endpoint) · machines drawn. The drawn
+    // counts move as port lookups land, so only the area half is pinned.
     const legend = await page.$$eval(`${row('shodan')} .legend-item`, (ns) => ns.map((n) => n.textContent));
-    assert.deepEqual(legend.sort(), ['ics 1', 'web 1']);
+    for (const want of [/^other 100k · \d$/, /^web 20k · \d$/, /^remote 5,099 · \d$/, /^ics 12 · 1$/]) {
+      assert.ok(legend.some((t) => want.test(t)), `${want} in ${legend.join(' | ')}`);
+    }
     await page.select(`${row('shodan')} select.ctl`, 'risk');
     const risk = await page.$$eval(`${row('shodan')} .legend-item`, (ns) => ns.map((n) => n.textContent));
     assert.deepEqual(risk, ['known CVEs 1', 'no known CVEs 1']);
-    assert.match(await text$(page, `${row('shodan')} .note`), /3 total matches in view; the first page is drawn/);
+    assert.equal(await text$(page, `${row('shodan')} .note`),
+      '125,591 services in current view. Showing all 2 entries.');
+    await page.waitForFunction(() => /Busiest address: 198\.51\.100\.99, 1,246 services/
+      .test(document.querySelector('.layer[data-layer="shodan"] .layer-count').title));
     // Switching the layer on reads the credit count without a full refresh.
     await page.waitForFunction(() => /100 query credits left/.test(document.querySelector('.layer[data-layer="shodan"] .layer-count').title));
+  });
+
+  test('Shodan waits for the camera to settle before querying; the delay is adjustable', async () => {
+    await enable('shodan');
+    await page.evaluate(() => { WV.shodanSettleMs = 2000; WV.clearShodanSettle(); });
+    const searches = () => stack.server.mock.callsTo('/shodan/host/search').length;
+    const move = (lon, lat) => page.evaluate(([x, y]) => {
+      WV.viewer.camera.moveStart.raiseEvent();
+      WV.viewer.camera.setView({
+        destination: Cesium.Cartesian3.fromDegrees(x, y, 3000),
+        orientation: { heading: 0, pitch: -Math.PI / 2, roll: 0 },
+      });
+      WV.viewer.camera.moveEnd.raiseEvent();
+    }, [lon, lat]);
+
+    // Somewhere not yet fetched: a countdown, and nothing asked until it ends.
+    const before = searches();
+    const movedAt = Date.now();
+    await move(-97.4, 36.6);
+    await page.waitForFunction(() => WV.layers.shodan.settleUntil > Date.now(), { timeout: 2000 });
+    assert.match(await text$(page, `${row('shodan')} .layer-count`), /^◴\d/);
+    assert.equal(searches(), before, 'nothing queried while the camera is still settling');
+    assert.equal(await page.evaluate(() => WV.layers.shodan.lookupsPaused), true, 'port lookups wait too');
+    await page.waitForFunction(() => WV.layers.shodan.settleUntil == null, { timeout: 6000 });
+    assert.ok(Date.now() - movedAt >= 2000, 'waited the configured delay before querying');
+    await waitForLayer(page, 'shodan');
+    assert.ok(searches() > before, 'queried once the camera had settled');
+    assert.equal(await page.evaluate(() => WV.layers.shodan.lookupsPaused), false, 'lookups resumed');
+
+    // Back inside ground already held: no countdown, no request.
+    const held = searches();
+    await move(-97.4, 36.6);
+    await new Promise((r) => setTimeout(r, 1200));
+    assert.equal(await page.evaluate(() => WV.layers.shodan.settleUntil ?? null), null, 'no wait for a held view');
+    assert.equal(searches(), held);
+    assert.equal(await page.evaluate(() => WV.layers.shodan.lookupsPaused), false);
   });
 
   test('SYNC leaves Shodan on its paid-for answers; Shift+SYNC re-buys them', async () => {
@@ -91,10 +134,12 @@ e2e('layers and the detail panel', () => {
   });
 
   test('Shodan detail: host, CVE links and the reputation lookup', async () => {
-    assert.equal(await pickFirst(page, 'shodan', (r) => r.port === 443), true);
+    assert.equal(await pickFirst(page, 'shodan', (r) => r.ip === '198.51.100.10'), true);
     const d = await detail();
     assert.equal(d.kind, 'SHODAN HOST');
-    assert.equal(d.title, '198.51.100.10:443');
+    assert.equal(d.title, '198.51.100.10');
+    // Every port on the machine, not only the one the area search matched.
+    await page.waitForFunction(() => /3 services on this machine/.test(document.querySelector('[data-slot="ports"]').textContent));
     assert.match(d.body, /CVE-2021-44228/);
     await page.waitForFunction(() => /Scanner reputation/.test(document.querySelector('[data-slot="enrich"]').textContent));
     assert.match(await text$(page, '[data-slot="enrich"]'), /Not on the abuse\.ch botnet C2 list/);

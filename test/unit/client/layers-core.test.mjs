@@ -505,20 +505,21 @@ describe('Layer base class', () => {
     assert.equal(layer.source.entities.values.length, 0);
   });
 
-  test('Shodan keys records by ip:port and records the cell it was charged for', async () => {
+  test('Shodan keys records by ip:port, draws machines, and covers the cell it bought', async () => {
     globalThis.fetch = async () => new Response(JSON.stringify({
       query: 'q', total: 2, byCategory: { web: 1 }, vulnerable: 1, cellDeg: 0.25,
-      queried: { south: 1, west: 2, north: 3, east: 4 },
-      matches: [{ ip: '1.2.3.4', port: 80, lat: 1, lon: 2, vulns: [], category: 'web' },
-        { ip: '1.2.3.4', port: 443, lat: 1, lon: 2, vulns: ['CVE-1'], category: 'web' }],
+      queried: { south: 2, west: 3, north: 2.25, east: 3.25 },
+      matches: [{ ip: '1.2.3.4', port: 80, lat: 2.1, lon: 3.1, vulns: [], category: 'web' },
+        { ip: '1.2.3.4', port: 443, lat: 2.1, lon: 3.1, vulns: ['CVE-1'], category: 'web' }],
     }));
     const s = new ShodanLayer(makeViewer());
+    s.lookupsOn = false;
     s.setEnabled(true);
-    await s.refresh({ bbox: '1.5,2.5,2.5,3.5' });
-    assert.deepEqual(s.records().map((r) => r.id).sort(), ['1.2.3.4:443', '1.2.3.4:80']);
-    assert.equal(s.lastFetchedBbox, '1,2,3,4');
-    assert.equal(s.isCovered('1.1,2.1,2.9,3.9'), true);
-    assert.equal(s.count, 2);
+    await s.refresh({ bbox: '2.1,3.1,2.2,3.2' });          // one cell: 2.0..2.25 x 3.0..3.25
+    assert.deepEqual(s.records().map((r) => r.id).sort(), ['1.2.3.4:443/tcp', '1.2.3.4:80/tcp']);
+    assert.equal(s.isCovered('2.12,3.12,2.18,3.18'), true, 'a zoom inside the bought cell');
+    assert.equal(s.isCovered('2.3,3.3,2.4,3.4'), false, 'a cell never fetched');
+    assert.equal(s.count, 1, 'two services, one machine');
   });
 });
 

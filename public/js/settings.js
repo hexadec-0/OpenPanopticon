@@ -78,7 +78,7 @@ export function collect(wv) {
 
     enabled: Object.fromEntries(Object.entries(L).map(([k, l]) => [k, l.enabled])),
 
-    shodan: { colorBy: L.shodan.colorBy },
+    shodan: { colorBy: L.shodan.colorBy, lookups: L.shodan.lookupsOn, settleMs: wv.shodanSettleMs },
     flights: { showLabels: L.flights.showLabels, showTrails: L.flights.showTrails },
     satellites: { group: L.satellites.group, limit: L.satellites.limit },
     overpass: { presets: set(L.overpass.presets) },
@@ -142,7 +142,13 @@ export function apply(wv, s) {
   const asSet = (v, fallback) => (Array.isArray(v) ? new Set(v) : fallback);
   const bool = (v, fallback) => (typeof v === 'boolean' ? v : fallback);
 
-  if (s.shodan) L.shodan.colorBy = s.shodan.colorBy || L.shodan.colorBy;
+  if (s.shodan) {
+    L.shodan.colorBy = s.shodan.colorBy || L.shodan.colorBy;
+    L.shodan.lookupsOn = bool(s.shodan.lookups, L.shodan.lookupsOn);
+    if (Number.isFinite(s.shodan.settleMs)) {
+      wv.shodanSettleMs = Math.max(0, Math.min(120_000, s.shodan.settleMs));
+    }
+  }
 
   if (s.flights) {
     L.flights.showLabels = bool(s.flights.showLabels, L.flights.showLabels);

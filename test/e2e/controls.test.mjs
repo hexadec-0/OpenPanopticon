@@ -39,6 +39,71 @@ e2e('top bar, HUD and keyboard', () => {
     assert.match(await page.$eval('#optics .optic[data-mode="flir"]', (b) => b.title), /Thermal infrared/);
   });
 
+  test('HDG turns the view to face north, keeping the point in the middle', async () => {
+    await page.evaluate(({ lat, lon }) => {
+      WV.viewer.camera.cancelFlight();
+      WV.viewer.camera.setView({
+        destination: Cesium.Cartesian3.fromDegrees(lon, lat, 8000),
+        orientation: { heading: Cesium.Math.toRadians(90), pitch: Cesium.Math.toRadians(-50), roll: 0 },
+      });
+    }, HOME);
+    await page.waitForFunction(() => document.querySelector('#hud-hdg').textContent === '090°', { timeout: 3000 });
+    const midBefore = await page.evaluate(() => {
+      const s = WV.viewer.scene; const c = s.canvas;
+      const p = WV.viewer.camera.pickEllipsoid(new Cesium.Cartesian2(c.clientWidth / 2, c.clientHeight / 2));
+      const g = Cesium.Cartographic.fromCartesian(p);
+      return { lat: g.latitude, lon: g.longitude };
+    });
+    await page.click('#hud-hdg');
+    await page.waitForFunction(() => {
+      const h = WV.viewer.camera.heading;
+      return Math.min(h, Math.PI * 2 - h) < 0.01;
+    }, { timeout: 5000 });
+    const res = await page.evaluate(() => {
+      const s = WV.viewer.scene; const c = s.canvas;
+      const p = WV.viewer.camera.pickEllipsoid(new Cesium.Cartesian2(c.clientWidth / 2, c.clientHeight / 2));
+      const g = Cesium.Cartographic.fromCartesian(p);
+      return { lat: g.latitude, lon: g.longitude, pitch: WV.viewer.camera.pitch };
+    });
+    assert.ok(Math.abs(res.lat - midBefore.lat) < 1e-4 && Math.abs(res.lon - midBefore.lon) < 1e-4,
+      'the point in the middle stays in the middle');
+    assert.ok(Math.abs(res.pitch - Cesium.Math.toRadians(-50)) < 0.02, 'tilt kept');
+    await page.waitForFunction(() => document.querySelector('#hud-hdg').textContent === '000°', { timeout: 3000 });
+  });
+
+  test('ALT takes a typed height in km and moves the camera straight to it', async () => {
+    await lookAt(page, { lat: HOME.lat, lon: HOME.lon, h: 12_345 });
+    const before = await page.evaluate(() => {
+      const c = WV.viewer.camera.positionCartographic;
+      return { lat: c.latitude, lon: c.longitude };
+    });
+    await page.click('#hud-alt');
+    await page.waitForSelector('.hud-alt-input');
+    await page.$eval('.hud-alt-input', (i) => { i.value = ''; });
+    await page.type('.hud-alt-input', '30');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => Math.abs(WV.viewer.camera.positionCartographic.height - 30_000) < 5,
+      { timeout: 5000 });
+    const after = await page.evaluate(() => {
+      const c = WV.viewer.camera.positionCartographic;
+      return { lat: c.latitude, lon: c.longitude };
+    });
+    assert.ok(Math.abs(after.lat - before.lat) < 1e-6 && Math.abs(after.lon - before.lon) < 1e-6,
+      'same place, only the height changed');
+    assert.equal(await page.$('.hud-alt-input'), null, 'the entry closes');
+    await page.waitForFunction(() => document.querySelector('#hud-alt').textContent === '30.0 km', { timeout: 3000 });
+
+    // Nonsense is refused and the camera stays put; Escape cancels.
+    await page.click('#hud-alt');
+    await page.$eval('.hud-alt-input', (i) => { i.value = ''; });
+    await page.type('.hud-alt-input', 'banana');
+    await page.keyboard.press('Enter');
+    assert.equal(await page.$eval('.hud-alt-input', (i) => i.classList.contains('bad')), true);
+    await page.keyboard.press('Escape');
+    assert.equal(await page.$('.hud-alt-input'), null);
+    assert.ok(Math.abs(await page.evaluate(() => WV.viewer.camera.positionCartographic.height) - 30_000) < 5);
+  });
+
   test('keys 1–5 pick the optic', async () => {
     await page.keyboard.press('3');
     assert.equal(await text$(page, '#hud-mode'), 'SAR');

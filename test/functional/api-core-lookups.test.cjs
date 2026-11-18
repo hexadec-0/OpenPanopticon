@@ -383,6 +383,39 @@ describe('/api/basemap', () => {
     assert.equal((await s.api('/api/basemap', { provider: 'wayback' })).status, 400);
   });
 
+  // Regression: a first look walked every version before answering, longer
+  // than the browser waits, so the panel showed an error for half a minute.
+  test('Esri Wayback: a slow walk answers at once with the newest mosaic, then the full list', async () => {
+    const { waybackTilemap } = require('../helpers/fixtures.cjs');
+    const timing = s.mod.waybackTiming;
+    const wait = timing.waitMs;
+    timing.waitMs = 50;
+    try {
+      s.mock.on('/MapServer/tilemap/', async (req) => {
+        await new Promise((r) => setTimeout(r, 150));
+        return waybackTilemap(req);
+      });
+      const t0 = Date.now();
+      const first = (await s.api('/api/basemap', { provider: 'wayback', bbox: BBOX })).json();
+      assert.ok(Date.now() - t0 < 1500, 'answered without waiting for the walk');
+      assert.equal(first.pending, true);
+      assert.deepEqual(first.scenes.map((x) => x.id), ['100'], 'the newest release, drawn at once');
+      assert.match(first.scenes[0].url, /\/tile\/100\/\{z\}\/\{y\}\/\{x\}$/);
+      // The walk carries on by itself and is cached; asking again gets it all.
+      let full;
+      for (let i = 0; i < 40; i++) {
+        await new Promise((r) => setTimeout(r, 100));
+        full = (await s.api('/api/basemap', { provider: 'wayback', bbox: BBOX })).json();
+        if (!full.pending) break;
+      }
+      assert.equal(full.pending, undefined);
+      assert.deepEqual(full.scenes.map((x) => x.id), ['90', '70']);
+      assert.equal(s.mock.callsTo('/tilemap/').length, 3, 'walked once, not once per ask');
+    } finally {
+      timing.waitMs = wait;
+    }
+  });
+
   test('Esri Wayback: nothing recorded for the tile still offers the current mosaic', async () => {
     s.mock.on('/MapServer/tilemap/', () => json({ data: [0], select: [], size: [] }));
     const d = (await s.api('/api/basemap', { provider: 'wayback', bbox: '10,-30.1,10.1,-30' })).json();

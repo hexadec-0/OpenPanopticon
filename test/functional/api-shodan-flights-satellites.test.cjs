@@ -37,13 +37,14 @@ describe('/api/shodan', () => {
     assert.deepEqual(d.queried, { south: 34.75, west: -100.25, north: 35.25, east: -99.75 });
   });
 
-  test('queries Shodan by centre and radius, with the key, minified', async () => {
+  test('queries Shodan by bounding box, with the key, minified', async () => {
     await s.api('/api/shodan', { bbox: BBOX, preset: 'all' });
     const call = s.mock.callsTo('/shodan/host/search')[0];
     const u = new URL(call.url);
     assert.equal(u.searchParams.get('key'), TEST_KEYS.SHODAN_API_KEY);
     assert.equal(u.searchParams.get('minify'), 'true');
-    assert.match(u.searchParams.get('query'), /^geo:"35\.0000,-100\.0000,\d+"$/);
+    // The snapped cell as Shodan's 4-value geo box: north,west,south,east.
+    assert.equal(u.searchParams.get('query'), 'geo:"35.2500,-100.2500,34.7500,-99.7500"');
   });
 
   test('a named preset adds its filter; an unknown one falls back to "all"', async () => {
@@ -152,6 +153,152 @@ describe('/api/shodan', () => {
     assert.equal(a.query_credits, 100);
     await s.api('/api/shodan/credits');
     assert.equal(s.mock.callsTo('/api-info').length, 1);
+  });
+});
+
+describe('/api/shodan paging, reuse and area totals', () => {
+  // A search that reports `total` matches and serves them 100 to a page.
+  const paged = (total) => ({ params }) => {
+    const page = Number(params.get('page') || 1);
+    const from = (page - 1) * 100;
+    const n = Math.max(0, Math.min(100, total - from));
+    return json({ total, matches: Array.from({ length: n }, (_, i) => ({
+      ip_str: `10.0.${page}.${i}`, port: 80, transport: 'tcp', data: 'HTTP/1.1 200 OK',
+      location: { latitude: 35, longitude: -100 },
+    })) });
+  };
+  const pagesAsked = () => s.mock.callsTo('/shodan/host/search')
+    .map((c) => new URL(c.url).searchParams.get('page') || '1');
+
+  test('a new area buys up to SHODAN_PAGES pages and says it is a sample', async () => {
+    s.mock.on('/shodan/host/search', paged(1000));
+    const d = (await s.api('/api/shodan', { bbox: BBOX })).json();
+    assert.equal(s.mod.SHODAN_PAGES, 3);
+    assert.deepEqual(pagesAsked(), ['1', '2', '3']);
+    assert.equal(d.returned, 300);
+    assert.equal(d.pages, 3);
+    assert.equal(d.complete, false);
+    assert.equal(d.total, 1000);
+  });
+
+  test('paging stops once every match is held', async () => {
+    s.mock.on('/shodan/host/search', paged(150));
+    const d = (await s.api('/api/shodan', { bbox: BBOX })).json();
+    assert.deepEqual(pagesAsked(), ['1', '2']);
+    assert.equal(d.returned, 150);
+    assert.equal(d.complete, true);
+  });
+
+  test('a later page that fails keeps the pages already bought', async () => {
+    // Later routes are matched first.
+    s.mock.on('/shodan/host/search', paged(1000));
+    s.mock.on((url) => url.pathname === '/shodan/host/search' && url.searchParams.get('page') === '2',
+      () => json({ error: 'busy' }, { status: 503 }));
+    const r = await s.api('/api/shodan', { bbox: BBOX });
+    assert.equal(r.status, 200);
+    const d = r.json();
+    assert.equal(d.returned, 100);
+    assert.equal(d.pages, 1);
+    assert.match(d.partial, /503/);
+  });
+
+  test('every page is cached: a repeat view buys nothing', async () => {
+    s.mock.on('/shodan/host/search', paged(1000));
+    await s.api('/api/shodan', { bbox: BBOX });
+    s.mod.cache.clear();
+    await s.api('/api/shodan', { bbox: BBOX });
+    assert.equal(pagesAsked().length, 3);
+  });
+
+  // Regression: zooming into a city inside a box answered with a 100-host
+  // sample of 14 million redrew that sample instead of asking about the city.
+  test('a sampled box is not reused for a smaller view inside it', async () => {
+    s.mock.on('/shodan/host/search', paged(1000));
+    await s.api('/api/shodan', { bbox: '34.6,-100.4,35.4,-99.6' });   // wide, sampled
+    const before = pagesAsked().length;
+    const d = (await s.api('/api/shodan', { bbox: BBOX })).json();     // inside it
+    assert.ok(pagesAsked().length > before, 'the smaller view was asked about');
+    assert.deepEqual(d.queried, { south: 34.75, west: -100.25, north: 35.25, east: -99.75 });
+  });
+
+  test('a box whose answer was complete is still reused', async () => {
+    s.mock.on('/shodan/host/search', paged(40));
+    await s.api('/api/shodan', { bbox: '34.6,-100.4,35.4,-99.6' });
+    const before = pagesAsked().length;
+    await s.api('/api/shodan', { bbox: BBOX });
+    assert.equal(pagesAsked().length, before);
+  });
+
+  test('area totals come from the count endpoint, by category from ports', async () => {
+    const d = (await s.api('/api/shodan', { bbox: BBOX })).json();
+    assert.equal(d.area.total, 125591);
+    assert.equal(d.area.byCategory.web, 10118 + 9928);
+    assert.equal(d.area.byCategory.remote, 5099);
+    assert.equal(d.area.byCategory.ics, 12);
+    const sum = Object.values(d.area.byCategory).reduce((a, b) => a + b, 0);
+    assert.equal(sum, 125591, 'ports outside the top hundred count as other');
+    assert.deepEqual(d.area.topIps[0], { ip: '198.51.100.99', count: 1246 });
+    assert.equal(d.radiusKm > 0, true);
+    const count = s.mock.callsTo('/shodan/host/count')[0];
+    assert.equal(new URL(count.url).searchParams.get('query'), d.query);
+  });
+
+  test('a failed count leaves the answer without totals, not failed', async () => {
+    s.mock.fail('/shodan/host/count', 500);
+    const r = await s.api('/api/shodan', { bbox: BBOX });
+    assert.equal(r.status, 200);
+    assert.equal(r.json().area, null);
+  });
+});
+
+describe('/api/shodan/host', () => {
+  test('every port on the address, summarised, and the most notable category', async () => {
+    const d = (await s.api('/api/shodan/host', { ip: '198.51.100.10' })).json();
+    assert.equal(d.found, true);
+    assert.deepEqual(d.ports, [22, 443, 8080]);
+    assert.deepEqual(d.services.map((v) => v.port), [22, 443, 8080]);
+    assert.equal(d.services.find((v) => v.port === 22).category, 'remote');
+    assert.equal(d.category, 'remote', 'SSH outranks web');
+    assert.deepEqual(d.vulns, ['CVE-2021-44228', 'CVE-2023-0001']);
+    assert.equal(d.servicesTotal, 3);
+    assert.equal(d.lat, 35.002);
+  });
+
+  test('spends no credit check, and is cached', async () => {
+    await s.api('/api/shodan/host', { ip: '198.51.100.10' });
+    s.mod.cache.clear();
+    await s.api('/api/shodan/host', { ip: '198.51.100.10' });
+    assert.equal(s.mock.callsTo('/shodan/host/198.51.100.10').length, 1);
+    assert.equal(s.mock.callsTo('/api-info').length, 0);
+  });
+
+  test('an address Shodan holds nothing on is an answer, not an error', async () => {
+    const r = await s.api('/api/shodan/host', { ip: '192.0.2.200' });
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.json(), { ip: '192.0.2.200', found: false });
+  });
+
+  test('only an IP address is accepted', async () => {
+    for (const ip of ['', 'example.com', '../api-info', '1.2.3.4/24']) {
+      assert.equal((await s.api('/api/shodan/host', { ip })).status, 400, ip);
+    }
+    assert.equal(s.mock.calls.length, 0);
+  });
+
+  test('without a key: 412', async () => {
+    const t = await startServer();
+    try {
+      assert.equal((await t.api('/api/shodan/host', { ip: '198.51.100.10' })).status, 412);
+    } finally { await t.close(); }
+  });
+
+  test('a huge host is capped, lowest ports first, with the full count kept', () => {
+    const data = Array.from({ length: 400 }, (_, i) => ({ port: 1000 + i, data: '' }));
+    const d = s.mod.summariseShodanHost('192.0.2.1', { data, ports: data.map((x) => x.port) });
+    assert.equal(d.services.length, 300);
+    assert.equal(d.services[0].port, 1000);
+    assert.equal(d.servicesTotal, 400);
+    assert.equal(d.ports.length, 400);
   });
 });
 

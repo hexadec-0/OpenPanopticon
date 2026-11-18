@@ -19,7 +19,7 @@ import {
   ShodanLayer, FlightLayer, SatelliteLayer, OverpassLayer, WebcamLayer,
   EventLayer, AlprLayer, VesselLayer, NetInfraLayer, IotLayer, TrafficLayer, YoutubeLayer,
   WeatherOverlay, ImageryOverlay, LabelsOverlay, BasemapOverlay, api, nearbyPhotosHtml,
-  groundPoint, streetViewLink, streetViewEmbedUrl,
+  groundPoint, streetViewLink, streetViewEmbedUrl, compactCount, SHODAN_MAX_ALTITUDE_M,
 } from './layers.js';
 
 const $ = (sel) => document.querySelector(sel);
@@ -51,6 +51,34 @@ const QUERY_CEILING_STEPS_M = [45_000, 100_000, 250_000, 500_000];
 // plain SYNC leaves them on their cached answers; Shift+SYNC forces them too.
 const METERED_LAYERS = new Set(['shodan']);
 
+// How long the camera must sit still before Shodan is queried, by default.
+// Panning spends a query credit per new area, so unlike the other layers
+// Shodan waits out the movement rather than firing 700 ms after every settle.
+// Adjustable per session in the Shodan panel (and persisted); 0 fires as soon
+// as the camera settles, like everything else.
+const SHODAN_SETTLE_DEFAULT_MS = 15_000;
+
+// Heights the ALT entry accepts, in metres above the ellipsoid (the same
+// height the readout shows). Below the floor the camera would sit in the
+// ground; past the ceiling the globe is a dot.
+const ALT_ENTRY_MIN_M = 100;
+const ALT_ENTRY_MAX_M = 50_000_000;
+// How close above the ground an entered height may put the camera.
+const ALT_ENTRY_GROUND_CLEARANCE_M = 50;
+
+/**
+ * A typed camera height in metres, or null. Kilometres by default ("45",
+ * "2.5", "2,5 km"); metres with an "m" ("800 m").
+ */
+export function parseHeight(text) {
+  const m = /^\s*(\d+(?:[.,]\d+)?)\s*(km|m)?\s*$/i.exec(String(text ?? ''));
+  if (!m) return null;
+  const v = Number(m[1].replace(',', '.'));
+  const metres = (m[2] || 'km').toLowerCase() === 'm' ? v : v * 1000;
+  if (!Number.isFinite(metres) || metres < ALT_ENTRY_MIN_M || metres > ALT_ENTRY_MAX_M) return null;
+  return metres;
+}
+
 
 const TARGETS = [
   { name: 'Austin, TX',    lat: 30.2672,  lon: -97.7431, h: 2600 },
@@ -75,6 +103,10 @@ class OpenPanopticon {
     this.health = null;
     this.selected = null;
     this.queryCeilingM = QUERY_CEILING_DEFAULT_M;
+    // Shodan's own settle delay (see SHODAN_SETTLE_DEFAULT_MS) and its timer.
+    this.shodanSettleMs = SHODAN_SETTLE_DEFAULT_MS;
+    this.shodanSettleTimer = null;
+    this._settleTick = null;
     // Set by Settings.apply when a home is pinned, else resolved on boot.
     this.home = null;
   }
@@ -112,6 +144,16 @@ class OpenPanopticon {
       iot: new IotLayer(this.viewer),
       traffic: new TrafficLayer(this.viewer),
       youtube: new YoutubeLayer(this.viewer),
+    };
+    // A machine picked from a grouped marker's list opens its own panel, as
+    // if it had been clicked on the globe.
+    this.layers.shodan.openRecord = (record) => this.selectPicked({ id: { layer: 'shodan', record } });
+    this.layers.shodan.onLookupProgress = () => this.renderLayerStatus();
+    // An OSM camera pin is left out where the ALPR layer draws the same
+    // camera with a view cone; the OSM layer repaints when that set changes.
+    this.layers.overpass.hiddenBy = () => (this.layers.alpr.enabled ? this.layers.alpr.conedSpots : null);
+    this.layers.alpr.onConedChange = () => {
+      if (this.layers.overpass.enabled) { this.layers.overpass.redraw(); this.renderLayerStatus(); }
     };
     // Layers that cannot work without a key in .env. They are locked off:
     // nothing — a click, a saved session, a shortcut — can switch them on.
@@ -336,7 +378,12 @@ class OpenPanopticon {
     const budget = () => {
       this.viewer.targetFrameRate = moving ? FPS_MOVING : FPS_IDLE;
     };
-    this.viewer.camera.moveStart.addEventListener(() => { moving = true; budget(); });
+    this.viewer.camera.moveStart.addEventListener(() => {
+      moving = true; budget();
+      // Shodan's port lookups wait for the camera too: paused from the first
+      // movement until its settle wait ends (see scheduleShodanSettle).
+      if (this.layers?.shodan && !globalThis.OP_DEMO) this.layers.shodan.lookupsPaused = true;
+    });
     this.viewer.camera.moveEnd.addEventListener(() => { moving = false; budget(); });
     budget();
 
@@ -652,6 +699,133 @@ class OpenPanopticon {
   /* Refresh cycle                                                     */
   /* ---------------------------------------------------------------- */
 
+  /**
+   * The ALT readout doubles as an entry. Click it (or focus it and press
+   * Enter), type a height in km (or "800 m"), press Enter, and the camera
+   * moves straight up or down to it, keeping its place, heading and tilt.
+   * Escape or clicking away leaves the camera where it is.
+   */
+  setupAltitudeEntry() {
+    const out = $('#hud-alt');
+    if (!out) return;
+    out.tabIndex = 0;
+    out.classList.add('editable');
+    out.title = 'Click to type a camera height in km (or "800 m"), then press Enter';
+    const open = () => {
+      if (this.altInput) return;
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.inputMode = 'decimal';
+      input.autocomplete = 'off';
+      input.className = 'hud-alt-input';
+      input.setAttribute('aria-label', 'Camera height in km');
+      const km = this.altitude() / 1000;
+      input.value = km >= 10 ? String(Math.round(km)) : String(Math.round(km * 10) / 10);
+      out.hidden = true;
+      out.after(input);
+      this.altInput = input;
+      input.focus();
+      input.select();
+      const close = () => {
+        if (this.altInput !== input) return;
+        this.altInput = null;
+        input.remove();
+        out.hidden = false;
+        this.renderHud();
+      };
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          const metres = parseHeight(input.value);
+          if (metres == null) {
+            input.classList.add('bad');
+            this.toast(`Enter a height in km, e.g. 45 or 2.5, or in metres, e.g. 800 m `
+              + `(${ALT_ENTRY_MIN_M} m to ${(ALT_ENTRY_MAX_M / 1000).toLocaleString()} km).`);
+            return;
+          }
+          close();
+          this.setCameraHeight(metres);
+          out.focus();
+        } else if (e.key === 'Escape') {
+          e.preventDefault();
+          close();
+          out.focus();
+        }
+      });
+      input.addEventListener('input', () => input.classList.remove('bad'));
+      input.addEventListener('blur', close);
+    };
+    out.addEventListener('click', open);
+    out.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); }
+    });
+  }
+
+  /**
+   * Move the camera straight up or down to `metres` above the ellipsoid,
+   * keeping its place, heading and tilt. Kept clear of the ground under it,
+   * so a low height over high terrain does not put the camera underground.
+   * The move ends like any other, so layers refresh on the usual settle.
+   */
+  setCameraHeight(metres) {
+    const cam = this.viewer.camera;
+    const c = cam.positionCartographic;
+    let h = metres;
+    const ground = this.viewer.scene?.globe?.getHeight?.(c);
+    if (Number.isFinite(ground) && h < ground + ALT_ENTRY_GROUND_CLEARANCE_M) {
+      h = ground + ALT_ENTRY_GROUND_CLEARANCE_M;
+      this.toast(`The ground here is at ${Math.round(ground).toLocaleString()} m, `
+        + `so the camera stops at ${Math.round(h).toLocaleString()} m.`);
+    }
+    cam.cancelFlight?.();
+    cam.flyTo({
+      destination: Cesium.Cartesian3.fromRadians(c.longitude, c.latitude, h),
+      orientation: { heading: cam.heading, pitch: cam.pitch, roll: cam.roll },
+      duration: 1.0,
+    });
+  }
+
+  /** HDG doubles as a compass: click it (or Enter) to face north. */
+  setupHeadingReset() {
+    const out = $('#hud-hdg');
+    if (!out) return;
+    out.tabIndex = 0;
+    out.classList.add('clickable');
+    out.title = 'Click to face north (heading 0°), keeping the tilt and the point in the middle';
+    out.addEventListener('click', () => this.faceNorth());
+    out.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); this.faceNorth(); }
+    });
+  }
+
+  /**
+   * Turn to heading 0°, rotating about the ground point in the middle of the
+   * screen, so what you were looking at stays in the middle and the tilt and
+   * distance stay as they were, like a map's compass. Looking at the sky (no
+   * ground in the middle), it turns in place instead.
+   */
+  faceNorth() {
+    const { scene, camera } = this.viewer;
+    camera.cancelFlight?.();
+    const canvas = scene.canvas;
+    const mid = new Cesium.Cartesian2(canvas.clientWidth / 2, canvas.clientHeight / 2);
+    const ray = camera.getPickRay(mid);
+    const target = (ray && scene.globe?.pick?.(ray, scene)) || camera.pickEllipsoid(mid);
+    if (target) {
+      const range = Cesium.Cartesian3.distance(camera.positionWC, target);
+      camera.flyToBoundingSphere(new Cesium.BoundingSphere(target, 1), {
+        offset: new Cesium.HeadingPitchRange(0, camera.pitch, range),
+        duration: 0.8,
+      });
+    } else {
+      camera.flyTo({
+        destination: camera.positionWC.clone(),
+        orientation: { heading: 0, pitch: camera.pitch, roll: 0 },
+        duration: 0.8,
+      });
+    }
+  }
+
   /** Camera height above the ellipsoid, in metres. */
   altitude() {
     return this.viewer?.camera?.positionCartographic?.height ?? 0;
@@ -659,6 +833,22 @@ class OpenPanopticon {
 
   /** Too high for a query to be worth making. */
   tooHigh() { return !globalThis.OP_DEMO && this.altitude() > this.queryCeilingM; }
+
+  /**
+   * Whether this layer sits out at the camera's present height.
+   *
+   * A layer with its own `maxAltitudeM` (Shodan) answers to that alone and
+   * not to the FETCH ceiling, so raising FETCH to 500 km never sends Shodan a
+   * region-wide search.
+   */
+  heldFor(layer) {
+    if (globalThis.OP_DEMO || !layer.viewportBound) return false;
+    if (layer.maxAltitudeM != null) return this.altitude() > layer.maxAltitudeM;
+    return this.tooHigh();
+  }
+
+  /** The height a layer queries below, for the messages that explain a hold. */
+  ceilingFor(layer) { return layer.maxAltitudeM ?? this.queryCeilingM; }
 
   /** Step the ceiling up through the presets, wrapping round. */
   cycleQueryCeiling() {
@@ -676,14 +866,18 @@ class OpenPanopticon {
   /**
    * @param {boolean} force       refetch past every cache tier
    * @param {boolean} forceMetered  also force the layers in METERED_LAYERS.
-   *   Off for a plain SYNC: forcing Shodan re-buys every cell in view at a
-   *   query credit each, for answers Shodan rarely changes inside a month.
+   *   Off for a plain SYNC: forcing Shodan buys every search page in view
+   *   again, a query credit each (up to SHODAN_PAGES per area), for answers
+   *   Shodan rarely changes inside a month.
    */
-  async refreshAll({ force = false, forceMetered = false } = {}) {
+  async refreshAll({ force = false, forceMetered = false, deferShodan = false } = {}) {
     const bbox = this.currentBbox();
     if (!bbox) return;
     const ctx = { bbox, onStatus: () => this.renderLayerStatus() };
     const high = this.tooHigh();
+    // An immediate refresh (SYNC, FETCH, a direct call) supersedes a pending
+    // Shodan settle; only the camera-settle path defers it.
+    if (!deferShodan) this.clearShodanSettle();
 
     if (high) {
       // "Nothing loaded and there were no errors" is the worst way to learn
@@ -697,24 +891,48 @@ class OpenPanopticon {
       }
     } else this._heldNotice = null;
 
-    await Promise.all(Object.values(this.layers).map((l) => (
-      high && l.viewportBound ? l.holdForAltitude()
-        : l.refresh(ctx, { force: force && (forceMetered || !METERED_LAYERS.has(l.id)) })
-    )));
+    // Shodan has its own limit, so it can be holding while everything else
+    // fetches. Said once per climb past it.
+    const shodan = this.layers.shodan;
+    if (shodan.enabled && this.heldFor(shodan)) {
+      if (!high && !this._shodanHeldNotice) {
+        this.toast(`Shodan is searched only below ${Math.round(this.ceilingFor(shodan) / 1000)} km, `
+          + 'whatever the FETCH ceiling. Zoom in to search it; what is drawn stays.');
+      }
+      this._shodanHeldNotice = true;
+    } else this._shodanHeldNotice = false;
+
+    await Promise.all(Object.values(this.layers).map((l) => {
+      // Shodan is held back until the camera has settled for shodanSettleMs,
+      // scheduled below; the rest refresh on the usual 700 ms settle.
+      if (deferShodan && l.id === 'shodan') return null;
+      return this.heldFor(l) ? l.holdForAltitude()
+        : l.refresh(ctx, { force: force && (forceMetered || !METERED_LAYERS.has(l.id)) });
+    }));
+    if (deferShodan) this.scheduleShodanSettle();
+    else this.resumeShodanLookups();
 
     // Scenes are per-view: what covers Atlanta does not cover Rotterdam.
     if (this.basemap?.active && !high) this.basemap.search(ctx).catch(() => {});
     // A Shodan fetch that actually reached the network spent a credit; keep
     // the remaining count honest rather than only reading it at boot.
-    if (this.layers.shodan.enabled && !this.layers.shodan.fromCache) {
+    if (!deferShodan && this.layers.shodan.enabled && !this.layers.shodan.fromCache) {
       this.refreshShodanCredits().catch(() => {});
     }
     this.renderLayerStatus();
   }
 
-  async refreshOne(id, { force = false, isRetry = false } = {}) {
+  async refreshOne(id, opts = {}) {
+    if (id !== 'shodan') return this._refreshOne(id, opts);
+    // A direct Shodan refresh supersedes any pending settle countdown, and
+    // the port lookups carry on once it is done.
+    this.clearShodanSettle();
+    try { return await this._refreshOne(id, opts); } finally { this.resumeShodanLookups(); }
+  }
+
+  async _refreshOne(id, { force = false, isRetry = false } = {}) {
     const layer = this.layers[id];
-    if (this.tooHigh() && layer.viewportBound) {
+    if (this.heldFor(layer)) {
       // Includes the live polls: an aircraft position fetched for half a
       // hemisphere is a round trip for something you cannot pick out anyway.
       await layer.holdForAltitude();
@@ -732,6 +950,67 @@ class OpenPanopticon {
       retry: () => this.refreshOne(id, { isRetry: true }).catch(() => {}),
     }, { force, isRetry });
     this.renderLayerStatus();
+  }
+
+  /** Stop any pending Shodan settle countdown and its ticker. */
+  clearShodanSettle() {
+    clearTimeout(this.shodanSettleTimer); this.shodanSettleTimer = null;
+    clearInterval(this._settleTick); this._settleTick = null;
+    if (this.layers?.shodan) this.layers.shodan.settleUntil = null;
+  }
+
+  /**
+   * Query Shodan once the camera has been still for shodanSettleMs.
+   *
+   * Called from the camera-settle path only, so a pan across several areas
+   * spends nothing until it stops. A new movement calls clearShodanSettle and
+   * this again, restarting the wait. Above the 45 km limit it just holds.
+   */
+  scheduleShodanSettle() {
+    this.clearShodanSettle();
+    const l = this.layers.shodan;
+    if (!l.enabled || globalThis.OP_DEMO || !this.autoRefresh) { this.resumeShodanLookups(); return; }
+    if (this.heldFor(l)) {
+      // Above the limit nothing runs anyway; the flag is cleared so the
+      // lookups only answer to the altitude from here.
+      l.holdForAltitude(); this.resumeShodanLookups(); this.renderLayerStatus(); return;
+    }
+    // Already held from an earlier answer: nothing would be bought, so there
+    // is nothing to wait for. Redraw now (refreshOne takes the covered path
+    // and sends no request).
+    const bbox = this.currentBbox();
+    if (bbox && l.isCovered(bbox)) { this.refreshOne('shodan').catch(() => {}); return; }
+    const ms = Math.max(0, this.shodanSettleMs || 0);
+    const fire = () => {
+      this.clearShodanSettle();
+      if (!this.autoRefresh) { this.renderLayerStatus(); return; }
+      this.refreshOne('shodan').then(() => this.refreshShodanCredits()).catch(() => {});
+    };
+    if (ms === 0) { fire(); return; }
+    l.settleUntil = Date.now() + ms;
+    this.renderLayerStatus();
+    this.shodanSettleTimer = setTimeout(fire, ms);
+    // A once-a-second re-render so the countdown in the layer row moves.
+    this._settleTick = setInterval(() => {
+      if (!this.layers.shodan.settleUntil) { clearInterval(this._settleTick); this._settleTick = null; return; }
+      this.renderLayerStatus();
+    }, 1000);
+  }
+
+  /** Let Shodan's port lookups run again after the camera has settled. */
+  resumeShodanLookups() {
+    const l = this.layers?.shodan;
+    if (!l) return;
+    l.lookupsPaused = false;
+    l.pumpLookups();
+    this.renderLayerStatus();
+  }
+
+  /** Set the Shodan settle delay, in seconds (clamped 0–120). Returns the value applied. */
+  setShodanSettle(seconds) {
+    const s = Math.max(0, Math.min(120, Math.round(Number(seconds) || 0)));
+    this.shodanSettleMs = s * 1000;
+    return s;
   }
 
   startTimers() {
@@ -842,9 +1121,12 @@ class OpenPanopticon {
     // Debounced refetch after the camera settles.
     this.viewer.camera.moveEnd.addEventListener(() => {
       this.renderHud();
-      if (!this.autoRefresh || globalThis.OP_DEMO) return;
+      if (!this.autoRefresh || globalThis.OP_DEMO) { this.resumeShodanLookups(); return; }
       clearTimeout(this.moveTimer);
-      this.moveTimer = setTimeout(() => this.refreshAll(), 700);
+      // A fresh movement restarts Shodan's settle countdown: it is only
+      // queried once the camera has been still for shodanSettleMs.
+      this.clearShodanSettle();
+      this.moveTimer = setTimeout(() => this.refreshAll({ deferShodan: true }), 700);
     });
 
     setInterval(() => this.renderHud(), 1000);
@@ -1124,6 +1406,8 @@ class OpenPanopticon {
     this.buildDetailResize();
     this.buildCycleControl();
     $('#hud-gate').onclick = () => this.cycleQueryCeiling();
+    this.setupAltitudeEntry();
+    this.setupHeadingReset();
     $('#auto-toggle').onclick = (e) => {
       this.autoRefresh = !this.autoRefresh;
       e.currentTarget.classList.toggle('active', this.autoRefresh);
@@ -1145,7 +1429,7 @@ class OpenPanopticon {
         .finally(() => { this.weather.forced = false; });
       this.toast(withMetered || !this.layers.shodan.enabled
         ? 'Refreshing from source…'
-        : 'Refreshing from source… Shodan kept its cached results (Shift+SYNC to re-buy them).');
+        : 'Refreshing from source… Shodan kept the search pages already bought (Shift+SYNC buys them again, a credit a page).');
     };
     $('#refresh-now').onclick = (e) => this.syncNow(!!e?.shiftKey);
     $('#reset-settings').onclick = () => {
@@ -1383,45 +1667,78 @@ class OpenPanopticon {
     };
 
     /* --- Shodan --------------------------------------------------- */
-    // No type filter and no query box by request: the layer always returns
-    // everything Shodan has indexed in view, and the colour mode is how you
-    // read it.
+    // No type filter and no query box by request: the layer searches for
+    // every service in view, draws the machines from the first search pages,
+    // and the colour mode is how you read them.
     const shodanCtl = el('div', 'layer-body');
 
     const colorSel = el('select', 'ctl');
     for (const [v, t] of [['category', 'Colour: service type'], ['risk', 'Colour: known CVEs']]) {
       const o = el('option', null, t); o.value = v; colorSel.append(o);
     }
+    const lookups = checkbox('Look up every port on each machine', this.layers.shodan.lookupsOn, (v) => {
+      this.layers.shodan.lookupsOn = v;
+      if (v) this.layers.shodan.pumpLookups();
+      this.renderLayerStatus();
+      this.persist();
+    });
+    lookups.title = 'Free: host lookups spend no query credits. Shodan takes about one a second, '
+      + 'so a new area fills in over a few minutes; what is in view goes first.';
     const legend = el('div', 'legend');
     const note = el('p', 'note', '');
-    shodanCtl.append(colorSel, legend, note);
+    const settleWrap = el('label', 'ctl settle-ctl');
+    settleWrap.append(el('span', null, 'Query delay after camera stops'));
+    const settleIn = el('input', 'num');
+    settleIn.type = 'number'; settleIn.min = '0'; settleIn.max = '120'; settleIn.step = '1';
+    settleIn.value = String(Math.round(this.shodanSettleMs / 1000));
+    settleWrap.title = 'Seconds the camera must sit still before Shodan is queried. Panning spends '
+      + 'a query credit per new area, so the wait avoids buying areas you only passed over. '
+      + '0 queries as soon as the camera settles.';
+    settleIn.onchange = () => { settleIn.value = String(this.setShodanSettle(settleIn.value)); this.persist(); };
+    settleWrap.append(settleIn, el('span', 'unit', 's'));
+    shodanCtl.append(colorSel, lookups, settleWrap, legend, note);
 
     const renderLegend = () => {
+      if (this.health.sources.shodan !== 'configured') return;
       const l = this.layers.shodan;
       legend.innerHTML = '';
+      const chip = (color, text, title) => {
+        const c = el('span', 'legend-item');
+        const dot = el('span', 'legend-dot');
+        dot.style.background = color;
+        c.append(dot, el('span', null, text));
+        if (title) c.title = title;
+        legend.append(c);
+      };
       if (l.colorBy === 'category') {
-        for (const { cat, n, color } of l.categoryLegend()) {
-          const chip = el('span', 'legend-item');
-          const dot = el('span', 'legend-dot');
-          dot.style.background = color;
-          chip.append(dot, el('span', null, `${cat} ${n}`));
-          legend.append(chip);
+        for (const { cat, n, area, color } of l.categoryLegend()) {
+          if (area == null) chip(color, `${cat} ${n}`, `${n} machines drawn`);
+          else {
+            chip(color, `${cat} ${compactCount(area)} · ${n}`,
+              `${area.toLocaleString()} ${cat} services in the whole area (judged by port), `
+              + `${n} machines drawn`);
+          }
         }
       } else {
         for (const [label, color, n] of [
           ['known CVEs', '#ff2d55', l.vulnerable],
           ['no known CVEs', '#00e5ff', Math.max(0, l.count - l.vulnerable)],
-        ]) {
-          const chip = el('span', 'legend-item');
-          const dot = el('span', 'legend-dot');
-          dot.style.background = color;
-          chip.append(dot, el('span', null, `${label} ${n}`));
-          legend.append(chip);
-        }
+        ]) chip(color, `${label} ${n}`, `${n} machines drawn`);
       }
-      note.textContent = l.total > l.count
-        ? `${l.total.toLocaleString()} total matches in view; the first page is drawn.`
-        : 'Every host Shodan has indexed in this view.';
+
+      // Two facts only: how many services the area holds, and how many of
+      // them are on the map. Paging, lookups and the busiest address are in
+      // the layer's tooltip.
+      const inArea = l.area?.total ?? l.total;
+      const shown = l.returned || l.records().length;
+      const limitKm = Math.round(SHODAN_MAX_ALTITUDE_M / 1000);
+      const counts = shown || inArea
+        ? `${inArea.toLocaleString()} services in current view. `
+          + `${l.complete ? 'Showing all' : 'Showing first'} ${shown.toLocaleString()} entries.`
+        : '';
+      note.textContent = l.enabled && this.heldFor(l)
+        ? `Searched only below ${limitKm} km. Zoom in to update.${counts ? ` ${counts}` : ''}`
+        : counts;
     };
     this.renderShodanLegend = renderLegend;
 
@@ -1431,7 +1748,11 @@ class OpenPanopticon {
       this.renderLayerStatus();
       this.persist();
     };
-    this.restoreShodanUI = () => { colorSel.value = this.layers.shodan.colorBy; };
+    this.restoreShodanUI = () => {
+      colorSel.value = this.layers.shodan.colorBy;
+      lookups.querySelector('input').checked = this.layers.shodan.lookupsOn;
+      settleIn.value = String(Math.round(this.shodanSettleMs / 1000));
+    };
 
     const sBox = mk('shodan', 'Shodan exposure', shodanCtl);
     if (this.health.sources.shodan !== 'configured') {
@@ -2090,7 +2411,10 @@ class OpenPanopticon {
       note.classList.toggle('bad', bm.status === 'error' || bm.status === 'empty');
       if (bm.status === 'loading') note.textContent = 'Searching for imagery over this view…';
       else if (bm.error) note.textContent = bm.error;
-      else if (wayback && bm.meta?.provider === 'wayback') {
+      else if (wayback && bm.meta?.provider === 'wayback' && bm.meta.pending) {
+        note.textContent = 'Showing the newest Esri mosaic. Looking for older versions of the imagery '
+          + `here, which takes a few seconds for a new place or zoom level. ${bm.meta.attribution}.`;
+      } else if (wayback && bm.meta?.provider === 'wayback') {
         const n = bm.scenes.length;
         note.textContent = `${n} version${n === 1 ? '' : 's'} of the imagery here, newest first, `
           + `out of ${bm.meta.releases} Esri releases. Capture date, source and resolution are for `
@@ -2347,7 +2671,15 @@ class OpenPanopticon {
       box.classList.toggle('failed', layer.status === 'error');
       box.classList.toggle('held', layer.status === 'held');
       if (!layer.enabled) { cnt.textContent = '—'; cnt.title = ''; }
-      else if (layer.status === 'held' && !this.tooHigh() && !frozen) {
+      else if (id === 'shodan' && layer.settleUntil && Date.now() < layer.settleUntil
+               && !this.heldFor(layer)) {
+        const secs = Math.max(0, Math.ceil((layer.settleUntil - Date.now()) / 1000));
+        cnt.textContent = `◴${secs}`;
+        cnt.title = `Querying Shodan in ${secs}s — it waits for the camera to settle so a `
+          + 'pan does not spend a credit. Adjust the wait in the Shodan panel (0 = at once).';
+        box.classList.remove('loading', 'failed');
+      }
+      else if (layer.status === 'held' && !this.heldFor(layer) && !frozen) {
         // Below the ceiling, so not held whatever the status says: the
         // refresh that clears it is on its way.
         cnt.textContent = '···';
@@ -2357,9 +2689,13 @@ class OpenPanopticon {
         // Say why nothing is happening. A layer that is simply quiet looks
         // identical to one that is broken.
         cnt.textContent = '↓';
-        cnt.title = `Holding above ${Math.round(this.queryCeilingM / 1000)} km — `
+        cnt.title = `Holding above ${Math.round(this.ceilingFor(layer) / 1000)} km — `
           + `currently ${Math.round(this.altitude() / 1000).toLocaleString()} km. `
-          + 'Descend to query. Anything already found stays drawn.';
+          + 'Descend to query. Anything already found stays drawn.'
+          + (layer.maxAltitudeM != null
+            ? '\nThis layer has its own limit, separate from FETCH: above it a search '
+              + 'covers a whole region and returns only a sample of it.'
+            : '');
       }
       else if (layer.status === 'loading' && !frozen) {
         cnt.textContent = '···';
@@ -2394,6 +2730,10 @@ class OpenPanopticon {
           if (layer.cached > layer.count) bits.push(`${layer.cached.toLocaleString()} cached`);
           if (layer.skipped) bits.push(`${layer.skipped} fetch${layer.skipped > 1 ? 'es' : ''} saved by cache`);
           if (layer.fromCache) bits.push('this view served from cache');
+          if (layer.suppressed) {
+            bits.push(`${layer.suppressed.toLocaleString()} camera${layer.suppressed === 1 ? '' : 's'} `
+              + 'left to ALPR / Flock, which draws them with view cones');
+          }
           cnt.title = bits.join('\n');
         }
         box.classList.remove('waiting');
@@ -2448,13 +2788,36 @@ class OpenPanopticon {
                 + ' a download in between, which means these are still current.'
               : '\nElements fetched fresh from CelesTrak.');
         } else if (id === 'shodan') {
-          const bits = [layer.total > layer.count
-            ? `${layer.total.toLocaleString()} total matches; first page shown`
-            : `${layer.count.toLocaleString()} hosts`];
-          if (layer.cellDeg) {
-            bits.push(`One query covers a ${layer.cellDeg}° cell (~${
-              Math.round(layer.cellDeg * 111)}km) and serves every zoom inside it`);
+          const bits = [`${layer.count.toLocaleString()} machines`
+            + (layer.places && layer.places < layer.count ? ` on ${layer.places.toLocaleString()} points` : '')];
+          if (!layer.complete) {
+            bits.push(`A sample: the first ${layer.pages} page${layer.pages === 1 ? '' : 's'}`
+              + ` of ${layer.total.toLocaleString()} matching services`);
           }
+          if (layer.cellDeg) {
+            bits.push(layer.complete
+              ? `One query covers a ${layer.cellDeg}° cell (~${
+                Math.round(layer.cellDeg * 111)}km) and serves every zoom inside it`
+              : 'Zooming in asks about the smaller area, so a city is not shown the wider area\'s sample');
+          }
+          if (layer.partial) bits.push(`Stopped after page ${layer.pages}: ${layer.partial}`);
+          const p = layer.lookupProgress();
+          if (!layer.lookupsOn) {
+            if (p.total) bits.push('Port lookups are off');
+          } else if (p.total) {
+            bits.push(`Every port looked up for ${p.done} of ${p.total} machines${p.queued ? '…' : ''}`
+              + (layer.lookupsPaused && p.queued ? ' (waiting for the camera to settle)' : ''));
+          }
+          if (p.error && layer.lookupsOn) bits.push(`Last lookup failed: ${p.error}`);
+          const top = layer.area?.topIps?.[0];
+          if (top && top.count >= 100) {
+            bits.push(`Busiest address: ${top.ip}, ${top.count.toLocaleString()} services`);
+          }
+          if (layer.colorBy === 'category' && layer.area) {
+            bits.push('Legend: services in the area · machines drawn');
+          }
+          bits.push(`Searched only below ${Math.round(this.ceilingFor(layer) / 1000)} km, `
+            + 'separate from the FETCH ceiling');
           if (this.shodanCredits != null) {
             bits.push(`${this.shodanCredits.toLocaleString()} query credits left`);
           }

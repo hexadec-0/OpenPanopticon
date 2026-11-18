@@ -17,9 +17,10 @@ function fakeApp() {
     mode: 'flir',
     queryCeilingM: 100_000,
     autoRefresh: false,
+    shodanSettleMs: 15000,
     autoCycle: { on: true, intervalS: 30, excluded: new Set(['satellites']) },
     layers: {
-      shodan: { enabled: true, colorBy: 'risk' },
+      shodan: { enabled: true, colorBy: 'risk', lookupsOn: false },
       flights: { enabled: true, showLabels: false, showTrails: true },
       satellites: { enabled: false, group: 'starlink', limit: 500 },
       overpass: { enabled: true, presets: new Set(['power', 'military']) },
@@ -42,7 +43,7 @@ function fakeApp() {
 /** A fresh app with defaults, for apply() to push saved state into. */
 function blankApp() {
   const a = fakeApp();
-  Object.assign(a.layers.shodan, { colorBy: 'category' });
+  Object.assign(a.layers.shodan, { colorBy: 'category', lookupsOn: true });
   Object.assign(a.layers.flights, { showLabels: true });
   Object.assign(a.layers.satellites, { group: 'stations', limit: 250 });
   a.layers.overpass.presets = new Set(['surveillance']);
@@ -121,6 +122,7 @@ describe('collect', () => {
     assert.deepEqual(s.cycle, { on: true, intervalS: 30, excluded: ['satellites'] });
     assert.equal(s.sidebarCollapsed, true);
     assert.equal(s.enabled.shodan, true);
+    assert.deepEqual(s.shodan, { colorBy: 'risk', lookups: false, settleMs: 15000 });
     assert.equal(s.enabled.satellites, false);
     assert.deepEqual(s.overpass.presets.sort(), ['military', 'power']);
     assert.deepEqual(s.alpr, { vendorFilter: ['flock'], showCones: false, onlyWithDirection: true });
