@@ -927,7 +927,15 @@ class OpenPanopticon {
     // A direct Shodan refresh supersedes any pending settle countdown, and
     // the port lookups carry on once it is done.
     this.clearShodanSettle();
-    try { return await this._refreshOne(id, opts); } finally { this.resumeShodanLookups(); }
+    try { return await this._refreshOne(id, opts); } finally {
+      // A camera settle can schedule a countdown while this load is still in
+      // flight, before the view counts as covered. Once the load has covered
+      // it, that countdown would buy nothing, so drop it.
+      const l = this.layers.shodan;
+      const bb = l?.settleUntil ? this.currentBbox() : null;
+      if (bb && l.isCovered(bb)) { this.clearShodanSettle(); this.renderLayerStatus(); }
+      this.resumeShodanLookups();
+    }
   }
 
   async _refreshOne(id, { force = false, isRetry = false } = {}) {
@@ -957,22 +965,26 @@ class OpenPanopticon {
     clearTimeout(this.shodanSettleTimer); this.shodanSettleTimer = null;
     clearInterval(this._settleTick); this._settleTick = null;
     if (this.layers?.shodan) this.layers.shodan.settleUntil = null;
+    this._settleKey = null;
   }
 
   /**
    * Query Shodan once the camera has been still for shodanSettleMs.
    *
    * Called from the camera-settle path only, so a pan across several areas
-   * spends nothing until it stops. A new movement calls clearShodanSettle and
-   * this again, restarting the wait. Above the 45 km limit it just holds.
+   * spends nothing until it stops. A move to a different view clears the
+   * countdown and this starts it again; for the view already counting down it
+   * is left to run out. Above the 45 km limit it just holds.
    */
   scheduleShodanSettle() {
-    this.clearShodanSettle();
     const l = this.layers.shodan;
-    if (!l.enabled || globalThis.OP_DEMO || !this.autoRefresh) { this.resumeShodanLookups(); return; }
+    if (!l.enabled || globalThis.OP_DEMO || !this.autoRefresh) {
+      this.clearShodanSettle(); this.resumeShodanLookups(); return;
+    }
     if (this.heldFor(l)) {
       // Above the limit nothing runs anyway; the flag is cleared so the
       // lookups only answer to the altitude from here.
+      this.clearShodanSettle();
       l.holdForAltitude(); this.resumeShodanLookups(); this.renderLayerStatus(); return;
     }
     // Already held from an earlier answer: nothing would be bought, so there
@@ -980,6 +992,10 @@ class OpenPanopticon {
     // and sends no request).
     const bbox = this.currentBbox();
     if (bbox && l.isCovered(bbox)) { this.refreshOne('shodan').catch(() => {}); return; }
+    // Cesium raises moveEnd again for a view it has just settled on, so this
+    // can be reached a second time for the same view: let that countdown run.
+    if (l.settleUntil && bbox && bbox === this._settleKey) return;
+    this.clearShodanSettle();
     const ms = Math.max(0, this.shodanSettleMs || 0);
     const fire = () => {
       this.clearShodanSettle();
@@ -988,6 +1004,7 @@ class OpenPanopticon {
     };
     if (ms === 0) { fire(); return; }
     l.settleUntil = Date.now() + ms;
+    this._settleKey = bbox;
     this.renderLayerStatus();
     this.shodanSettleTimer = setTimeout(fire, ms);
     // A once-a-second re-render so the countdown in the layer row moves.
@@ -1123,9 +1140,13 @@ class OpenPanopticon {
       this.renderHud();
       if (!this.autoRefresh || globalThis.OP_DEMO) { this.resumeShodanLookups(); return; }
       clearTimeout(this.moveTimer);
-      // A fresh movement restarts Shodan's settle countdown: it is only
-      // queried once the camera has been still for shodanSettleMs.
-      this.clearShodanSettle();
+      // A move to a different view restarts Shodan's settle countdown: it is
+      // only queried once the camera has been still for shodanSettleMs.
+      // Cesium's Scene also raises moveEnd about half a second after a render
+      // that saw the camera change, so one move can be followed by more
+      // moveEnds for the same view; those leave the countdown running.
+      const key = this.currentBbox();
+      if (!key || key !== this._settleKey) this.clearShodanSettle();
       this.moveTimer = setTimeout(() => this.refreshAll({ deferShodan: true }), 700);
     });
 
@@ -2982,7 +3003,9 @@ class OpenPanopticon {
     $('#hud-alt').textContent = c.height > 10000
       ? `${(c.height / 1000).toFixed(1)} km`
       : `${Math.round(c.height).toLocaleString()} m`;
-    $('#hud-hdg').textContent = `${Math.round(Cesium.Math.toDegrees(cam.heading))
+    // Heading is modular: due north can settle at ~2pi, which rounds to 360.
+    // Wrap it so north always reads 000, never 360.
+    $('#hud-hdg').textContent = `${(Math.round(Cesium.Math.toDegrees(cam.heading)) % 360)
       .toString().padStart(3, '0')}°`;
     $('#hud-time').textContent = new Date().toISOString().slice(11, 19) + 'Z';
   }

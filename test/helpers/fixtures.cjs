@@ -125,8 +125,23 @@ function shodanSearch({ params }) {
     const d = 10 / 111;
     box = { south: HOME.lat - d, north: HOME.lat + d, west: HOME.lon - d, east: HOME.lon + d };
   }
-  const p1 = place(box, 0.002, 0.002);
-  const p2 = place(box, -0.002, 0.003);
+  // Each host sits at a fixed spot just north-east of HOME, both inside the one
+  // grid cell north and east of the HOME corner. A box that holds that spot
+  // shows the host there. A box that does not: for a view well away from home
+  // (the demo's region) it is relocated to the box centre so there is still
+  // something to capture; for a home view split across neighbouring cells it is
+  // omitted, so a per-cell search never draws the same machine in two places.
+  const put = (dLat, dLon) => {
+    const pt = near(dLat, dLon);
+    if (!box || inBox(box, pt)) return pt;
+    const cLat = (box.south + box.north) / 2;
+    const cLon = (box.west + box.east) / 2;
+    const farFromHome = Math.abs(cLat - HOME.lat) > 1 || Math.abs(cLon - HOME.lon) > 1;
+    return farFromHome ? { lat: cLat + dLat / 10, lon: cLon + dLon / 10 } : null;
+  };
+  const p1 = put(0.002, 0.002);
+  const p2 = put(0.002, 0.003);
+  const loc = (pt, extra) => (pt ? { latitude: pt.lat, longitude: pt.lon, ...extra } : { ...extra });
   return json({
     total: 3,
     matches: [
@@ -136,12 +151,12 @@ function shodanSearch({ params }) {
         hostnames: ['host.example'], tags: ['cloud'], timestamp: '2026-10-20T12:34:56.000000',
         vulns: { 'CVE-2021-44228': {}, 'CVE-2023-0001': {} },
         data: 'HTTP/1.1 200 OK\r\nServer: nginx/1.18.0\r\n',
-        location: { latitude: p1.lat, longitude: p1.lon, city: 'Testville', country_name: 'Testland' },
+        location: loc(p1, { city: 'Testville', country_name: 'Testland' }),
       },
       {
         ip_str: '198.51.100.11', port: 502, transport: 'tcp', org: 'Test Water Works',
         product: 'Modbus', data: 'Unit ID: 0',
-        location: { latitude: p2.lat, longitude: p2.lon, city: 'Testville', country_code: 'TL' },
+        location: loc(p2, { city: 'Testville', country_code: 'TL' }),
       },
       // No location: dropped when geolocation is required.
       { ip_str: '198.51.100.12', port: 22, product: 'OpenSSH', location: {} },

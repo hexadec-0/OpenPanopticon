@@ -54,7 +54,7 @@ describe('ShodanLayer', () => {
   // is a single 0.25 deg grid cell: one request, and totals that are the
   // cell's own rather than a sum over several. Multi-cell views are exercised
   // explicitly in the coverage and pan tests below.
-  const ctx = (bbox = '34.80,-100.20,34.95,-100.05') => ({ bbox, onStatus() {} });
+  const ctx = (bbox = '35.05,-99.95,35.2,-99.8') => ({ bbox, onStatus() {} });
   // Most tests read the layer before any port lookup lands; the lookups have
   // their own tests below.
   const quiet = (l) => { l.lookupsOn = false; return l; };

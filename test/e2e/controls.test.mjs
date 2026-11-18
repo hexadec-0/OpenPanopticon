@@ -67,7 +67,8 @@ e2e('top bar, HUD and keyboard', () => {
     });
     assert.ok(Math.abs(res.lat - midBefore.lat) < 1e-4 && Math.abs(res.lon - midBefore.lon) < 1e-4,
       'the point in the middle stays in the middle');
-    assert.ok(Math.abs(res.pitch - Cesium.Math.toRadians(-50)) < 0.02, 'tilt kept');
+    // -50 deg in radians, computed here in Node (Cesium is a browser global).
+    assert.ok(Math.abs(res.pitch - (-50 * Math.PI / 180)) < 0.02, 'tilt kept');
     await page.waitForFunction(() => document.querySelector('#hud-hdg').textContent === '000°', { timeout: 3000 });
   });
 

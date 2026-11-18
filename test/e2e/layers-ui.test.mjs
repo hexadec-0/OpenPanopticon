@@ -92,30 +92,62 @@ e2e('layers and the detail panel', () => {
         destination: Cesium.Cartesian3.fromDegrees(x, y, 3000),
         orientation: { heading: 0, pitch: -Math.PI / 2, roll: 0 },
       });
+      // Render once so the camera reports its view rectangle (on-demand
+      // rendering leaves it null until a frame is drawn), as a real move would.
+      WV.viewer.scene.render();
       WV.viewer.camera.moveEnd.raiseEvent();
     }, [lon, lat]);
 
-    // Somewhere not yet fetched: a countdown, and nothing asked until it ends.
-    const before = searches();
-    const movedAt = Date.now();
-    await move(-97.4, 36.6);
-    await page.waitForFunction(() => WV.layers.shodan.settleUntil > Date.now(), { timeout: 2000 });
-    assert.match(await text$(page, `${row('shodan')} .layer-count`), /^◴\d/);
-    assert.equal(searches(), before, 'nothing queried while the camera is still settling');
-    assert.equal(await page.evaluate(() => WV.layers.shodan.lookupsPaused), true, 'port lookups wait too');
-    await page.waitForFunction(() => WV.layers.shodan.settleUntil == null, { timeout: 6000 });
-    assert.ok(Date.now() - movedAt >= 2000, 'waited the configured delay before querying');
-    await waitForLayer(page, 'shodan');
-    assert.ok(searches() > before, 'queried once the camera had settled');
-    assert.equal(await page.evaluate(() => WV.layers.shodan.lookupsPaused), false, 'lookups resumed');
+    try {
+      // Somewhere not yet fetched: a countdown, and nothing asked until it ends.
+      const before = searches();
+      const movedAt = Date.now();
+      await move(-97.4, 36.6);
+      // The countdown starts once the other layers have refreshed for the new
+      // view, which on a slow machine can take a few seconds.
+      await page.waitForFunction(() => WV.layers.shodan.settleUntil > Date.now(), { timeout: 8000 })
+        .catch(async (e) => {
+          const dbg = await page.evaluate(() => ({
+            settleUntil: WV.layers.shodan.settleUntil ?? null, key: WV._settleKey ?? null,
+            bbox: WV.currentBbox(), covered: WV.currentBbox() ? WV.layers.shodan.isCovered(WV.currentBbox()) : null,
+            enabled: WV.layers.shodan.enabled, held: WV.heldFor(WV.layers.shodan), auto: WV.autoRefresh,
+          }));
+          throw new Error('no countdown: ' + JSON.stringify(dbg) + ' ' + e.message);
+        });
+      assert.match(await text$(page, `${row('shodan')} .layer-count`), /^◴\d/);
+      assert.equal(searches(), before, 'nothing queried while the camera is still settling');
+      assert.equal(await page.evaluate(() => WV.layers.shodan.lookupsPaused), true, 'port lookups wait too');
+      await page.waitForFunction(() => WV.layers.shodan.settleUntil == null, { timeout: 10_000 });
+      assert.ok(Date.now() - movedAt >= 2000, 'waited the configured delay before querying');
+      await waitForLayer(page, 'shodan');
+      assert.ok(searches() > before, 'queried once the camera had settled');
+      assert.equal(await page.evaluate(() => WV.layers.shodan.lookupsPaused), false, 'lookups resumed');
 
-    // Back inside ground already held: no countdown, no request.
-    const held = searches();
-    await move(-97.4, 36.6);
-    await new Promise((r) => setTimeout(r, 1200));
-    assert.equal(await page.evaluate(() => WV.layers.shodan.settleUntil ?? null), null, 'no wait for a held view');
-    assert.equal(searches(), held);
-    assert.equal(await page.evaluate(() => WV.layers.shodan.lookupsPaused), false);
+      // Back inside ground already held: no countdown, no request.
+      const held = searches();
+      await move(-97.4, 36.6);
+      // The settle path runs after the 700 ms move debounce and the other
+      // layers' refresh, which can take a few seconds on a slow machine. For a
+      // held view it ends by resuming the port lookups, so wait for that rather
+      // than a fixed sleep; a countdown started instead would keep them paused.
+      await page.waitForFunction(() => WV.layers.shodan.lookupsPaused === false, { timeout: 8000 })
+        .catch(async (e) => {
+          const dbg = await page.evaluate(() => ({
+            settleUntil: WV.layers.shodan.settleUntil ?? null, paused: WV.layers.shodan.lookupsPaused,
+            covered: WV.currentBbox() ? WV.layers.shodan.isCovered(WV.currentBbox()) : null,
+          }));
+          throw new Error('lookups never resumed over a held view: ' + JSON.stringify(dbg) + ' ' + e.message);
+        });
+      assert.equal(await page.evaluate(() => WV.layers.shodan.settleUntil ?? null), null, 'no wait for a held view');
+      assert.equal(searches(), held, 'nothing queried for a held view');
+    } finally {
+      // Always hand the camera back to home: the tests after this one share
+      // this page and expect the home view, so a failure above must not leave
+      // them over empty ground. Restore the default settle delay too.
+      await move(HOME.lon, HOME.lat);
+      await page.evaluate(() => { WV.shodanSettleMs = 15_000; });
+      await waitForLayer(page, 'shodan').catch(() => {});
+    }
   });
 
   test('SYNC leaves Shodan on its paid-for answers; Shift+SYNC re-buys them', async () => {
@@ -309,18 +341,46 @@ e2e('layers and the detail panel', () => {
     assert.equal(pos, true);
     await lookAt(page, { lat: HOME.lat + 0.005, lon: HOME.lon, h: 4000 });
     await page.waitForFunction(() => WV._frames > 0 || true);
-    await new Promise((r) => setTimeout(r, 1500));
-    const xy = await page.evaluate(() => {
+    // Layers refresh about 700 ms after the camera settles (and Cesium can
+    // raise a second moveEnd shortly after), redrawing their entities. A
+    // click that lands mid-redraw hits nothing, so wait for the redraws to
+    // finish, and click again if one still caught the first click.
+    const where = () => page.evaluate(() => {
       const ent = WV.layers.events.source.entities.values.find((e) => e.point
         && e.properties.record.getValue().title === 'Earthquake in Testland');
+      if (!ent) return null;
       const p = ent.position.getValue(WV.viewer.clock.currentTime);
       const w = Cesium.SceneTransforms.worldToWindowCoordinates(WV.viewer.scene, p);
       const r = WV.viewer.canvas.getBoundingClientRect();
       return w && { x: r.left + w.x, y: r.top + w.y };
     });
+    let d = null;
+    let xy = null;
+    for (let attempt = 0; attempt < 3 && !d; attempt++) {
+      await new Promise((r) => setTimeout(r, 1500));
+      xy = await where();
+      if (!xy) continue;
+      await page.mouse.click(xy.x, xy.y);
+      d = await page.waitForSelector('#detail.open', { timeout: 3000 }).then(() => detail(), () => null);
+    }
     assert.ok(xy, 'feature is on screen');
-    await page.mouse.click(xy.x, xy.y);
-    const d = await detail();
+    if (!d) {
+      // Diagnostic: say what the click actually hit.
+      const dbg = await page.evaluate(({ x, y }) => {
+        const r = WV.viewer.canvas.getBoundingClientRect();
+        const picked = WV.viewer.scene.pick(new Cesium.Cartesian2(x - r.left, y - r.top));
+        const ev = WV.layers.events.source.entities.values;
+        return {
+          detailOpen: !!document.querySelector('#detail.open'),
+          pickedLayer: picked?.id?.properties?.layer?.getValue?.() ?? (picked?.id?.id ?? null),
+          nEvents: ev.length,
+          shodanOn: WV.layers.shodan.enabled,
+          // Whatever sits on top of the canvas at the click point, if anything.
+          topElement: (() => { const n = document.elementFromPoint(x, y); return n && `${n.tagName}#${n.id}.${n.className}`; })(),
+        };
+      }, xy);
+      throw new Error('click opened no detail: ' + JSON.stringify(dbg));
+    }
     assert.match(d.title, /Earthquake in Testland/);
   });
 
