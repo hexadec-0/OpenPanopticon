@@ -66,15 +66,17 @@ e2e('layers and the detail panel', () => {
     // Area services (from the count endpoint) · machines drawn. The drawn
     // counts move as port lookups land, so only the area half is pinned.
     const legend = await page.$$eval(`${row('shodan')} .legend-item`, (ns) => ns.map((n) => n.textContent));
-    for (const want of [/^other 100k · \d$/, /^web 20k · \d$/, /^remote 5,099 · \d$/, /^ics 12 · 1$/]) {
+    // The view spans four 0.25-degree cells; the area totals (free count
+    // endpoint) are the sum across them, so each is 4x the per-cell figure.
+    for (const want of [/^other 402k · \d$/, /^web 80k · \d$/, /^remote 20k · \d$/, /^ics 48 · \d$/]) {
       assert.ok(legend.some((t) => want.test(t)), `${want} in ${legend.join(' | ')}`);
     }
     await page.select(`${row('shodan')} select.ctl`, 'risk');
     const risk = await page.$$eval(`${row('shodan')} .legend-item`, (ns) => ns.map((n) => n.textContent));
     assert.deepEqual(risk, ['known CVEs 1', 'no known CVEs 1']);
     assert.equal(await text$(page, `${row('shodan')} .note`),
-      '125,591 services in current view. Showing all 2 entries.');
-    await page.waitForFunction(() => /Busiest address: 198\.51\.100\.99, 1,246 services/
+      '502,364 services in current view. Showing all 2 entries.');
+    await page.waitForFunction(() => /Busiest address: 198\.51\.100\.99, 4,984 services/
       .test(document.querySelector('.layer[data-layer="shodan"] .layer-count').title));
     // Switching the layer on reads the credit count without a full refresh.
     await page.waitForFunction(() => /100 query credits left/.test(document.querySelector('.layer[data-layer="shodan"] .layer-count').title));

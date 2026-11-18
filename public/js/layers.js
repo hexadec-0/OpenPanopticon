@@ -1050,7 +1050,9 @@ export class ShodanLayer extends Layer {
       // The camera has moved on: keep what is in hand and let refresh() ask
       // for the new view. Cells already drawn stay drawn.
       if (this._viewBbox !== bbox) break;
-      if (super.isCovered(cell.key)) continue;   // bought already and retained
+      // A forced refresh (Shift+SYNC) re-buys every cell; a plain one keeps
+      // the cells already paid for and only fetches new ground.
+      if (!this._forced && super.isCovered(cell.key)) continue;
 
       const data = await this.fetch('/api/shodan', { bbox: cell.key, preset: 'all' });
       fetched = true;
