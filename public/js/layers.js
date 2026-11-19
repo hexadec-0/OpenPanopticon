@@ -2398,21 +2398,28 @@ export class OverpassLayer extends Layer {
     // Tiles one at a time, nearest the middle first: Overpass allows ~2
     // slots per IP and the server queues behind them anyway, so parallel
     // requests would only wait in line and time out together.
-    const fetchPart = async (part) => {
+    // `cachedOnly` asks the server for what it already holds, in memory or
+    // on disk, without queueing for Overpass.
+    const fetchPart = async (part, cachedOnly = false) => {
       if (this.partCovered(part)) return;
       const d = await this.fetch('/api/overpass', {
         bbox: part.key, presets: [...this.presets].join(','), limit: OSM_TILE_LIMIT,
+        ...(cachedOnly ? { cached: 1 } : {}),
       });
       // The server answers for whole grid cells; keep only what falls in
       // the part asked for, so nothing past the padded view is loaded.
       this.remember((d.features || []).filter((f) => f.lat >= part.south && f.lat <= part.north
         && f.lon >= part.west && f.lon <= part.east));
-      if (d.partial) { draw(true); throw partialAnswer(d); }
+      if (d.partial) {
+        if (cachedOnly) return;   // the rest is fetched in the second pass
+        draw(true);
+        throw partialAnswer(d);
+      }
       // Cut to the draw limit: the server holds the rest, so ask for it
       // cell by cell. A single cell over the limit is as fine as it gets.
       const cells = OverpassLayer.cellsOf(part);
       if (d.capped && cells.length > 1) {
-        for (const c of cells) await fetchPart(c);
+        for (const c of cells) await fetchPart(c, cachedOnly);
       } else {
         if (d.truncated) truncated = true;
         this.markCovered(part.key);
@@ -2421,6 +2428,19 @@ export class OverpassLayer extends Layer {
     };
 
     try {
+      // First everything the server already holds, over the whole view. The
+      // second pass goes to Overpass tile by tile and stops at the first
+      // refusal, so without this a view whose middle tile was not cached
+      // drew nothing at all, even with the rest of it on disk (as after a
+      // restart, when the browser's own copy is gone too). A forced refresh
+      // skips it: the server ignores its cache for those.
+      if (!this._forced) {
+        for (const tile of tiles) {
+          if (this._viewBbox !== ctx.bbox) break;
+          await fetchPart(tile, true);
+        }
+        draw(true);
+      }
       for (const tile of tiles) {
         // The camera has moved on: stop here. What is in hand stays, and
         // refresh() asks for the new view as soon as this returns.

@@ -2507,7 +2507,7 @@ const overpassLimits = {   // an object so tests can lower it
   maxsize: 128 * 1024 * 1024,
 };
 
-async function overpassCells(box, classes, cap, label = 'Overpass', ttl = RETAIN['overpass.infrastructure'], centre = null) {
+async function overpassCells(box, classes, cap, label = 'Overpass', ttl = RETAIN['overpass.infrastructure'], centre = null, { cachedOnly = false } = {}) {
   const byKey = new Map(classes.map((c) => [c.key, c]));
   const chosen = classes.map((c) => c.key);
   const cells = overpassCellsOf(box);
@@ -2521,7 +2521,11 @@ async function overpassCells(box, classes, cap, label = 'Overpass', ttl = RETAIN
     else missing.push({ p, c });
   })));
 
-  if (missing.length) {
+  if (missing.length && cachedOnly) {
+    // Asked for what is already held, without waiting on Overpass: the
+    // missing cells are reported, not fetched.
+    partial = { error: new UpstreamError(200, 'Not fetched yet.'), retryAfter: 0 };
+  } else if (missing.length) {
     const presets = chosen.filter((p) => missing.some((m) => m.p === p));
     const need = [...new Map(missing.map((m) => [m.c.key, m.c])).values()];
     log('info', `${label}: ${need.length} of ${cells.length} cells not cached (${presets.join(', ')}) — querying`);
@@ -2740,7 +2744,7 @@ function nearestFirst(items, b, cap) {
  * selected classes go out as one query and are partitioned on the way back
  * using each preset's tag predicate.
  */
-async function overpass({ bbox, presets, preset, limit }) {
+async function overpass({ bbox, presets, preset, limit, cachedOnly = false }) {
   const b = parseBbox(bbox);
   if (!b) throw new UpstreamError(400, 'bbox required as south,west,north,east');
 
@@ -2768,7 +2772,7 @@ async function overpass({ bbox, presets, preset, limit }) {
   const raw = await overpassCells(q,
     chosen.map((k) => ({ key: k, body: OVERPASS_PRESETS[k].body, match: OVERPASS_PRESETS[k].match })), cap,
     'Overpass', RETAIN['overpass.infrastructure'],
-    { lat: (b.south + b.north) / 2, lon: (b.west + b.east) / 2 });
+    { lat: (b.south + b.north) / 2, lon: (b.west + b.east) / 2 }, { cachedOnly });
 
   const byPreset = Object.fromEntries(chosen.map((k) => [k, 0]));
   const features = [];
@@ -6761,6 +6765,8 @@ const ROUTES = {
     presets: q.get('presets'),
     preset: q.get('preset'),        // still accepted, single class
     limit: q.get('limit'),
+    // cached=1: answer from memory and disk only, never queue for Overpass.
+    cachedOnly: q.get('cached') === '1',
   }),
   '/api/webcams': (q) => webcams({ bbox: q.get('bbox') }),
   '/api/youtube': (q) => youtubeVideos({ bbox: q.get('bbox') }),

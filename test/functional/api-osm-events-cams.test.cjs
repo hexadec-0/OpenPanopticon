@@ -56,6 +56,21 @@ describe('/api/overpass when Overpass refuses part-way', () => {
     assert.equal(r.status, 429);
   });
 
+  test('cached=1 answers from what is held and never asks Overpass', async () => {
+    await s.api('/api/overpass', { bbox: BBOX, presets: 'power' });
+    s.mod.cache.clear();   // as after a restart: only the disk copy is left
+    const before = s.mock.callsTo('overpass').length;
+    const d = (await s.api('/api/overpass', { bbox: WIDE, presets: 'power', cached: '1' })).json();
+    assert.equal(s.mock.callsTo('overpass').length, before, 'no query, no status probe');
+    assert.equal(d.partial, true);
+    assert.ok(d.count > 0, 'the cells on disk are in the answer');
+    assert.ok(d.missing > 0);
+    assert.equal(d.covered, null);
+    const none = (await s.api('/api/overpass', { bbox: '40.1,-90.1,40.2,-90', presets: 'power', cached: '1' })).json();
+    assert.equal(none.count, 0, 'nothing held is an empty answer, not an error');
+    assert.equal(s.mock.callsTo('overpass').length, before);
+  });
+
   test('cached ground is shown even while Overpass is cooling down', async () => {
     await s.api('/api/overpass', { bbox: BBOX, presets: 'power' });
     s.mod.overpassGate.cooldownUntil = Date.now() + 120_000;

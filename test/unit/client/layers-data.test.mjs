@@ -16,7 +16,7 @@ import * as L from '../../../public/js/layers.js';
 const require = createRequire(import.meta.url);
 const { startServer } = require('../../helpers/harness.cjs');
 const { TEST_KEYS, HOME } = require('../../helpers/fixtures.cjs');
-const { json } = require('../../helpers/responses.cjs');
+const { json, status } = require('../../helpers/responses.cjs');
 
 const BBOX = '34.97,-100.03,35.03,-99.97';
 const XSS = '<img src=x onerror="window.__xss=1">';
@@ -584,6 +584,34 @@ describe('OverpassLayer', () => {
     assert.match(d.html, /icao<\/th><td>KTST/);
     assert.match(d.html, /All OSM tags \(4\)/);
     assert.match(d.html, /openstreetmap\.org\/way\/3002/);
+  });
+
+  test('after a restart, cached ground is drawn even when Overpass refuses the first tile', async () => {
+    // A view over several tiles. The previous run fetched all of them but
+    // the one nearest the middle, which the browser asks for first.
+    const V = '34.80,-100.20,35.20,-99.80';
+    const probe = new L.OverpassLayer(viewer);
+    const { tiles } = probe.tilesFor(probe.padBbox(V));
+    assert.ok(tiles.length > 1);
+    for (const t of tiles.slice(1)) await s.api('/api/overpass', { bbox: t.key, presets: 'surveillance' });
+    s.mod.cache.clear();   // as after a restart: only the disk copy is left
+    s.mock.on((url, call) => /overpass/.test(url.hostname) && call.method === 'POST', () => status(429, 'rate limited'));
+    const asked = s.mock.callsTo('overpass').length;
+
+    const l = on(new L.OverpassLayer(viewer));
+    await l.refresh(ctx(V));
+    clearTimeout(l._retryTimer);
+    assert.ok(l.count > 0, "the cached tiles are drawn");
+    assert.equal(l.status, 'error', 'the uncached tile is still owed');
+    // Every query that went out was for the uncached tile, none for ground on disk.
+    const g = 0.125, t0 = tiles[0];
+    for (const c of s.mock.callsTo('overpass').slice(asked).filter((x) => x.method === 'POST')) {
+      const data = new URLSearchParams(String(c.body)).get('data') || '';
+      const [qs, qw, qn, qe] = /\((-?[\d.]+),(-?[\d.]+),(-?[\d.]+),(-?[\d.]+)\)/.exec(data).slice(1).map(Number);
+      assert.ok(qs >= Math.floor(t0.south / g) * g && qn <= Math.ceil(t0.north / g) * g
+        && qw >= Math.floor(t0.west / g) * g && qe <= Math.ceil(t0.east / g) * g, `query outside the uncached tile: ${data}`);
+    }
+    assert.equal(l.isCovered(V), false);
   });
 
   test('a hostile OSM tag is escaped', () => {
