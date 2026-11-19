@@ -25,6 +25,8 @@ const fsp = require('node:fs/promises');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const net = require('node:net');
+const dns = require('node:dns');
+const zlib = require('node:zlib');
 const { AsyncLocalStorage } = require('node:async_hooks');
 const { URL } = require('node:url');
 
@@ -291,6 +293,11 @@ function remember(key, entry) {
   while (cache.size > cacheMaxEntries()) cache.delete(cache.keys().next().value);
 }
 
+/** A producer's answer that was saved at `savedAt` rather than made just now. */
+class Aged {
+  constructor(value, savedAt) { this.value = value; this.savedAt = savedAt; }
+}
+
 async function cached(key, ttlMs, producer) {
   // A manual refresh means the operator has decided the stored answer is not
   // good enough, so neither the memory copy nor an already-running fetch that
@@ -308,8 +315,12 @@ async function cached(key, ttlMs, producer) {
 
   const p = (async () => {
     try {
-      const value = await producer();
-      remember(key, { expires: Date.now() + ttlMs, value });
+      const out = await producer();
+      // An answer read back from disk is as old as when it was saved, not
+      // when it was read: it expires on that clock in memory too.
+      const aged = out instanceof Aged;
+      const value = aged ? out.value : out;
+      remember(key, { expires: (aged ? out.savedAt : Date.now()) + ttlMs, value });
       return value;
     } finally {
       inflight.delete(key);
@@ -583,6 +594,11 @@ const diskKeyHash = (key) => crypto.createHash('sha256').update(`openpanopticon:
 // (diskMaxAge(), from cache.conf.)
 
 async function readDiskCache(key, ttlMs) {
+  return (await readDiskRecord(key, ttlMs))?.value;
+}
+
+/** A live disk record as { value, savedAt }, or undefined. */
+async function readDiskRecord(key, ttlMs) {
   if (wantsFresh()) return undefined;
   const file = path.join(DISK_CACHE_DIR, diskName(key));
   try {
@@ -591,11 +607,12 @@ async function readDiskCache(key, ttlMs) {
     // A collision, unless it is a record from before keys were hashed that
     // pruneDiskCache() has not rewritten yet.
     if (rec.keyHash !== diskKeyHash(key) && rec.key !== key) return undefined;
-    if (Date.now() - rec.savedAt > ttlMs) {                   // expired
-      if (Date.now() - rec.savedAt > diskMaxAge()) await fsp.unlink(file).catch(() => {});
+    const savedAt = Number(rec.savedAt);
+    if (!Number.isFinite(savedAt) || Date.now() - savedAt > ttlMs) {   // expired
+      if (!(Date.now() - savedAt <= diskMaxAge())) await fsp.unlink(file).catch(() => {});
       return undefined;
     }
-    return rec.value;
+    return { value: rec.value, savedAt: Math.min(savedAt, Date.now()) };
   } catch {
     return undefined;
   }
@@ -624,32 +641,49 @@ async function writeDiskCache(key, value) {
  * clear: still-live ones are rewritten without it (they may have cost a
  * Shodan credit), expired ones are deleted.
  */
+/**
+ * Run `fn` over `items`, at most `limit` at a time. File walks over thousands
+ * of entries are dominated by per-file latency (a network or synced drive
+ * especially), which one-at-a-time stat calls pay in full.
+ */
+async function forEachLimit(items, limit, fn) {
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      await fn(items[i], i);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+}
+const PRUNE_CONCURRENCY = 16;
+
 async function pruneDiskCache({ now = Date.now() } = {}) {
   let names;
   try { names = await fsp.readdir(DISK_CACHE_DIR); } catch { return { removed: 0, rewritten: 0 }; }
   let removed = 0; let rewritten = 0;
-  for (const name of names) {
+  await forEachLimit(names, PRUNE_CONCURRENCY, async (name) => {
     const file = path.join(DISK_CACHE_DIR, name);
     try {
       const st = await fsp.stat(file);
-      if (!st.isFile()) continue;
+      if (!st.isFile()) return;
       const age = now - st.mtimeMs;
       if (name.endsWith('.tmp')) {
         // A write that never got renamed; give a live one an hour to finish.
         if (age > 60 * 60_000) { await fsp.unlink(file); removed++; }
-        continue;
+        return;
       }
-      if (!name.endsWith('.json')) continue;
-      if (age > diskMaxAge()) { await fsp.unlink(file); removed++; continue; }
+      if (!name.endsWith('.json')) return;
+      if (age > diskMaxAge()) { await fsp.unlink(file); removed++; return; }
 
       const fh = await fsp.open(file, 'r');
       const head = Buffer.alloc(16);
       try { await fh.read(head, 0, 16, 0); } finally { await fh.close(); }
-      if (!head.toString('utf8').startsWith('{"key":')) continue;
+      if (!head.toString('utf8').startsWith('{"key":')) return;
 
       const rec = JSON.parse(await fsp.readFile(file, 'utf8'));
       if (typeof rec.key !== 'string' || !(now - rec.savedAt <= diskMaxAge())) {
-        await fsp.unlink(file); removed++; continue;
+        await fsp.unlink(file); removed++; return;
       }
       const tmp = `${file}.${process.pid}.tmp`;
       await fsp.writeFile(tmp, JSON.stringify({ keyHash: diskKeyHash(rec.key), savedAt: rec.savedAt, value: rec.value }), 'utf8');
@@ -659,15 +693,15 @@ async function pruneDiskCache({ now = Date.now() } = {}) {
       await fsp.utimes(file, saved, saved).catch(() => {});
       rewritten++;
     } catch { /* unreadable or already gone: leave it for FLUSH */ }
-  }
+  });
   return { removed, rewritten };
 }
 
 /** cached(), plus a disk tier underneath it. */
 async function cachedPersistent(key, ttlMs, producer) {
   return cached(key, ttlMs, async () => {
-    const hit = await readDiskCache(key, ttlMs);
-    if (hit !== undefined) return hit;
+    const hit = await readDiskRecord(key, ttlMs);
+    if (hit !== undefined) return new Aged(hit.value, hit.savedAt);
     const value = await producer();
     // Awaited, not fired and forgotten. An answer that cost a donated
     // Overpass slot or a Shodan credit must be on disk before the caller is
@@ -1204,13 +1238,6 @@ function shodanSearchUrl(query, page) {
   url.searchParams.set('minify', 'true');
   if (page > 1) url.searchParams.set('page', String(page));
   return url;
-}
-
-/** A cached value, from memory or disk, without fetching anything. */
-async function peekCached(key, ttlMs) {
-  const hit = cache.get(key);
-  if (hit && hit.expires > Date.now()) return hit.value;
-  return readDiskCache(key, ttlMs);
 }
 
 /**
@@ -2457,9 +2484,10 @@ async function peekCached(key, ttlMs) {
   if (wantsFresh()) return undefined;
   const hit = cache.get(key);
   if (hit && hit.expires > Date.now()) { remember(key, hit); return hit.value; }
-  const disk = await readDiskCache(key, ttlMs);
-  if (disk !== undefined) remember(key, { expires: Date.now() + ttlMs, value: disk });
-  return disk;
+  const disk = await readDiskRecord(key, ttlMs);
+  if (disk === undefined) return undefined;
+  remember(key, { expires: disk.savedAt + ttlMs, value: disk.value });
+  return disk.value;
 }
 
 /**
@@ -5140,10 +5168,15 @@ async function firmsEvents(view) {
 /* --- RSOE EDIS (enterprise, opt-in) ---------------------------------- */
 async function edisEvents(b) {
   if (!CFG.edisUrl) return [];
-  const raw = await cached('ev:edis', RETAIN['current.events'], () =>
-    grab(CFG.edisUrl, {
+  const raw = await cached('ev:edis', RETAIN['current.events'], async () => {
+    // The one upstream whose address is a setting: check where it points
+    // before the key goes there, and never follow a redirect elsewhere.
+    await assertOutboundUrl(CFG.edisUrl, 'RSOE EDIS');
+    return grab(CFG.edisUrl, {
       headers: CFG.edisKey ? { Authorization: `Bearer ${CFG.edisKey}` } : {},
-    }, { label: 'RSOE EDIS', timeoutMs: 30000 }));
+      redirect: 'error',
+    }, { label: 'RSOE EDIS', timeoutMs: 30000 });
+  });
 
   // EDIS ships GeoJSON; field names are not public, so normalise defensively.
   const feats = raw.features || raw.events || (Array.isArray(raw) ? raw : []);
@@ -5291,6 +5324,21 @@ const ALLOWED_HOSTS = new Set([
 
 const ACCESS_KEY = BOUND_TO_LOOPBACK ? null
   : ((process.env.ACCESS_KEY || '').trim() || crypto.randomBytes(18).toString('base64url'));
+// A short key can be guessed. The generated one is 24 characters; one the
+// operator picks must be at least this long, or start() refuses to listen.
+const ACCESS_KEY_MIN_CHARS = 16;
+const ACCESS_KEY_PROBLEM = ACCESS_KEY && ACCESS_KEY.length < ACCESS_KEY_MIN_CHARS
+  ? `ACCESS_KEY is ${ACCESS_KEY.length} characters; it must be at least ${ACCESS_KEY_MIN_CHARS}.`
+  : null;
+
+// The browser holds a session token, never the key itself: a signed issue
+// time that expires on its own, so a copied cookie stops working and does not
+// reveal the key. Changing ACCESS_KEY ends every session.
+const SESSION_COOKIE = 'op_session';
+const SESSION_MAX_AGE_S = 30 * 86400;
+// Scripts on this machine (the Docker health probe, start.sh, chromebook.sh)
+// still present the raw key in this cookie. It is honoured from a loopback
+// peer only, so it cannot be used to guess the key from the network.
 const ACCESS_COOKIE = 'op_access';
 
 function sameSecret(a, b) {
@@ -5306,6 +5354,82 @@ function cookieValue(req, name) {
   return null;
 }
 
+/**
+ * The request's URL, or null if it cannot be parsed.
+ *
+ * Node's HTTP parser accepts request-targets that WHATWG URL rejects, such as
+ * `GET http://[ HTTP/1.1`. new URL() throws on those, and a throw inside an
+ * async request handler is an unhandled rejection, which ends the process:
+ * one such request would stop the server before any check had run.
+ */
+function requestUrl(req) {
+  try {
+    return new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  } catch {
+    return null;
+  }
+}
+
+function badRequest(res) {
+  if (!res.headersSent) res.writeHead(400, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain' });
+  res.end('Bad request');
+}
+
+const sessionMac = (issued) => crypto.createHmac('sha256', ACCESS_KEY)
+  .update(`openpanopticon-session:${issued}`).digest('base64url');
+
+/** A new session token: base-36 issue time (seconds) and its signature. */
+function sessionToken(now = Date.now()) {
+  const issued = Math.floor(now / 1000).toString(36);
+  return `${issued}.${sessionMac(issued)}`;
+}
+
+function validSession(token, now = Date.now()) {
+  const m = /^([0-9a-z]{1,12})\.([A-Za-z0-9_-]{43})$/.exec(String(token || ''));
+  if (!m) return false;
+  const issuedMs = parseInt(m[1], 36) * 1000;
+  if (!(issuedMs <= now + 60_000) || now - issuedMs > SESSION_MAX_AGE_S * 1000) return false;
+  return sameSecret(m[2], sessionMac(m[1]));
+}
+
+function fromLoopbackPeer(req) {
+  const a = String(req.socket?.remoteAddress || '');
+  return a === '::1' || /^(::ffff:)?127\./.test(a);
+}
+
+/** Whether a request carries a valid session, or the raw key from this machine. */
+function authorised(req) {
+  if (!ACCESS_KEY) return true;
+  if (validSession(cookieValue(req, SESSION_COOKIE))) return true;
+  const raw = cookieValue(req, ACCESS_COOKIE);
+  return !!raw && fromLoopbackPeer(req) && sameSecret(raw, ACCESS_KEY);
+}
+
+// Wrong ?key= offers, per client address. Past the limit, further offers are
+// refused without being checked until the window has passed, so the key
+// cannot be guessed at network speed. A valid session is never affected.
+const AUTH_FAIL_MAX = 10;
+const AUTH_FAIL_WINDOW_MS = 15 * 60_000;
+const AUTH_FAIL_TRACKED = 10_000;
+const authFails = new Map();   // address -> { n, until }
+
+function authRetryAfter(addr, now = Date.now()) {
+  const f = authFails.get(addr);
+  if (!f) return 0;
+  if (f.until <= now) { authFails.delete(addr); return 0; }
+  return f.n >= AUTH_FAIL_MAX ? Math.ceil((f.until - now) / 1000) : 0;
+}
+
+function noteAuthFail(addr, now = Date.now()) {
+  const f = authFails.get(addr);
+  if (f && f.until > now) { f.n++; return; }
+  authFails.set(addr, { n: 1, until: now + AUTH_FAIL_WINDOW_MS });
+  if (authFails.size > AUTH_FAIL_TRACKED) {
+    for (const [k, v] of authFails) if (v.until <= now) authFails.delete(k);
+    while (authFails.size > AUTH_FAIL_TRACKED) authFails.delete(authFails.keys().next().value);
+  }
+}
+
 /** Host and (when bound beyond loopback) access-key check. False = handled. */
 function gate(req, res) {
   const host = String(req.headers.host || '').toLowerCase();
@@ -5316,19 +5440,31 @@ function gate(req, res) {
   }
   if (!ACCESS_KEY) return true;
 
-  const url = new URL(req.url, `http://${host}`);
+  const url = requestUrl(req);
+  if (!url) { badRequest(res); return false; }
   const offered = url.searchParams.get('key');
-  if (offered && sameSecret(offered, ACCESS_KEY)) {
-    url.searchParams.delete('key');
-    res.writeHead(303, {
-      ...SECURITY_HEADERS,
-      'Set-Cookie': `${ACCESS_COOKIE}=${ACCESS_KEY}; HttpOnly; SameSite=Strict; Path=/`,
-      Location: url.pathname + url.search,
-    }).end();
-    return false;
+  if (offered) {
+    const addr = String(req.socket?.remoteAddress || '');
+    const wait = authRetryAfter(addr);
+    if (wait) {
+      res.writeHead(429, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain', 'Retry-After': String(wait) })
+        .end('Too many wrong access keys from this address. Try again later.');
+      return false;
+    }
+    if (sameSecret(offered, ACCESS_KEY)) {
+      url.searchParams.delete('key');
+      // Secure when the browser reached us over HTTPS (a TLS proxy in front).
+      const secure = req.socket?.encrypted || req.headers['x-forwarded-proto'] === 'https' ? '; Secure' : '';
+      res.writeHead(303, {
+        ...SECURITY_HEADERS,
+        'Set-Cookie': `${SESSION_COOKIE}=${sessionToken()}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${SESSION_MAX_AGE_S}${secure}`,
+        Location: url.pathname + url.search,
+      }).end();
+      return false;
+    }
+    noteAuthFail(addr);
   }
-  const held = cookieValue(req, ACCESS_COOKIE);
-  if (held && sameSecret(held, ACCESS_KEY)) return true;
+  if (authorised(req)) return true;
   res.writeHead(401, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain; charset=utf-8' })
     .end('OpenPanopticon is reachable from the network, so it needs its access key.\n'
       + 'Open the full URL (with ?key=…) printed in the terminal where the server started.');
@@ -5440,6 +5576,59 @@ function safeUrl(u, { httpsOnly = false } = {}) {
   return null;
 }
 
+// Addresses a configurable upstream URL may not point at: this machine, the
+// LAN, link-local (cloud metadata at 169.254.169.254), CGNAT, multicast and
+// reserved space. OPENPANOPTICON_ALLOW_PRIVATE_URLS=1, set in the real
+// environment (the settings menu cannot set it), lifts the rule for an
+// operator who runs such a feed on their own network.
+const PRIVATE_NETS = new net.BlockList();
+for (const [a, p] of [['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8],
+  ['169.254.0.0', 16], ['172.16.0.0', 12], ['192.0.0.0', 24], ['192.168.0.0', 16],
+  ['198.18.0.0', 15], ['224.0.0.0', 4], ['240.0.0.0', 4]]) PRIVATE_NETS.addSubnet(a, p, 'ipv4');
+// IPv4-mapped IPv6 (::ffff:127.0.0.1) is matched by the IPv4 rules above.
+for (const [a, p] of [['::', 128], ['::1', 128], ['fc00::', 7], ['fe80::', 10], ['ff00::', 8]]) {
+  PRIVATE_NETS.addSubnet(a, p, 'ipv6');
+}
+const PRIVATE_NAME_RE = /(^|\.)(localhost|local|internal|lan|home\.arpa)$/i;
+const allowPrivateUrls = () => process.env.OPENPANOPTICON_ALLOW_PRIVATE_URLS === '1';
+
+function isPrivateAddress(ip) {
+  const fam = net.isIP(ip);
+  return fam ? PRIVATE_NETS.check(ip, fam === 4 ? 'ipv4' : 'ipv6') : false;
+}
+
+/** Why a configurable upstream URL is refused, or null if it may be used. */
+function outboundUrlProblem(raw) {
+  let u;
+  try { u = new URL(String(raw).trim()); } catch { return 'must be an http(s) URL'; }
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') return 'must be an http(s) URL';
+  if (allowPrivateUrls()) return null;
+  if (u.protocol !== 'https:') return 'must be an https URL';
+  if (u.username || u.password) return 'must not carry a login in the URL';
+  const host = u.hostname.replace(/^\[|\]$/g, '');
+  if (isPrivateAddress(host) || PRIVATE_NAME_RE.test(host) || (!host.includes('.') && !net.isIP(host))) {
+    return 'must point at a public host, not this machine or the local network';
+  }
+  return null;
+}
+
+/**
+ * Refuse, before the request, a URL whose name resolves into private space.
+ * A lookup that fails is let through: the fetch then fails the same way.
+ */
+async function assertOutboundUrl(raw, label) {
+  const why = outboundUrlProblem(raw);
+  if (why) throw new UpstreamError(400, `${label} URL ${why}`);
+  if (allowPrivateUrls()) return;
+  const host = new URL(String(raw).trim()).hostname.replace(/^\[|\]$/g, '');
+  if (net.isIP(host)) return;
+  let addrs;
+  try { addrs = await dns.promises.lookup(host, { all: true, verbatim: true }); } catch { return; }
+  if (addrs.some((a) => isPrivateAddress(a.address))) {
+    throw new UpstreamError(400, `${label} URL resolves to a private address; refused`);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Routing
 // ---------------------------------------------------------------------------
@@ -5456,14 +5645,52 @@ const MIME = {
 };
 
 function sendJson(res, status, obj) {
-  const body = JSON.stringify(obj);
-  res.writeHead(status, {
+  sendBody(res, status, {
     ...SECURITY_HEADERS,
     'Content-Type': 'application/json; charset=utf-8',
-    'Content-Length': Buffer.byteLength(body),
     'Cache-Control': 'no-store',
-  });
-  res.end(body);
+  }, Buffer.from(JSON.stringify(obj)));
+}
+
+// Responses smaller than this go as they are: compressing them saves less
+// than its framing costs.
+const COMPRESS_MIN_BYTES = 1024;
+
+/** 'br', 'gzip' or null, from the request's Accept-Encoding. */
+function pickEncoding(req) {
+  const ae = String(req?.headers?.['accept-encoding'] || '').toLowerCase();
+  const offers = (name) => new RegExp(`(^|,)\\s*${name}\\s*(;\\s*q=(?!0(\\.0+)?\\s*(,|$))[\\d.]+)?\\s*(,|$)`).test(ae);
+  if (offers('br')) return 'br';
+  if (offers('gzip')) return 'gzip';
+  return null;
+}
+
+const brotli = (buf, quality) => new Promise((resolve, reject) => zlib.brotliCompress(buf, {
+  params: { [zlib.constants.BROTLI_PARAM_QUALITY]: quality, [zlib.constants.BROTLI_PARAM_SIZE_HINT]: buf.length },
+}, (e, out) => (e ? reject(e) : resolve(out))));
+const gzip = (buf) => new Promise((resolve, reject) => zlib.gzip(buf, { level: 6 }, (e, out) => (e ? reject(e) : resolve(out))));
+
+/**
+ * Send a body, compressed when the client accepts it and it is worth it.
+ * Compression runs on zlib's thread pool, not the event loop. Quality 4 for
+ * brotli: answers are made once and sent once, so speed beats the last few
+ * percent.
+ */
+function sendBody(res, status, headers, body, { precompressed = null } = {}) {
+  const enc = body.length >= COMPRESS_MIN_BYTES ? pickEncoding(res.req) : null;
+  const plain = () => {
+    if (res.headersSent || res.destroyed) return;
+    res.writeHead(status, { ...headers, ...(body.length >= COMPRESS_MIN_BYTES ? { Vary: 'Accept-Encoding' } : {}),
+      'Content-Length': body.length });
+    res.end(body);
+  };
+  if (!enc) { plain(); return; }
+  const work = precompressed ? precompressed(enc) : enc === 'br' ? brotli(body, 4) : gzip(body);
+  Promise.resolve(work).then((out) => {
+    if (res.headersSent || res.destroyed) return;
+    res.writeHead(status, { ...headers, 'Content-Encoding': enc, Vary: 'Accept-Encoding', 'Content-Length': out.length });
+    res.end(out);
+  }, plain);
 }
 
 
@@ -6103,7 +6330,9 @@ const CREDENTIALS = [
     url: 'https://firms.modaps.eosdis.nasa.gov/api/map_key/',
     note: 'Active-fire detections.', set: (v) => { CFG.firmsKey = v; } },
   { name: 'EDIS_API_URL', group: 'Hazards', label: 'RSOE EDIS feed URL', secret: false, kind: 'url',
-    note: 'Enterprise feed; needs the URL and the key.', set: (v) => { CFG.edisUrl = v; } },
+    sendsKey: 'EDIS_API_KEY',
+    note: 'Enterprise feed; needs the URL and the key. Changing the URL alone clears the key.',
+    set: (v) => { CFG.edisUrl = v; } },
   { name: 'EDIS_API_KEY', group: 'Hazards', label: 'RSOE EDIS key', set: (v) => { CFG.edisKey = v; } },
 
   { name: 'CESIUM_ION_TOKEN', group: 'Maps', label: 'Cesium Ion token', url: 'https://ion.cesium.com/tokens',
@@ -6163,7 +6392,10 @@ function cleanCredential(c, raw) {
   if (v.length > SETTING_MAX_CHARS) return { error: 'too long' };
   // One line, printable: anything else would break out of its line in .env.
   if (/[\x00-\x1f\x7f]/.test(v)) return { error: 'must be a single line with no control characters' };
-  if (v && c.kind === 'url' && !safeUrl(v)) return { error: 'must be an http(s) URL' };
+  if (v && c.kind === 'url') {
+    const why = outboundUrlProblem(v);
+    if (why) return { error: why };
+  }
   if (v && c.kind === 'pairs' && !Object.keys(parse511(v)).length) return { error: 'expected STATE:key pairs, e.g. TX:abc,GA:def' };
   return { value: v };
 }
@@ -6327,6 +6559,24 @@ function saveSettings(body) {
     const r = cleanCredential(c, raw);
     if (r.error) fields[name] = r.error; else creds.set(name, r.value);
   }
+  // A URL setting is where its paired key gets sent. Changed on its own, it
+  // would carry the stored key to whatever the new URL names, and the menu
+  // never shows keys precisely so that they cannot be taken. So a new URL
+  // without a new key clears the old key.
+  const cleared = [];
+  for (const [name, v] of [...creds]) {
+    const c = CREDENTIAL_BY_NAME.get(name);
+    if (!c.sendsKey || creds.has(c.sendsKey) || fields[c.sendsKey]) continue;
+    if (v === (process.env[name] || '').trim()) continue;          // unchanged
+    if (!(process.env[c.sendsKey] || '').trim()) continue;          // no key to protect
+    if (envFixed(c.sendsKey)) {
+      fields[name] = `${c.sendsKey} is fixed by the environment; change the URL there too`;
+      continue;
+    }
+    creds.set(c.sendsKey, '');
+    cleared.push(c.sendsKey);
+  }
+
   const cacheVals = new Map();
   const known = new Set(CACHE_SCHEMA.map(([s, k]) => `${s}.${k}`));
   for (const [name, raw] of Object.entries(body.cache || {})) {
@@ -6363,7 +6613,7 @@ function saveSettings(body) {
     log('info', `settings: ${[...cacheVals.keys()].join(', ')} written to ${path.basename(CACHE_CONF_FILE)}`);
   }
 
-  return { saved: { credentials: [...creds.keys()], cache: [...cacheVals.keys()] }, ...settingsView() };
+  return { saved: { credentials: [...creds.keys()], cache: [...cacheVals.keys()], cleared }, ...settingsView() };
 }
 
 /** A small JSON request body. */
@@ -6594,7 +6844,10 @@ const TILE_SOURCES = [
   // published, which makes them the best possible thing to keep on disk.
   { label: 'Esri Wayback', hosts: [WAYBACK_HOST],
     path: (p) => p.startsWith(WAYBACK_TILE_PREFIX) && /^\d{1,6}\/\d{1,2}\/\d{1,7}\/\d{1,7}$/.test(p.slice(WAYBACK_TILE_PREFIX.length)) },
-  { label: 'NASA GIBS', hosts: ['gibs.earthdata.nasa.gov'], path: (p) => p.startsWith('/wmts/') },
+  // Dated daily imagery: a tile that is missing today may be published
+  // within hours, so "nothing here" is kept for an hour, not a month.
+  { label: 'NASA GIBS', hosts: ['gibs.earthdata.nasa.gov'], path: (p) => p.startsWith('/wmts/'),
+    emptyMaxAgeMs: 60 * 60_000 },
   ...templateSource(SHORTBREAD_URL, 'Shortbread'),
   ...templateSource(`${TITILER}/cog/tiles/{z}`, 'TiTiler'),
 ];
@@ -6639,24 +6892,31 @@ async function readTile(key, now = Date.now()) {
     const buf = await fsp.readFile(file);
     const nl = buf.indexOf(10);
     if (nl < 0 || nl > 200) return null;
-    const [code, type] = buf.subarray(0, nl).toString('utf8').split(' ');
+    const [code, type, keepMs] = buf.subarray(0, nl).toString('utf8').split(' ');
     const status = Number(code);
     if (!Number.isInteger(status)) return null;
+    // A record written with its own, shorter life (an empty dated tile).
+    if (keepMs && now - st.mtimeMs > Number(keepMs)) {
+      await fsp.unlink(file).catch(() => {});
+      return null;
+    }
     return { status, type: type || 'application/octet-stream', body: buf.subarray(nl + 1) };
   } catch {
     return null;
   }
 }
 
-async function writeTile(key, { status, type, body }) {
+async function writeTile(key, { status, type, body, keepMs }) {
   if (!(tileMaxAge() > 0)) return;   // maps.tiles = 0: do not keep tiles
   const file = tileFile(key);
   try {
     await fsp.mkdir(path.dirname(file), { recursive: true });
     // Write then rename, so a crash mid-write never leaves half a tile.
     const tmp = `${file}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
-    await fsp.writeFile(tmp, Buffer.concat([Buffer.from(`${status} ${type}\n`), body]));
+    const head = keepMs > 0 ? `${status} ${type} ${Math.round(keepMs)}\n` : `${status} ${type}\n`;
+    await fsp.writeFile(tmp, Buffer.concat([Buffer.from(head), body]));
     await fsp.rename(tmp, file);
+    noteTileBytes(head.length + body.length);
   } catch (e) {
     log('warn', `could not store tile: ${e.message}`);
   }
@@ -6670,7 +6930,7 @@ const TILE_TYPE_RE = /^(image\/[\w.+-]+|application\/(x-protobuf|vnd\.mapbox-vec
  * Response. "Nothing here" (204/404, which vector sources answer over open
  * ocean) is stored too, so empty tiles are not asked for again either.
  */
-async function cachedTile(key, fetcher) {
+async function cachedTile(key, fetcher, { emptyMaxAgeMs = 0 } = {}) {
   if (tileInflight.has(key)) return tileInflight.get(key);
   const p = (async () => {
     const hit = await readTile(key);
@@ -6683,7 +6943,7 @@ async function cachedTile(key, fetcher) {
     }
     if (res.status === 204 || res.status === 404) {
       const rec = { status: res.status, type: 'text/plain', body: Buffer.alloc(0) };
-      await writeTile(key, rec);
+      await writeTile(key, { ...rec, keepMs: emptyMaxAgeMs });
       return { ...rec, cache: 'miss' };
     }
     if (!res.ok) throw new UpstreamError(res.status, `tile source returned HTTP ${res.status}`);
@@ -6730,13 +6990,15 @@ async function serveCachedTile(req, res, url, { trusted = false } = {}) {
     return;
   }
   const raw = url.searchParams.get('u') || '';
-  if (!tileSourceFor(raw)) {
+  const source = tileSourceFor(raw);
+  if (!source) {
     res.writeHead(400, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain' })
       .end('Not a tile source this server caches');
     return;
   }
   try {
-    sendTile(res, await cachedTile(`tile:${raw}`, () => fetchTileUpstream(raw)));
+    sendTile(res, await cachedTile(`tile:${raw}`, () => fetchTileUpstream(raw),
+      { emptyMaxAgeMs: source.emptyMaxAgeMs || 0 }));
   } catch (err) {
     const status = err instanceof UpstreamError ? err.status : 502;
     res.writeHead(status, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain' }).end(err.message);
@@ -6751,6 +7013,7 @@ async function serveCachedTile(req, res, url, { trusted = false } = {}) {
  * would sit on disk for good.
  */
 async function pruneTileCache({ now = Date.now(), maxBytes = RETAIN['maps.tiles_max_size'] } = {}) {
+  const writtenAtStart = tileBytesWritten;
   let shards;
   try { shards = await fsp.readdir(TILE_DIR); } catch { return { removed: 0, kept: 0, bytes: 0 }; }
   let removed = 0;
@@ -6759,21 +7022,21 @@ async function pruneTileCache({ now = Date.now(), maxBytes = RETAIN['maps.tiles_
     const dir = path.join(TILE_DIR, shard);
     let names;
     try { names = await fsp.readdir(dir); } catch { continue; }
-    for (const name of names) {
+    await forEachLimit(names, PRUNE_CONCURRENCY, async (name) => {
       const file = path.join(dir, name);
       try {
         const st = await fsp.stat(file);
-        if (!st.isFile()) continue;
+        if (!st.isFile()) return;
         const age = now - st.mtimeMs;
         if (name.endsWith('.tmp')) {
           // A write that never got renamed; give a live one an hour.
           if (age > 60 * 60_000) { await fsp.unlink(file); removed++; }
-          continue;
+          return;
         }
-        if (age > tileMaxAge()) { await fsp.unlink(file); removed++; continue; }
+        if (age > tileMaxAge()) { await fsp.unlink(file); removed++; return; }
         live.push({ file, mtime: st.mtimeMs, size: st.size });
       } catch { /* already gone */ }
-    }
+    });
     try { if ((await fsp.readdir(dir)).length === 0) await fsp.rmdir(dir); } catch { /* in use */ }
   }
   let bytes = live.reduce((a, t) => a + t.size, 0);
@@ -6786,7 +7049,31 @@ async function pruneTileCache({ now = Date.now(), maxBytes = RETAIN['maps.tiles_
       try { await fsp.unlink(t.file); bytes -= t.size; kept--; removed++; } catch { /* gone */ }
     }
   }
+  // What was written while this walk ran may not be in `live`; count it.
+  tileBytes = bytes + (tileBytesWritten - writtenAtStart);
   return { removed, kept, bytes };
+}
+
+// The folder's size, from the last prune plus every tile written since, so
+// the size cap holds between the six-hourly prunes and not only at them.
+// Unknown (null) until the first prune has counted the folder.
+let tileBytes = null;
+let tileBytesWritten = 0;   // every byte written, ever: lets a prune count writes made during it
+let tilePruneRunning = null;
+
+function noteTileBytes(n) {
+  tileBytesWritten += n;
+  if (tileBytes === null) return;
+  tileBytes += n;
+  pruneTilesIfOver();
+}
+
+function pruneTilesIfOver() {
+  if (tilePruneRunning || !(tileBytes > RETAIN['maps.tiles_max_size'])) return;
+  tilePruneRunning = pruneTileCache()
+    .then(({ removed, bytes }) => { if (removed) log('info', `tile cache over its cap: removed ${removed} (${Math.round(bytes / 1048576)} MB kept)`); })
+    .catch(() => {})
+    .finally(() => { tilePruneRunning = null; setImmediate(pruneTilesIfOver); });
 }
 
 
@@ -6866,6 +7153,27 @@ async function serveCartoTile(req, res, m, { trusted = false } = {}) {
   res.end(buf);
 }
 
+// Text assets are compressed once per version of the file and kept, so a
+// reload costs a stat, not a recompression. Brotli at quality 9: done once.
+const COMPRESSIBLE_EXT = new Set(['.html', '.js', '.css', '.json', '.svg']);
+const STATIC_KEEP_MAX_BYTES = 4 * 1024 * 1024;
+const staticCompressed = new Map();   // file -> { mtimeMs, size, br, gzip }
+
+function compressedStatic(file, st, data) {
+  let e = staticCompressed.get(file);
+  if (!e || e.mtimeMs !== st.mtimeMs || e.size !== st.size) {
+    e = { mtimeMs: st.mtimeMs, size: st.size };
+    staticCompressed.set(file, e);
+  }
+  return (enc) => {
+    if (!e[enc]) {
+      e[enc] = (enc === 'br' ? brotli(data, 9) : gzip(data));
+      e[enc].catch(() => { delete e[enc]; });
+    }
+    return e[enc];
+  };
+}
+
 async function serveStatic(req, res, pathname) {
   let rel = pathname === '/' ? '/index.html' : pathname;
   const target = path.join(PUBLIC_DIR, path.normalize(rel).replace(/^(\.\.[/\\])+/, ''));
@@ -6874,16 +7182,21 @@ async function serveStatic(req, res, pathname) {
     return;
   }
   try {
-    const data = await fsp.readFile(target);
+    const [st, data] = await Promise.all([fsp.stat(target), fsp.readFile(target)]);
     const ext = path.extname(target);
-    res.writeHead(200, {
+    const headers = {
       ...SECURITY_HEADERS,
       ...(ext === '.html' ? { 'Content-Security-Policy': cspFor(req.headers.host) } : {}),
       'Content-Type': MIME[ext] || 'application/octet-stream',
-      'Content-Length': data.length,
       'Cache-Control': 'no-cache',
-    });
-    res.end(data);
+    };
+    if (!COMPRESSIBLE_EXT.has(ext)) {
+      res.writeHead(200, { ...headers, 'Content-Length': data.length });
+      res.end(data);
+      return;
+    }
+    const keep = data.length <= STATIC_KEEP_MAX_BYTES;
+    sendBody(res, 200, headers, data, { precompressed: keep ? compressedStatic(target, st, data) : null });
   } catch {
     res.writeHead(404, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain' }).end('404 Not Found');
   }
@@ -6952,14 +7265,12 @@ async function serveTilePort(req, res) {
   res.setHeader('Access-Control-Allow-Credentials', 'true');
   res.setHeader('Vary', 'Origin');
   if (req.method === 'OPTIONS') { res.writeHead(204).end(); return; }
-  if (ACCESS_KEY) {
-    const held = cookieValue(req, ACCESS_COOKIE);
-    if (!held || !sameSecret(held, ACCESS_KEY)) {
-      res.writeHead(401, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain' }).end('Access key required');
-      return;
-    }
+  if (!authorised(req)) {
+    res.writeHead(401, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain' }).end('Access key required');
+    return;
   }
-  const url = new URL(req.url, `http://${req.headers.host}`);
+  const url = requestUrl(req);
+  if (!url) { badRequest(res); return; }
   try {
     if (url.pathname === '/tiles/ping') { res.writeHead(204, SECURITY_HEADERS).end(); return; }
     if (url.pathname === '/tiles/cache') { await serveCachedTile(req, res, url, { trusted: true }); return; }
@@ -6989,7 +7300,7 @@ function startTilePorts() {
   if (ACCESS_KEY) return Promise.resolve();
   const ports = Array.from({ length: TILE_PORT_COUNT }, (_, i) => CFG.port + 1 + i);
   return Promise.all(ports.map((port) => new Promise((resolve) => {
-    const srv = http.createServer((req, res) => { serveTilePort(req, res); });
+    const srv = http.createServer((req, res) => { serveTilePort(req, res).catch((e) => failRequest(res, e)); });
     srv.keepAliveTimeout = 30_000;
     srv.once('error', (e) => {
       log('warn', `tile port ${port} unavailable (${e.code || e.message}); tiles use the main port`);
@@ -7004,10 +7315,22 @@ function startTilePorts() {
   })));
 }
 
-const server = http.createServer(async (req, res) => {
+/** Last resort for a handler that threw outside its own error handling. */
+function failRequest(res, err) {
+  log('err', `request failed: ${err?.message || err}`);
+  try {
+    if (!res.headersSent) res.writeHead(500, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain' });
+    res.end('Internal error');
+  } catch { /* socket already gone */ }
+}
+
+const server = http.createServer((req, res) => { handleRequest(req, res).catch((e) => failRequest(res, e)); });
+
+async function handleRequest(req, res) {
   const started = Date.now();
   if (!gate(req, res)) return;
-  const url = new URL(req.url, `http://${req.headers.host}`);
+  const url = requestUrl(req);
+  if (!url) { badRequest(res); return; }
   const pathname = url.pathname;
   if (pathname.startsWith('/api/') && !apiAllowed(req, res, pathname, url.searchParams)) return;
 
@@ -7083,7 +7406,7 @@ const server = http.createServer(async (req, res) => {
       source: pathname,
     });
   }
-});
+}
 
 // ---------------------------------------------------------------------------
 // Boot
@@ -7106,6 +7429,13 @@ function log(kind, msg) {
 // run directly. Required from the test suite it is a plain module: nothing
 // binds a port, and the tests call server.listen() themselves.
 function start() {
+if (ACCESS_KEY_PROBLEM) {
+  console.error(`\n  ${ACCESS_KEY_PROBLEM}\n  Pick a longer one, or leave ACCESS_KEY empty to have one generated.\n`);
+  process.exit(1);
+}
+// Every request path catches its own errors. Should one ever slip through,
+// log it rather than let Node end the process and drop every other request.
+process.on('unhandledRejection', (e) => log('err', `unhandled rejection: ${e?.stack || e}`));
 // Clear out what the disk tier can no longer serve, now and every six hours.
 const prune = () => pruneDiskCache().then(({ removed, rewritten }) => {
   if (removed || rewritten) log('info', `disk cache: removed ${removed} expired, rewrote ${rewritten} old-format entries`);
@@ -7228,6 +7558,9 @@ module.exports = {
   feodoSet, greyNoiseLookup, enrich, normaliseOwcdb, cloudSource, gibsTemplate, gibsDefaultDate,
   GIBS_LAYERS, COUNTRY_CENTROIDS, FIVE_ELEVEN_HOSTS, basemapProviders, sentinelTileTemplate,
   safeUrl, sameSecret, cookieValue, gate, apiAllowed, ALLOWED_HOSTS, ACCESS_KEY, fromOwnPage, loggable,
+  requestUrl, sessionToken, validSession, authorised, authFails, AUTH_FAIL_MAX, ACCESS_KEY_PROBLEM,
+  SESSION_COOKIE, ACCESS_COOKIE, outboundUrlProblem, assertOutboundUrl, isPrivateAddress,
+  pickEncoding, COMPRESS_MIN_BYTES, forEachLimit, readDiskRecord, Aged,
   SECURITY_HEADERS, CSP, cspFor, MIME, cartoCache, log,
   tilePortsLive, startTilePorts, stopTilePorts, serveTilePort, mainHostFor,
   TILE_DIR, tileMaxAge, TILE_SOURCES, tileSourceFor, tileCacheHosts, tileFile, readTile, writeTile,

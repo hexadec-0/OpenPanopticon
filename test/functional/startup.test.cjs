@@ -81,12 +81,25 @@ describe('node server.js', () => {
   test('bound beyond loopback, prints the access-key URL and a warning', async () => {
     const p = await launch({ HOST: '127.0.0.1', ACCESS_KEY: 'k' });
     try { assert.doesNotMatch(p.out(), /\?key=/); } finally { await p.stop(); p.cleanup(); }
-    const q = await launch({ HOST: '0.0.0.0', ACCESS_KEY: 'printed-key' });
+    const q = await launch({ HOST: '0.0.0.0', ACCESS_KEY: 'printed-key-0123456789' });
     try {
-      assert.match(q.out(), /\?key=printed-key/);
+      assert.match(q.out(), /\?key=printed-key-0123456789/);
       assert.match(q.out(), /beyond this machine/);
       assert.equal((await request(q.port, '/')).status, 401);
     } finally { await q.stop(); q.cleanup(); }
+  });
+
+  test('refuses to start with an access key shorter than 16 characters', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'op-start-'));
+    try {
+      const r = require('node:child_process').spawnSync(process.execPath, [SERVER], {
+        env: cleanEnv({ HOST: '0.0.0.0', ACCESS_KEY: 'short', PORT: '0', OPENPANOPTICON_DATA_DIR: dir,
+          OPENPANOPTICON_ENV_FILE: path.join(dir, '.env'), OPENPANOPTICON_CACHE_CONF: path.join(dir, 'cache.conf') }),
+        encoding: 'utf8', timeout: 10_000,
+      });
+      assert.equal(r.status, 1);
+      assert.match(r.stderr, /ACCESS_KEY is 5 characters; it must be at least 16/);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   });
 
   test('exits promptly on SIGTERM, even with a keep-alive connection open', async () => {

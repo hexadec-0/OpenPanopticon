@@ -45,4 +45,4 @@ surveillance hardware, get extra review in line with the README's
 - write comments as present-tense rationale (why the code is this way), not
   as a history of the debugging that got it there
 
-Security issues go through [SECURITY.md](SECURITY.md), not public issues.
+Security issues go through [SECURITY.md](../SECURITY.md), not public issues.

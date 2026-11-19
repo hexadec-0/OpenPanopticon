@@ -4,17 +4,17 @@
 #
 # OPENPANOPTICON — Chromebook (ChromeOS Linux / Crostini) helper
 #
-#   bash chromebook.sh          one-time setup: Node, .env, launcher icon
-#   bash chromebook.sh open     start in the background (if needed) and open Chrome
-#   bash chromebook.sh stop     stop a background server
-#   bash chromebook.sh log      follow the background server's log
+#   bash utils/chromebook.sh          one-time setup: Node, .env, launcher icon
+#   bash utils/chromebook.sh open     start in the background (if needed) and open Chrome
+#   bash utils/chromebook.sh stop     stop a background server
+#   bash utils/chromebook.sh log      follow the background server's log
 #
 # The launcher icon this adds runs "open", so after setup you can start
 # OpenPanopticon from the ChromeOS launcher like any other app.
 #
 set -euo pipefail
 
-cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.."   # project root
 HERE="$(pwd)"
 
 BOLD=$'\033[1m'; DIM=$'\033[2m'; GRN=$'\033[32m'; YEL=$'\033[33m'
@@ -176,7 +176,7 @@ ensure_env() {
   fi
   # It holds every API key; nobody else on this machine needs to read it.
   chmod 600 .env 2>/dev/null || true
-  chmod +x start.sh chromebook.sh 2>/dev/null || true
+  chmod +x start.sh utils/chromebook.sh 2>/dev/null || true
 }
 
 install_launcher() {
@@ -192,7 +192,7 @@ SVG
 Type=Application
 Name=OpenPanopticon
 Comment=OSINT data fusion globe
-Exec=bash "$HERE/chromebook.sh" open
+Exec=bash "$HERE/utils/chromebook.sh" open
 Icon=openpanopticon
 Terminal=false
 Categories=Network;Utility;
@@ -220,7 +220,7 @@ setup() {
   say ""
   say "  Done. Start it from the launcher icon, or here with:"
   say "    ${BOLD}./start.sh${RST}            (in this terminal; ctrl-c stops it)"
-  say "    ${BOLD}bash chromebook.sh open${RST}  (in the background)"
+  say "    ${BOLD}bash utils/chromebook.sh open${RST}  (in the background)"
   say "  It opens at ${CYN}http://$(hostname).linux.test:$(port)${RST}"
   say ""
 }
@@ -277,5 +277,5 @@ case "${1:-setup}" in
   open)  open_app ;;
   stop)  stop_app ;;
   log)   [ -f "$LOG" ] || die "  No log yet at $LOG"; tail -f "$LOG" ;;
-  *)     die "  usage: bash chromebook.sh [setup|open|stop|log]" ;;
+  *)     die "  usage: bash utils/chromebook.sh [setup|open|stop|log]" ;;
 esac

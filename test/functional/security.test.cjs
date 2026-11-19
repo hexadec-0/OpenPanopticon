@@ -247,21 +247,60 @@ describe('server bound beyond loopback (access key)', () => {
     assert.equal((await s.request('/', { headers: { Cookie: 'op_access=wrong' } })).status, 401);
   });
 
-  test('the right key is exchanged for an HttpOnly, SameSite=Strict cookie and dropped from the URL', async () => {
+  test('the right key is exchanged for an expiring session cookie that does not hold the key', async () => {
     const r = await s.request(`/?key=${KEY}&keep=1`);
     assert.equal(r.status, 303);
     assert.equal(r.headers.location, '/?keep=1');
     const cookie = r.headers['set-cookie'][0];
-    assert.match(cookie, new RegExp(`^op_access=${KEY};`));
+    assert.match(cookie, /^op_session=[0-9a-z]+\.[A-Za-z0-9_-]{43};/);
+    assert.ok(!cookie.includes(KEY), 'the cookie must not carry the access key');
     assert.match(cookie, /HttpOnly/);
     assert.match(cookie, /SameSite=Strict/);
     assert.match(cookie, /Path=\//);
+    assert.match(cookie, /Max-Age=\d+/);
+    assert.doesNotMatch(cookie, /Secure/, 'plain http gets no Secure flag');
   });
 
-  test('the cookie then opens both the page and the API', async () => {
-    const headers = { Cookie: `other=1; op_access=${KEY}` };
+  test('behind a TLS proxy the session cookie is Secure', async () => {
+    const r = await s.request(`/?key=${KEY}`, { headers: { 'X-Forwarded-Proto': 'https' } });
+    assert.match(r.headers['set-cookie'][0], /; Secure/);
+  });
+
+  test('the session cookie then opens both the page and the API', async () => {
+    const session = (await s.request(`/?key=${KEY}`)).headers['set-cookie'][0].split(';')[0];
+    const headers = { Cookie: `other=1; ${session}` };
     assert.equal((await s.request('/', { headers })).status, 200);
     assert.equal((await s.api('/api/health', {}, { headers })).status, 200);
+  });
+
+  test('a forged, tampered or expired session is refused', async () => {
+    const good = s.mod.sessionToken();
+    const [issued, mac] = good.split('.');
+    const old = s.mod.sessionToken(Date.now() - 31 * 86400e3);
+    for (const bad of [`${issued}.${'A'.repeat(43)}`, `${(parseInt(issued, 36) + 1).toString(36)}.${mac}`, old, 'x.y', '']) {
+      assert.equal((await s.request('/', { headers: { Cookie: `op_session=${bad}` } })).status, 401, bad);
+    }
+  });
+
+  test('the raw key in a cookie is honoured from this machine only (local scripts)', () => {
+    const req = (addr) => ({ headers: { cookie: `op_access=${KEY}` }, socket: { remoteAddress: addr } });
+    assert.equal(s.mod.authorised(req('127.0.0.1')), true);
+    assert.equal(s.mod.authorised(req('::ffff:127.0.0.1')), true);
+    assert.equal(s.mod.authorised(req('::1')), true);
+    assert.equal(s.mod.authorised(req('192.168.1.20')), false);
+    assert.equal(s.mod.authorised(req('172.17.0.1')), false);
+  });
+
+  test('wrong keys are throttled per address, and a valid session still works', async () => {
+    s.mod.authFails.clear();
+    for (let i = 0; i < s.mod.AUTH_FAIL_MAX; i++) assert.equal((await s.request(`/?key=wrong-${i}`)).status, 401);
+    const blocked = await s.request(`/?key=${KEY}`);
+    assert.equal(blocked.status, 429, 'even the right key waits once the limit is reached');
+    assert.ok(Number(blocked.headers['retry-after']) > 0);
+    const headers = { Cookie: `op_session=${s.mod.sessionToken()}` };
+    assert.equal((await s.request('/', { headers })).status, 200);
+    s.mod.authFails.clear();
+    assert.equal((await s.request(`/?key=${KEY}`)).status, 303);
   });
 
   test('a generated key is used when none is configured', async () => {

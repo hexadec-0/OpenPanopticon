@@ -10,7 +10,13 @@
 #   ACCESS_KEY     a long random string; open http://<host>:8420/?key=<it> once
 #   ALLOWED_HOSTS  the address you type in the browser, with port,
 #                  e.g. 192.168.1.50:8420,panopticon.lan:8420
-# See DOCKER.md for the full list.
+# See utils/DOCKER.md for the full list.
+#
+# From the command line:   docker compose -f docker/docker-compose.yml up -d
+
+# Pinned so the project (and its volume) keeps the same name now that this
+# file lives in docker/ rather than the project root.
+name: openpanopticon
 
 services:
   openpanopticon:

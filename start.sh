@@ -4,7 +4,7 @@
 #
 # OPENPANOPTICON — OSINT Data Fusion
 # Launcher for Linux, macOS and Chromebook Linux. Windows: run START.bat instead.
-# First time on a Chromebook? Run   bash chromebook.sh   once.
+# First time on a Chromebook? Run   bash utils/chromebook.sh   once.
 #
 set -euo pipefail
 
@@ -36,7 +36,7 @@ if is_crostini && ! command -v node >/dev/null 2>&1; then
   die "
   Node.js was not found. On a Chromebook, run the one-time setup first:
 
-    bash chromebook.sh
+    bash utils/chromebook.sh
 "
 fi
 
@@ -56,7 +56,7 @@ NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
 if [ "$NODE_MAJOR" -lt 22 ]; then
   if is_crostini; then
     die "  Node $(node -v) is too old — OpenPanopticon needs 22 or newer.
-  Run   bash chromebook.sh   to install a current version."
+  Run   bash utils/chromebook.sh   to install a current version."
   fi
   die "  Node $(node -v) is too old — OpenPanopticon needs 22 or newer (built-in fetch and WebSocket)."
 fi
@@ -138,8 +138,10 @@ fi
 open_browser() {
   for _ in $(seq 1 40); do
     if command -v curl >/dev/null 2>&1; then
-      curl -sf -o /dev/null -H 'X-Panopticon: 1' ${ACCESS_KEY:+-b "op_access=${ACCESS_KEY}"} \
-        "${LOCAL_URL}/api/health" && break
+      # The key goes to curl on stdin, not the command line, so it never
+      # shows up in `ps` for other users of this machine.
+      { [ -n "${ACCESS_KEY:-}" ] && printf 'cookie = "op_access=%s"\n' "$ACCESS_KEY"; true; } \
+        | curl -sf -o /dev/null -K - -H 'X-Panopticon: 1' "${LOCAL_URL}/api/health" && break
     else
       sleep 0.25
     fi

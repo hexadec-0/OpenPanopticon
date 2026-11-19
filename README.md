@@ -86,7 +86,7 @@ docker run -d -p 8420:8420 -v openpanopticon-data:/data \
   -e SHODAN_API_KEY=... YOUR_DOCKERHUB_USER/openpanopticon
 ```
 
-See [DOCKER.md](DOCKER.md) for the Portainer stack, every variable, and how
+See [DOCKER.md](utils/DOCKER.md) for the Portainer stack, every variable, and how
 the image is published.
 
 > [!WARNING]
@@ -635,6 +635,8 @@ providers/           runtime data written by the server, never committed:
                      response cache, downloaded TLE copies, diagnostics
 package.json         Node engine, scripts. No runtime dependencies
 test/                the test suite (see test/README.md)
+utils/               DOCKER and CONTRIBUTING docs, Chromebook setup,
+                     release-zip builders
 demo/                static GitHub Pages demo (see demo/README.md;
                      live at https://hexadec-0.github.io/OpenPanopticon/)
 docs/                the built demo, once captured (served by GitHub Pages)

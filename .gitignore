@@ -17,3 +17,6 @@ node_modules/
 
 # Cache retention settings. Written with the defaults on first start; yours to edit.
 /cache.conf
+
+# Release zips built by utils/release.sh and utils/release.bat
+/dist/

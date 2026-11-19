@@ -2,13 +2,13 @@
 #
 # OpenPanopticon container image. Every setting from .env.example is read from
 # the environment, so configure it with `docker run -e`, a compose file, or the
-# Env tab in Portainer. See DOCKER.md.
+# Env tab in Portainer. See utils/DOCKER.md.
 
 FROM node:22-alpine
 
 # A container is reached through its published port, never its own loopback,
 # so it listens on every interface. The server then requires ALLOWED_HOSTS and
-# an ACCESS_KEY (see DOCKER.md); nothing about that check is relaxed here.
+# an ACCESS_KEY (see utils/DOCKER.md); nothing about that check is relaxed here.
 ENV NODE_ENV=production \
     HOST=0.0.0.0 \
     PORT=8420 \

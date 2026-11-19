@@ -2,7 +2,7 @@
 
 The image holds only `server.js` and `public/` on Node 22 Alpine. It runs as
 the unprivileged `node` user and keeps its cache on a `/data` volume. Every
-setting in [`.env.example`](.env.example) is an ordinary environment variable,
+setting in [`.env.example`](../.env.example) is an ordinary environment variable,
 so you can set them with `docker run -e`, a compose file, or Portainer's Env
 tab. You don't need a `.env` file.
 
@@ -29,7 +29,7 @@ network-exposure checks are always on:
 
 | Variable | What to put in it |
 |---|---|
-| `ACCESS_KEY` | Any long random string. If you leave it empty, a new key is generated on every restart and printed in the container log. Set it so the key stays the same. |
+| `ACCESS_KEY` | Any random string of 16 characters or more (the server refuses to start with a shorter one). The browser gets a session cookie that expires after 30 days, not the key itself; ten wrong keys from one address lock that address out for 15 minutes. If you leave it empty, a new key is generated on every restart and printed in the container log. Set it so the key stays the same. |
 | `ALLOWED_HOSTS` | Every address you'll type into the browser, **with the port you browse to**, comma-separated. Example: `192.168.1.50:8420,nas.lan:8420,osint.example.com`. If you publish on a different port (`-p 9000:8420`), list `:9000`. Behind a reverse proxy on 443/80, list the bare host name. |
 
 If the page shows **Misdirected request** (HTTP 421), the container log names
@@ -42,8 +42,8 @@ the exact `Host` it refused. Add that value to `ALLOWED_HOSTS`.
 > own user.** Anyone with the address and the access key can open it at the same
 > time, and nothing on the globe is shared between them. Each browser keeps its
 > own layers, filters, optical mode, label style, pinned home, and the features
-> it has already fetched (see [Settings persistence](README.md#settings-persistence)
-> and [In the browser](README.md#in-the-browser)). Two people looking at the
+> it has already fetched (see [Settings persistence](../README.md#settings-persistence)
+> and [In the browser](../README.md#in-the-browser)). Two people looking at the
 > "same" map are really two separate sessions: one person's changes never show
 > up on the other's screen. To share a view, send the coordinates or a
 > screenshot. A link to the server won't carry it over.
@@ -56,7 +56,7 @@ the exact `Host` it refused. Add that value to `ALLOWED_HOSTS`.
 ## Portainer
 
 **As a stack (recommended):** go to *Stacks → Add stack → Web editor* and paste
-[`docker-compose.yml`](docker-compose.yml). Under *Environment variables*, add
+[`docker/docker-compose.yml`](../docker/docker-compose.yml). Under *Environment variables*, add
 `IMAGE`, `ACCESS_KEY`, `ALLOWED_HOSTS` and whichever API keys you have. You can
 also use *Load variables from .env file* to upload your existing `.env`. To
 change a key later, edit the variable and click *Update the stack*.
@@ -107,7 +107,7 @@ Portainer, use *Recreate → Re-pull image*, or *Update the stack* with
 
 ## Publishing the image (maintainers)
 
-[`.github/workflows/docker.yml`](.github/workflows/docker.yml) builds
+[`.github/workflows/docker.yml`](../.github/workflows/docker.yml) builds
 `linux/amd64` and `linux/arm64` and pushes `latest` and `sha-<commit>` to
 Docker Hub on every push to `main`. Before it can push, add two repository
 secrets under *Settings → Secrets and variables → Actions*:
