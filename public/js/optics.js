@@ -156,48 +156,11 @@ const SAR = `${COMMON}
   }
 `;
 
-/* ------------------------------------------------------------------ */
-/* CEL — posterised, ink-outlined. The "why does surveillance have to  */
-/* look grim" mode.                                                    */
-/* ------------------------------------------------------------------ */
-const CEL = `${COMMON}
-  void main() {
-    vec2 uv = v_textureCoordinates;
-    vec2 px = 1.0 / resolution;
-    vec3 src = texture(colorTexture, uv).rgb;
-
-    // Quantise to paint bands.
-    vec3 posterised = floor(src * 6.0 + 0.5) / 6.0;
-
-    // Lift saturation the way cel paint does.
-    float l = luma(posterised);
-    posterised = mix(vec3(l), posterised, 1.45);
-
-    // Ink line from a luminance Sobel.
-    float tl = luma(texture(colorTexture, uv + vec2(-1.0,  1.0) * px).rgb);
-    float t  = luma(texture(colorTexture, uv + vec2( 0.0,  1.0) * px).rgb);
-    float tr = luma(texture(colorTexture, uv + vec2( 1.0,  1.0) * px).rgb);
-    float lf = luma(texture(colorTexture, uv + vec2(-1.0,  0.0) * px).rgb);
-    float rt = luma(texture(colorTexture, uv + vec2( 1.0,  0.0) * px).rgb);
-    float bl = luma(texture(colorTexture, uv + vec2(-1.0, -1.0) * px).rgb);
-    float bt = luma(texture(colorTexture, uv + vec2( 0.0, -1.0) * px).rgb);
-    float br = luma(texture(colorTexture, uv + vec2( 1.0, -1.0) * px).rgb);
-    float gx = (tr + 2.0 * rt + br) - (tl + 2.0 * lf + bl);
-    float gy = (tl + 2.0 * t  + tr) - (bl + 2.0 * bt + br);
-    float ink = 1.0 - smoothstep(0.12, 0.42, length(vec2(gx, gy)));
-
-    vec3 col = posterised * ink;
-    col = mix(col, col * vec3(1.03, 1.01, 0.94), 0.6);  // warm daylight grade
-    out_FragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
-  }
-`;
-
 export const OPTICAL_MODES = {
   eo:   { label: 'EO',   caption: 'Electro-optical — unfiltered',      shader: null, hud: '#39ff88' },
   flir: { label: 'FLIR', caption: 'Thermal infrared — ironbow',        shader: FLIR, hud: '#ffb45c' },
   sar:  { label: 'SAR',  caption: 'Synthetic aperture radar — X-band', shader: SAR,  hud: '#9fd8ff' },
   crt:  { label: 'CRT',  caption: 'Analogue downlink — 1987',          shader: CRT,  hud: '#8cff6b' },
-  cel:  { label: 'CEL',  caption: 'Non-photorealistic — cel shaded',   shader: CEL,  hud: '#ffd4a3' },
 };
 
 export class OpticsController {

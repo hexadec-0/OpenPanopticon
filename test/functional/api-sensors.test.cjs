@@ -74,6 +74,46 @@ describe('/api/netinfra', () => {
     assert.equal(d.nodes[0].id, 'tor:US', 'busiest first');
   });
 
+  test('Mesh / LoRa: Meshtastic and MeshCore nodes in the view, freshest first', async () => {
+    const d = (await s.api('/api/netinfra', { bbox: BBOX, sources: 'mesh' })).json();
+    assert.deepEqual(d.problems, {});
+    assert.equal(d.sources.mesh.available, true);
+    assert.deepEqual(d.nodes.map((n) => n.id).sort(),
+      ['meshcore:aaaaaaaaaaaaaaaa', 'meshtastic:7', 'meshtastic:9197318']);
+    const r = d.nodes.find((n) => n.id === 'meshtastic:9197318');
+    assert.equal(r.title, 'Testville Ridge Router');
+    assert.equal(r.subtitle, 'Meshtastic · Router Late · SEEED_SOLAR_NODE');
+    assert.equal(r.detail['Node ID'], '!008c5706');
+    assert.equal(r.radius, 730, '15 bits of position is about ±730 m');
+    assert.ok(Math.abs(r.lat - 35.01) < 1e-6);
+    assert.equal(d.nodes.find((n) => n.id === 'meshtastic:7').radius, null, 'full precision has no blur');
+    const c = d.nodes.find((n) => n.network === 'MeshCore');
+    assert.equal(c.subtitle, 'MeshCore · Repeater');
+    assert.equal(c.detail.Radio, '910.525 MHz, BW 62.5 kHz, SF7, CR 4/5');
+    assert.ok(!JSON.stringify(c).includes('fffffff'), 'who uploaded a node is not passed on');
+    assert.equal(d.nodes[0].id, 'meshtastic:9197318', 'most recently heard first');
+  });
+
+  test('Mesh / LoRa: each world file is fetched once and held across views', async () => {
+    await s.api('/api/netinfra', { bbox: BBOX, sources: 'mesh' });
+    const far = (await s.api('/api/netinfra', { bbox: '51,-1,52,0', sources: 'mesh' })).json();
+    assert.deepEqual(far.nodes.map((n) => n.id), ['meshtastic:8']);
+    assert.equal(s.mock.callsTo('meshmap.net').length, 1);
+    assert.equal(s.mock.callsTo('map.meshcore.io').length, 1);
+  });
+
+  test('Mesh / LoRa: one network down is a problem, not an empty layer', async () => {
+    s.mock.fail('map.meshcore.io', 503);
+    const d = (await s.api('/api/netinfra', { bbox: BBOX, sources: 'mesh' })).json();
+    assert.equal(d.bySource.mesh, 2);
+    assert.match(d.problems.mesh, /MeshCore: .*503/);
+    s.mock.fail('meshmap.net', 503);
+    s.mod.cache.clear(); await s.mod.clearDiskCache();
+    const both = (await s.api('/api/netinfra', { bbox: BBOX, sources: 'mesh' })).json();
+    assert.ok(both.problems.mesh);
+    assert.equal(both.bySource.mesh, undefined);
+  });
+
   test('without keys, cells and WiFi are unavailable and not called', async () => {
     const t = await startServer();
     try {

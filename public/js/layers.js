@@ -1509,6 +1509,10 @@ export class FlightLayer extends Layer {
     super(viewer, 'flights', 'Live aircraft');
     this.showLabels = true;
     this.showTrails = true;
+    // Only contacts the aggregator's database flags as military.
+    this.militaryOnly = false;
+    this.feed = null;
+    this.problems = {};
     this.trails = new Map();   // icao24 -> { pos: Cartesian3[], at: number[] }
     this.trailMaxAgeMs = TRAIL_MAX_AGE_MS;   // aircraft.trails in cache.conf
     // Dead-reckoning anchors: icao24 -> the last reported fix plus the motion
@@ -1641,10 +1645,13 @@ export class FlightLayer extends Layer {
     this.creditFloor = data.creditFloor ?? null;
     this.coveredBbox = data.covered || null;
     this.authenticated = data.authenticated;
+    this.feed = data.feed || null;
+    this.problems = data.problems || {};
 
     const live = new Set();
+    const shown = this.militaryOnly ? data.aircraft.filter((a) => a.military) : data.aircraft;
 
-    for (const a of data.aircraft) {
+    for (const a of shown) {
       live.add(a.icao24);
       const alt = a.onGround ? 0 : (a.altitude || 0);
       const pos = Cesium.Cartesian3.fromDegrees(a.lon, a.lat, alt);
@@ -1683,6 +1690,7 @@ export class FlightLayer extends Layer {
       const climbing = (a.verticalRate || 0) > 1.5;
       const descending = (a.verticalRate || 0) < -1.5;
       const tint = emergency ? '#ff2d55'
+        : a.military ? '#c77dff'
         : a.onGround ? '#8b949e'
         : climbing ? '#7ee787'
         : descending ? '#ffa657'
@@ -1748,7 +1756,7 @@ export class FlightLayer extends Layer {
       const ftLabel = a.altitude ? `${Math.round(a.altitude * 3.28084 / 100) * 100}ft` : 'GND';
       const ktLabel = a.velocity ? `${Math.round(a.velocity * 1.94384)}kt` : '';
       ent.label.show = this.showLabels;
-      ent.label.text = `${a.callsign || a.icao24.toUpperCase()}\n${ftLabel} ${ktLabel}`
+      ent.label.text = `${a.callsign || a.icao24.toUpperCase()}${a.military ? ' · MIL' : ''}\n${ftLabel} ${ktLabel}`
         + (emergency ? `\n⚠ ${a.alert}` : '');
       ent.label.fillColor = Cesium.Color.fromCssColorString(tint);
       ent.properties = new Cesium.PropertyBag({ layer: 'flights', record: a });
@@ -1764,17 +1772,21 @@ export class FlightLayer extends Layer {
       }
     }
 
-    this.count = data.aircraft.length;
+    this.count = shown.length;
+    this.military = data.aircraft.filter((a) => a.military).length;
     this.resolutionSec = data.resolutionSec || this.resolutionSec;
     this.dropped = data.dropped || 0;
   }
 
   detail(rec) {
     const fpm = rec.verticalRate ? Math.round(rec.verticalRate * 196.85) : 0;
+    const integrity = rec.nic != null || rec.nacp != null
+      ? `NIC ${rec.nic ?? '?'} · NACp ${rec.nacp ?? '?'}${(rec.nic != null && rec.nic < 7) || (rec.nacp != null && rec.nacp < 8) ? ' — degraded, possible GNSS interference' : ''}`
+      : null;
     return {
-      kind: 'AIR CONTACT',
+      kind: rec.military ? 'AIR CONTACT · MILITARY' : 'AIR CONTACT',
       title: rec.callsign || rec.icao24.toUpperCase(),
-      accent: rec.alert ? '#ff2d55' : '#58d3ff',
+      accent: rec.alert ? '#ff2d55' : rec.military ? '#c77dff' : '#58d3ff',
       html: `
         ${rec.alert ? `<div class="alarm">SQUAWK ${rec.squawk} — ${esc(rec.alert)}</div>` : ''}
         <div data-slot="routehead"></div>
@@ -1782,8 +1794,12 @@ export class FlightLayer extends Layer {
         <div data-slot="inset"></div>
         <table>${rows([
           ['ICAO24', rec.icao24.toUpperCase()],
+          ['Registration', rec.registration],
+          ['Type', [rec.aircraftType, rec.typeDescription].filter(Boolean).join(' · ') || null],
           ['Registered', rec.country],
           ['Category', rec.category],
+          ['Military', rec.military ? 'yes (aggregator database flag)' : null],
+          ['Privacy list', rec.privacyBlocked ? 'LADD / PIA — hidden on filtered trackers' : null],
           ['Position', `${rec.lat.toFixed(4)}, ${rec.lon.toFixed(4)}`],
           ['Altitude', rec.onGround ? 'on ground'
             : `${Math.round((rec.altitude || 0) * 3.28084).toLocaleString()} ft`],
@@ -1796,6 +1812,8 @@ export class FlightLayer extends Layer {
           // heard from, and then its position is a memory, not a fix.
           ['Position age', rec.ageSec == null ? 'unknown'
             : rec.ageSec < 10 ? 'live' : `${rec.ageSec}s ago`],
+          ['Nav integrity', integrity],
+          ['Heard by', Array.isArray(rec.sources) ? rec.sources.join(', ') + (rec.mlat ? ' (MLAT)' : '') : null],
         ])}</table>
         <div data-slot="route"><p class="hint pending">Looking up route and airframe…</p></div>
         <a class="ext" href="https://globe.adsbexchange.com/?icao=${encodeURIComponent(rec.icao24)}"
@@ -2790,7 +2808,8 @@ export class EventLayer extends Layer {
     // Hazards resolve, so keep them a shorter time than static infrastructure.
     this.accumulate = true;
     this.cacheTtlMs = CURRENT_COVERAGE_MS;
-    this.sources = new Set(['gdacs', 'eonet', 'usgs', 'nws']);
+    // The keyless official feeds.
+    this.sources = new Set(['gdacs', 'eonet', 'usgs', 'nws', 'emsc', 'tfr', 'meteoalarm', 'cems', 'odin', 'acled']);
     this.minSeverity = 'info';
     this.showPolygons = true;
     this.bySource = {};
@@ -2812,7 +2831,11 @@ export class EventLayer extends Layer {
     this.zoneOnly = data.zoneOnlyAlerts || 0;
     this.remember(data.events);
     this.redraw();
-    if (Object.keys(this.problems).length && !this.count) {
+    // The layer has failed only when no source answered. One source down in
+    // a quiet view (nothing else to draw there) is a note in the count's
+    // tooltip, not an error naming that source as if the layer were broken.
+    const answered = Object.keys(data.bySource || {}).length;
+    if (Object.keys(this.problems).length && !answered) {
       throw new Error(Object.values(this.problems)[0]);
     }
   }
@@ -2830,6 +2853,35 @@ export class EventLayer extends Layer {
     for (const e of visible) {
       const style = SEVERITY_STYLE[e.severity] || SEVERITY_STYLE.info;
       const color = Cesium.Color.fromCssColorString(style.color);
+
+      // A flight restriction is an area, not a point: its outline and one
+      // pin at the middle, with no fill or halo to swamp the map.
+      if (e.source === 'tfr') {
+        if (this.showPolygons && e.polygon?.length > 2) {
+          this.source.entities.add({
+            polyline: {
+              positions: Cesium.Cartesian3.fromDegreesArray([...e.polygon, e.polygon[0]].flat()),
+              width: 2,
+              material: color.withAlpha(0.85),
+              clampToGround: true,
+            },
+            properties: { layer: 'events', record: e },
+          });
+        }
+        this.source.entities.add({
+          position: Cesium.Cartesian3.fromDegrees(e.lon, e.lat, 0),
+          billboard: {
+            image: pinSprite(style.color),
+            width: 22,
+            height: 30,
+            verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
+            heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+            disableDepthTestDistance: DEPTH_FREE_M,
+          },
+          properties: { layer: 'events', record: e },
+        });
+        continue;
+      }
 
       // Affected-area polygon, where the source provides one.
       if (this.showPolygons && e.polygon?.length > 2) {
@@ -2899,6 +2951,7 @@ export class EventLayer extends Layer {
           ['Ends', when(rec.endTime)],
           ['Affected area', rec.polygon?.length ? `polygon, ${rec.polygon.length} vertices` : null],
         ])}</table>
+        ${rec.approximate ? '<p class="hint">Placed approximately: the source gave a region, not a shape.</p>' : ''}
         ${rec.description ? `<h4>Detail</h4><p class="body">${esc(rec.description)}</p>` : ''}
         ${rec.instruction ? `<h4>Instruction</h4><p class="body">${esc(rec.instruction)}</p>` : ''}
         ${safeUrl(rec.url) ? `<a class="ext" href="${esc(safeUrl(rec.url))}" target="_blank" rel="noopener noreferrer">Open source report ↗</a>` : ''}`,
@@ -2977,6 +3030,121 @@ export class WebcamLayer extends Layer {
     if (!stage) return;
     this.stopLive();
 
+    // A YouTube live camera: the thumbnail, and YouTube's player only when
+    // asked for. Opening the panel must not be what connects to Google.
+    const ytEmbed = safeUrl(rec.youtubeEmbed, { httpsOnly: true });
+    if (ytEmbed && /^https:\/\/www\.youtube-nocookie\.com\/embed\/[\w-]{11}$/.test(ytEmbed)) {
+      const shown = [];
+      const thumb = safeUrl(rec.image, { httpsOnly: true });
+      if (thumb) {
+        const img = document.createElement('img');
+        img.className = 'cam-live';
+        img.alt = `${rec.title || 'Camera'} thumbnail`;
+        img.referrerPolicy = 'no-referrer';
+        img.setAttribute('data-hide-on-error', '');
+        img.src = thumb;
+        stage.append(img);
+        shown.push(img);
+      }
+      const play = document.createElement('button');
+      play.type = 'button';
+      play.className = 'yt-play';
+      play.textContent = '▶ Play live';
+      stage.append(play);
+      shown.push(play);
+      this.liveEls = shown;
+      play.onclick = () => {
+        play.onclick = null;
+        for (const el of shown) el.remove();
+        const frame = document.createElement('iframe');
+        frame.className = 'cam-frame';
+        frame.src = `${ytEmbed}?autoplay=1&mute=1&rel=0`;
+        // As in the YouTube layer: YouTube refuses an embed that sends no
+        // referrer, so this one sends the origin and no more.
+        frame.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-presentation allow-popups');
+        frame.setAttribute('referrerpolicy', 'strict-origin');
+        frame.setAttribute('allow', 'autoplay; encrypted-media; fullscreen; picture-in-picture');
+        frame.setAttribute('allowfullscreen', '');
+        stage.append(frame, liveBadge('live on YouTube'));
+        this.liveEls = [frame];
+      };
+      return;
+    }
+
+    // Agency cameras that stream rather than publish stills: a motion JPEG
+    // plays in an <img> as it arrives, an MP4 clip in a muted <video>, and
+    // HLS natively where the browser has it (Safari) or as a link elsewhere.
+    const mjpeg = safeUrl(rec.mjpeg, { httpsOnly: true });
+    const video = safeUrl(rec.video, { httpsOnly: true });
+    const hls = safeUrl(rec.hls, { httpsOnly: true });
+    if (mjpeg && !globalThis.OP_DEMO) {
+      const img = document.createElement('img');
+      img.className = 'cam-live';
+      img.alt = `${rec.title || 'Camera'} live stream`;
+      img.referrerPolicy = 'no-referrer';
+      img.onerror = () => { img.replaceWith(Object.assign(document.createElement('p'),
+        { className: 'hint', textContent: 'The stream is not answering right now.' })); };
+      img.src = mjpeg;
+      stage.append(img, liveBadge('live stream'));
+      this.liveEls = [img];
+      return;
+    }
+    const playable = video
+      || (hls && document.createElement('video').canPlayType?.('application/vnd.apple.mpegurl') ? hls : null);
+    if (playable && !globalThis.OP_DEMO) {
+      const v = document.createElement('video');
+      v.className = 'cam-live';
+      v.muted = true;
+      v.autoplay = true;
+      v.playsInline = true;
+      v.controls = true;
+      v.setAttribute('referrerpolicy', 'no-referrer');
+      v.src = playable;
+      stage.append(v, liveBadge('live video'));
+      this.liveEls = [v];
+      return;
+    }
+    // Elsewhere HLS plays through hls.js, loaded the first time a stream is
+    // opened. The still is the poster until the video starts, and what the
+    // panel falls back to if the stream will not play.
+    if (hls && !globalThis.OP_DEMO) {
+      const v = document.createElement('video');
+      v.className = 'cam-live';
+      v.muted = true;
+      v.autoplay = true;
+      v.playsInline = true;
+      v.controls = true;
+      const poster = safeUrl(rec.image, { httpsOnly: true });
+      if (poster) v.poster = poster;
+      const badge = liveBadge('connecting\u2026');
+      stage.append(v, badge);
+      this.liveEls = [v, badge];
+      const current = () => this.liveEls?.includes(v);
+      const fallback = (why) => {
+        if (!current()) return;
+        this.stopLive();
+        if (rec.image) { this.enrich({ ...rec, hls: null, video: null }, root); return; }
+        stage.append(Object.assign(document.createElement('p'), { className: 'hint', textContent: why }));
+      };
+      loadHlsJs().then((Hls) => {
+        if (!current()) return;
+        if (!Hls?.isSupported?.()) { fallback('This browser cannot play the live stream.'); return; }
+        const player = new Hls({ maxBufferLength: 10, liveSyncDurationCount: 2, enableWorker: true });
+        this.hlsPlayer = player;
+        player.on(Hls.Events.MANIFEST_PARSED, () => {
+          if (!current()) return;
+          badge.textContent = 'live video';
+          v.play?.()?.catch?.(() => {});
+        });
+        player.on(Hls.Events.ERROR, (_, data) => {
+          if (data?.fatal) fallback('The live stream is not answering right now.');
+        });
+        player.loadSource(hls);
+        player.attachMedia(v);
+      });
+      return;
+    }
+
     const embed = safeUrl(rec.embed, { httpsOnly: true });
     const still = safeUrl(rec.image);
     if (embed) {
@@ -2990,7 +3158,10 @@ export class WebcamLayer extends Layer {
       // and nothing that would let it touch this page.
       frame.setAttribute('sandbox',
         'allow-scripts allow-same-origin allow-presentation allow-popups');
-      frame.setAttribute('referrerpolicy', 'no-referrer');
+      // YouTube refuses an embed that sends no referrer ("Error 153"); it
+      // gets the origin and no more. Every other player gets nothing.
+      const youtube = /^(www\.)?youtube(-nocookie)?\.com$/.test(new URL(embed).hostname);
+      frame.setAttribute('referrerpolicy', youtube ? 'strict-origin' : 'no-referrer');
       frame.setAttribute('allow', 'autoplay; fullscreen; picture-in-picture');
       stage.append(frame);
       stage.append(liveBadge('live player'));
@@ -2999,7 +3170,9 @@ export class WebcamLayer extends Layer {
     }
 
     if (!still) {
-      stage.innerHTML = '<p class="hint">This camera publishes no still frame or player.</p>';
+      stage.innerHTML = hls
+        ? '<p class="hint">This camera streams HLS, which this browser cannot play here — use the link below.</p>'
+        : '<p class="hint">This camera publishes no still frame or player.</p>';
       return;
     }
 
@@ -3073,6 +3246,9 @@ export class WebcamLayer extends Layer {
    */
   stopLive() {
     this.stopRefresh();
+    // Stops its downloads, not only the picture.
+    try { this.hlsPlayer?.destroy(); } catch { /* already gone */ }
+    this.hlsPlayer = null;
     const els = this.liveEls || [];
     this.liveEls = null;
     for (const el of els) {
@@ -3096,20 +3272,37 @@ export class WebcamLayer extends Layer {
         <div data-slot="inset"></div>
         <table>${rows([
           ['Source', CAM_SOURCE_LABEL[rec.source] || rec.source],
+          ['Channel', rec.channel],
           ['Category', rec.category],
           ['Pointing', rec.pan != null ? `${Math.round(rec.pan)}° pan, ${rec.tilt}° tilt` : null],
           ['Location', rec.place],
+          ['View', rec.description],
           ['Coordinates', `${rec.lat.toFixed(5)}, ${rec.lon.toFixed(5)}`],
           ['Status', rec.status],
-          ['Updated', rec.updated],
+          [rec.source === 'ytlive' ? 'Live since' : 'Updated', rec.updated],
+          ['Placed by', CAM_PLACEMENT[rec.placement] || null],
         ])}</table>
         ${safeUrl(rec.link) ? `<a class="ext" href="${esc(safeUrl(rec.link))}" target="_blank" rel="noopener noreferrer">Open source page ↗</a>` : ''}
+        ${camFeedLink(rec)}
+        ${safeUrl(rec.channelLink) ? `<a class="ext" href="${esc(safeUrl(rec.channelLink))}" target="_blank" rel="noopener noreferrer">Channel ↗</a>` : ''}
         <p class="hint">Cameras published for public viewing by their operators.</p>`,
     };
   }
 }
 
+const CAM_PLACEMENT = {
+  geotag: 'the location its owner set',
+  named: 'a place named in its title or channel (approximate)',
+  area: 'the town it was found under (approximate)',
+};
+
 const CAM_COLOR = {
+  agency: '#e9c46a',
+  ytlive: '#ff4d6d',
+  caltrans: '#f4d35e',
+  tfl: '#3a86ff',
+  digitraffic: '#bde0fe',
+  drivebc: '#90be6d',
   windy: '#00d9a3',
   nycdot: '#ffd166',
   openwebcamdb: '#8ac6ff',
@@ -3117,13 +3310,61 @@ const CAM_COLOR = {
 };
 
 const CAM_SOURCE_LABEL = {
+  agency: 'Road agency / public camera (OSIRIS catalogue)',
   windy: 'Windy Webcams',
   nycdot: 'NYC DOT traffic camera',
   openwebcamdb: 'OpenWebcamDB (curated)',
   alertca: 'ALERTCalifornia (wildfire PTZ)',
+  ytlive: 'YouTube live camera',
+  caltrans: 'Caltrans highway camera',
+  tfl: 'TfL JamCam (London)',
+  digitraffic: 'Digitraffic road weather camera (Finland)',
+  drivebc: 'DriveBC highway camera (British Columbia)',
 };
 
 let camCache = new Map();
+/**
+ * A link to the picture or stream itself, from its operator, when that is
+ * not the page already linked: the one address that always shows what the
+ * camera sees now. Not for YouTube (the watch page is the source link) or
+ * this server's own frame route.
+ */
+let hlsLoading = null;
+/** hls.js, from this server, loaded once and only when a stream needs it. */
+function loadHlsJs() {
+  if (globalThis.Hls) return Promise.resolve(globalThis.Hls);
+  if (!document.head?.appendChild) return Promise.resolve(null);
+  hlsLoading ||= new Promise((resolve) => {
+    const s = document.createElement('script');
+    s.src = new URL('../providers/hls.light.min.js', import.meta.url).href;
+    s.onload = () => resolve(globalThis.Hls || null);
+    s.onerror = () => { hlsLoading = null; resolve(null); };
+    document.head.appendChild(s);
+  });
+  return hlsLoading;
+}
+
+function camFeedLink(rec) {
+  if (rec.youtubeEmbed) return '';
+  const feed = [rec.hls, rec.video, rec.mjpeg, rec.image]
+    .map((u) => (u && /^https?:\/\//.test(u) ? safeUrl(u) : null)).find(Boolean);
+  if (!feed || feed === safeUrl(rec.link)) return '';
+  return `<a class="ext" href="${esc(feed)}" target="_blank" rel="noopener noreferrer">Open feed ↗</a>`;
+}
+
+const pinCache = new Map();
+/** A map pin in this colour, tip at the bottom centre. */
+function pinSprite(color) {
+  if (pinCache.has(color)) return pinCache.get(color);
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 30">
+    <path d="M11 29 C11 29 2 17.5 2 11 A9 9 0 0 1 20 11 C20 17.5 11 29 11 29 Z" fill="${color}"
+          stroke="rgba(0,0,0,.65)" stroke-width="1.4"/>
+    <circle cx="11" cy="11" r="3.4" fill="rgba(0,0,0,.55)"/></svg>`;
+  const uri = `data:image/svg+xml;base64,${btoa(svg)}`;
+  pinCache.set(color, uri);
+  return uri;
+}
+
 function camSprite(color) {
   if (camCache.has(color)) return camCache.get(color);
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
@@ -3475,7 +3716,7 @@ function vesselSprite(color, moving) {
 }
 
 /* ================================================================== */
-/* NETWORK INFRASTRUCTURE — probes, cells, wireless, Tor              */
+/* NETWORK INFRASTRUCTURE — probes, cells, wireless, Tor, mesh       */
 /* ================================================================== */
 
 export class NetInfraLayer extends Layer {
@@ -3566,11 +3807,17 @@ export class NetInfraLayer extends Layer {
           ['ASN', rec.asn ? `AS${rec.asn}` : null],
           ['Country', rec.country],
           ['Coordinates', `${rec.lat.toFixed(5)}, ${rec.lon.toFixed(5)}`],
+          ['Last heard', rec.heard ? new Date(rec.heard).toLocaleString() : null],
           ...Object.entries(rec.detail || {}),
           ['Tags', rec.tags],
         ])}</table>
         ${rec.source === 'atlas' ? `<a class="ext" href="https://atlas.ripe.net/probes/${encodeURIComponent(rec.id.split(':')[1] ?? '')}/"
            target="_blank" rel="noopener">Open in RIPE Atlas ↗</a>` : ''}
+        ${rec.source === 'mesh' ? `<a class="ext" href="${rec.network === 'MeshCore'
+          ? `https://map.meshcore.io/?lat=${rec.lat.toFixed(4)}&lon=${rec.lon.toFixed(4)}&zoom=14`
+          : 'https://meshmap.net/'}" target="_blank" rel="noopener noreferrer">Open in ${esc(rec.network === 'MeshCore' ? 'MeshCore map' : 'MeshMap')} ↗</a>
+          <p class="hint">Positions are what each node broadcasts about itself. Meshtastic nodes often
+          blur theirs on purpose; the circle is that blur.</p>` : ''}
         ${rec.source === 'wigle' ? '<p class="hint">Wireless survey data is contributed by volunteers '
           + 'and reflects where a network was observed, not who owns it.</p>' : ''}`,
     };

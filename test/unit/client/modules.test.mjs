@@ -15,7 +15,7 @@ beforeEach(() => { installCesium(); dom = installDom(); });
 
 describe('optics', () => {
   test('five modes, each with a label, a caption and a HUD colour', () => {
-    assert.deepEqual(Object.keys(OPTICAL_MODES), ['eo', 'flir', 'sar', 'crt', 'cel']);
+    assert.deepEqual(Object.keys(OPTICAL_MODES), ['eo', 'flir', 'sar', 'crt']);
     for (const [k, m] of Object.entries(OPTICAL_MODES)) {
       assert.ok(m.label && m.caption, k);
       assert.match(m.hud, /^#[0-9a-f]{6}$/i, k);
@@ -24,7 +24,7 @@ describe('optics', () => {
 
   test('EO is unfiltered; every other mode is a complete fragment shader', () => {
     assert.equal(OPTICAL_MODES.eo.shader, null);
-    for (const k of ['flir', 'sar', 'crt', 'cel']) {
+    for (const k of ['flir', 'sar', 'crt']) {
       const src = OPTICAL_MODES[k].shader;
       assert.match(src, /void main\(\)/, k);
       assert.match(src, /out_FragColor\s*=/, k);

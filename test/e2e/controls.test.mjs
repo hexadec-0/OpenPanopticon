@@ -27,8 +27,8 @@ e2e('top bar, HUD and keyboard', () => {
 
   test('optics buttons switch the sensor mode, the HUD and the post-process stage', async () => {
     const labels = await page.$$eval('#optics .optic', (bs) => bs.map((b) => b.textContent));
-    assert.deepEqual(labels, ['EO', 'FLIR', 'SAR', 'CRT', 'CEL']);
-    for (const [mode, label] of [['flir', 'FLIR'], ['sar', 'SAR'], ['crt', 'CRT'], ['cel', 'CEL'], ['eo', 'EO']]) {
+    assert.deepEqual(labels, ['EO', 'FLIR', 'SAR', 'CRT']);
+    for (const [mode, label] of [['flir', 'FLIR'], ['sar', 'SAR'], ['crt', 'CRT'], ['eo', 'EO']]) {
       await page.click(`#optics .optic[data-mode="${mode}"]`);
       assert.equal(await page.$eval('body', (b) => b.dataset.mode), mode);
       assert.equal(await text$(page, '#hud-mode'), label);
@@ -105,13 +105,13 @@ e2e('top bar, HUD and keyboard', () => {
     assert.ok(Math.abs(await page.evaluate(() => WV.viewer.camera.positionCartographic.height) - 30_000) < 5);
   });
 
-  test('keys 1–5 pick the optic', async () => {
+  test('keys 1–4 pick the optic', async () => {
     await page.keyboard.press('3');
     assert.equal(await text$(page, '#hud-mode'), 'SAR');
     await page.keyboard.press('1');
     assert.equal(await text$(page, '#hud-mode'), 'EO');
-    await page.keyboard.press('9');
-    assert.equal(await text$(page, '#hud-mode'), 'EO', 'no sixth mode');
+    await page.keyboard.press('5');
+    assert.equal(await text$(page, '#hud-mode'), 'EO', 'no fifth mode');
   });
 
   test('shortcuts are ignored while typing in a field', async () => {

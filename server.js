@@ -84,9 +84,22 @@ const CFG = {
   eiaKey: (process.env.EIA_API_KEY || '').trim(),
   cloudflareToken: (process.env.CLOUDFLARE_API_TOKEN || '').trim(),
   cartoKey: (process.env.CARTO_API_KEY || '').trim(),
+  // myACLED account login, for the OAuth password grant the ACLED API takes.
+  acledEmail: (process.env.ACLED_EMAIL || '').trim(),
+  acledPassword: (process.env.ACLED_PASSWORD || '').trim(),
+  // YouTube channels whose live streams are cameras, checked whatever is in
+  // view: @handles or UC… channel ids, comma-separated.
+  ytCamChannels: parseList(process.env.YOUTUBE_CAM_CHANNELS ?? '@ncsu-sat,@caryncgovchannel'),
+  // Unfiltered community ADS-B aggregator merged with OpenSky: adsb.lol,
+  // airplanes.live, adsb.fi, or off. See ADSB_FEEDS.
+  adsbFeed: (process.env.ADSB_FEED ?? 'adsb.lol').trim().toLowerCase() || 'off',
   // 511 state feeds: "TX:key,GA:key,NY:key" — see the 511 section below.
   fiveElevenKeys: parse511(process.env.FIVE_ELEVEN_KEYS || ''),
 };
+
+function parseList(raw) {
+  return [...new Set(String(raw).split(',').map((s) => s.trim()).filter((s) => /^(@[\w.-]{3,30}|UC[\w-]{22})$/.test(s)))];
+}
 
 function parse511(raw) {
   const out = {};
@@ -140,7 +153,13 @@ const CACHE_SCHEMA = [
   ['overpass', 'alpr', '30d', 'ALPR / Flock camera layer.'],
   ['overpass', 'truncated', '1h', 'An answer that hit the item cap is incomplete, so it is held in memory\n# only, for this long, and never written to disk.'],
   ['network', 'infrastructure', '30d', 'RIPE Atlas probes, cell towers (OpenCelliD), WiFi (WiGLE), Tor relays.'],
-  ['cameras', 'directories', '14d', 'Webcam directories: NYC DOT, OpenWebcamDB, ALERTCalifornia.'],
+  ['network', 'mesh_live', '15m', 'Meshtastic nodes from meshmap.net (the whole world, one file; positions move).'],
+  ['network', 'mesh_directory', '2h', 'MeshCore nodes from map.meshcore.io (the whole world, one large file).'],
+  ['cameras', 'directories', '14d', 'Webcam directories: NYC DOT, OpenWebcamDB, ALERTCalifornia, Caltrans,\n# TfL JamCams, Digitraffic (Finland), DriveBC.'],
+  ['cameras', 'agency', '6h', 'Road-agency and public cameras from the OSIRIS catalogue, per region:\n# which cameras exist and their addresses (the pictures are always live).'],
+  ['cameras', 'youtube_live', '7d', 'YouTube live cameras found per view cell and on the listed channels:\n# which streams they are and where. Finding them costs 100-300 YouTube quota\n# units a cell, so they are held a week.'],
+  ['cameras', 'youtube_live_check', '30m', 'How often the YouTube live cameras in view are checked to still be live\n# (1 quota unit per 50 cameras).'],
+  ['cameras', 'windy', '6h', 'Windy webcams per view cell, every page of them. Positions and players\n# stay valid; Windy\'s preview-image links can expire sooner, which only\n# matters for a camera without a player.'],
   ['youtube', 'videos', '72h', 'YouTube geotagged-video searches. A search spends 100-300 units of the\n# 10,000-unit daily YouTube Data API quota, so a view is not paid for twice.'],
   ['youtube', 'window', '72h', 'How far back each YouTube search looks for uploads, counted from when\n# the search runs. A held search keeps showing the window it was asked for.'],
   ['satellites', 'elements', '14d', 'Orbital elements from CelesTrak. Only accurate near their epoch: older\n# elements put low-orbit objects tens of kilometres from where they are.'],
@@ -151,11 +170,11 @@ const CACHE_SCHEMA = [
   ['places', 'geocode', '3d', 'Place-name searches.'],
   ['places', 'seismic', '3d', 'Seismometer station lists.'],
   ['places', 'photos', '7d', 'Nearby-photo lookups on Wikimedia Commons, shown in the detail panel.'],
-  ['current', 'events', '1h', 'Hazards and alerts: GDACS, EONET, USGS, NWS, FIRMS, EDIS. An old alert\n# drawn as live is worse than none.'],
+  ['current', 'events', '1h', 'Hazards, alerts and news: GDACS, EONET, USGS, EMSC, NWS, MeteoAlarm,\n# FAA TFRs, Copernicus EMS, FIRMS, EDIS. An old alert drawn as live is worse\n# than none.'],
   ['current', 'traffic', '1h', 'Traffic incidents and cameras from 511 services.'],
   ['current', 'sensors', '1h', 'Live sensor readings (Sensor.Community).'],
   ['current', 'threats', '1h', 'Feodo botnet command-and-control list.'],
-  ['current', 'outages', '1h', 'Internet outages (IODA).'],
+  ['current', 'outages', '1h', 'Internet outages (IODA) and power outages (ODIN).'],
   ['current', 'radar', '4m', 'Weather radar frame list.'],
   ['memory', 'max_entries', '5000', 'Most answers held in memory at once. The disk copies stay; this only\n# bounds memory.'],
   ['memory', 'label_tiles', '3000', 'Place-label tiles held in memory, on top of the disk copy.'],
@@ -453,6 +472,9 @@ const VIEW_CELL_DEG = {
   // Hazard feeds and 511 are cheap per call but slow, so a coarse cell lets
   // panning around a region reuse one answer.
   events: 1.0,
+  // ODIN answers with every county's boundary in the box, so a cell is a
+  // handful of counties' outlines rather than a region's worth.
+  odin: 1.0,
   traffic: 0.5,
   atlas: 0.5,
   shake: 0.5,
@@ -462,6 +484,13 @@ const VIEW_CELL_DEG = {
   // YouTube charges 100 quota units per search page whatever the radius, so
   // a coarse cell lets panning around a city reuse one paid answer.
   youtube: 0.5,
+  // A YouTube live-camera search is 100 quota units whatever its radius, so
+  // a cell is a city and its suburbs.
+  ytlive: 0.5,
+  // Windy pages its answer 50 at a time, so the cost of a cell is the number
+  // of cameras in it rather than its size: a city's cell is several pages,
+  // open country one.
+  windy: 0.5,
   // Photo lookups are per pin. ~200 m: pins on one block share an answer,
   // and the search still starts close enough to rank by distance.
   photos: 0.002,
@@ -494,6 +523,11 @@ const VIEW_MAX_DEG = {
   // search returns are spread so thin over a region that a city in view
   // gets a handful of them.
   youtube: 2,
+  // A wide view over Europe holds thousands of cameras: every page of them
+  // would be dozens of calls for markers too dense to tell apart.
+  windy: 3,
+  odin: 4,
+  ytlive: 1,
 };
 
 /**
@@ -1651,6 +1685,136 @@ function assertOpenSkyCredit() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// UNFILTERED ADS-B — community aggregators, merged with OpenSky
+//
+// adsb.lol, airplanes.live and adsb.fi are volunteer receiver networks that
+// publish everything their feeders hear: military aircraft and the business
+// jets on the FAA's LADD/PIA block lists included. All three speak the
+// ADS-B Exchange v2 schema, so one adapter covers them. They also carry the
+// navigation-integrity fields (NIC, NACp) that show GPS interference.
+//
+// They are keyless and asked per point and radius (nautical miles, 250 at
+// most). airplanes.live allows about one request a second; the 5s cache per
+// cell keeps well under that for one browser and under it for a few.
+// ---------------------------------------------------------------------------
+
+const ADSB_FEEDS = {
+  __proto__: null,
+  'adsb.lol': {
+    label: 'adsb.lol', licence: 'ODbL',
+    url: (lat, lon, nm) => `https://api.adsb.lol/v2/point/${lat}/${lon}/${nm}`,
+  },
+  'airplanes.live': {
+    label: 'airplanes.live', licence: 'non-commercial',
+    url: (lat, lon, nm) => `https://api.airplanes.live/v2/point/${lat}/${lon}/${nm}`,
+  },
+  'adsb.fi': {
+    label: 'adsb.fi', licence: 'non-commercial',
+    url: (lat, lon, nm) => `https://opendata.adsb.fi/api/v2/lat/${lat}/lon/${lon}/dist/${nm}`,
+  },
+};
+
+const adsbFeed = () => ADSB_FEEDS[CFG.adsbFeed] || null;
+
+// ADS-B emitter categories (DO-260B) to the words OpenSky uses for them.
+const ADSB_CATEGORY = {
+  __proto__: null,
+  A1: 'Light', A2: 'Small', A3: 'Large', A4: 'High-vortex large', A5: 'Heavy',
+  A6: 'High performance', A7: 'Rotorcraft', B1: 'Glider', B2: 'Lighter-than-air',
+  B3: 'Parachutist', B4: 'Ultralight', B6: 'UAV', B7: 'Space vehicle',
+  C1: 'Emergency vehicle', C2: 'Service vehicle', C3: 'Point obstacle',
+  C4: 'Cluster obstacle', C5: 'Line obstacle',
+};
+
+const FT = 0.3048;            // feet to metres
+const KT = 0.514444;          // knots to m/s
+const FPM = 0.00508;          // feet per minute to m/s
+
+/** One aircraft from an ADSBx-v2 feed, in the shape /api/flights returns. */
+function normaliseAdsb(a, feedName) {
+  const lat = Number(a.lat ?? a.lastPosition?.lat);
+  const lon = Number(a.lon ?? a.lastPosition?.lon);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon) || !a.hex) return null;
+  const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+  const onGround = a.alt_baro === 'ground';
+  const baro = onGround ? 0 : num(a.alt_baro);
+  const geom = onGround ? null : num(a.alt_geom);
+  const rate = num(a.geom_rate) ?? num(a.baro_rate);
+  const flags = Number(a.dbFlags) || 0;
+  const squawk = a.squawk ? String(a.squawk) : null;
+  const age = num(a.seen_pos) ?? num(a.seen);
+  return {
+    // A leading ~ marks an address that is not an ICAO 24-bit one (TIS-B).
+    icao24: String(a.hex).toLowerCase(),
+    timePosition: null,
+    ageSec: age != null ? Math.round(age) : null,
+    callsign: (a.flight || '').trim() || null,
+    country: null,
+    lon, lat,
+    baroAlt: baro != null ? baro * FT : null,
+    onGround,
+    velocity: num(a.gs) != null ? a.gs * KT : null,
+    heading: num(a.track) ?? num(a.true_heading) ?? num(a.mag_heading),
+    verticalRate: rate != null ? rate * FPM : null,
+    geoAlt: geom != null ? geom * FT : null,
+    squawk,
+    alert: SQUAWK_ALERTS[squawk] || (a.emergency && a.emergency !== 'none' ? String(a.emergency).toUpperCase() : null),
+    spi: !!a.spi,
+    category: ADSB_CATEGORY[a.category] || null,
+    altitude: geom != null ? geom * FT : baro != null ? baro * FT : 0,
+    registration: a.r || null,
+    aircraftType: a.t || null,
+    typeDescription: a.desc || null,
+    military: !!(flags & 1),
+    privacyBlocked: !!(flags & 8) || !!(flags & 4),
+    nic: num(a.nic),
+    nacp: num(a.nac_p),
+    mlat: Array.isArray(a.mlat) && a.mlat.length > 0,
+    sources: [feedName],
+  };
+}
+
+/** Aircraft the configured feed hears inside the cell, or [] when it is off. */
+async function adsbAircraft(q) {
+  const feed = adsbFeed();
+  if (!feed) return null;
+  const lat = Number(((q.south + q.north) / 2).toFixed(4));
+  const lon = Number(((q.west + q.east) / 2).toFixed(4));
+  // Half the cell's diagonal, so the circle covers every corner of the box.
+  const nm = Math.min(250, Math.ceil(bboxRadiusKm(q) / 1.852) + 1);
+  const raw = await cached(`adsb:${CFG.adsbFeed}:${q.key}`, 5000, () =>
+    grab(feed.url(lat, lon, nm), {}, { label: feed.label, timeoutMs: 15000 }));
+  const list = raw.ac || raw.aircraft || [];
+  return list.map((a) => normaliseAdsb(a, CFG.adsbFeed)).filter((a) => a && inBox(q, a.lat, a.lon));
+}
+
+/**
+ * One contact per airframe from both feeds. The fresher position wins; the
+ * identity fields only one side carries (OpenSky's registration country,
+ * the aggregator's registration, type and military flag) are kept from
+ * whichever has them.
+ */
+function mergeAircraft(primary, extra) {
+  const byHex = new Map(primary.map((a) => [a.icao24, { ...a, sources: a.sources || ['opensky'] }]));
+  for (const b of extra) {
+    const a = byHex.get(b.icao24);
+    if (!a) { byHex.set(b.icao24, b); continue; }
+    const fresher = (b.ageSec ?? Infinity) < (a.ageSec ?? Infinity) ? b : a;
+    const other = fresher === a ? b : a;
+    const merged = { ...other, ...Object.fromEntries(Object.entries(fresher).filter(([, v]) => v != null)) };
+    merged.country = a.country ?? b.country;
+    merged.registration = b.registration ?? a.registration ?? null;
+    merged.aircraftType = b.aircraftType ?? a.aircraftType ?? null;
+    merged.military = !!(a.military || b.military);
+    merged.privacyBlocked = !!(a.privacyBlocked || b.privacyBlocked);
+    merged.alert = a.alert || b.alert || null;
+    merged.sources = [...new Set([...(a.sources || []), ...(b.sources || [])])];
+    byHex.set(b.icao24, merged);
+  }
+  return [...byHex.values()];
+}
+
 async function flights({ bbox }) {
   const b = parseBbox(bbox);
   if (!b) throw new UpstreamError(400, 'bbox required as south,west,north,east');
@@ -1659,7 +1823,74 @@ async function flights({ bbox }) {
   // spent a credit on every camera nudge: a 4dp bounding box names a camera
   // position, and no two of them are ever the same.
   const q = viewCell(b, 'flights');
+  const feed = adsbFeed();
 
+  const [sky, agg] = await Promise.allSettled([
+    feed ? openSkyBudgeted(q) : openSkyFlights(q),
+    adsbAircraft(q),
+  ]);
+
+  // With no aggregator, OpenSky failing is the layer failing, 429 and all.
+  if (!feed) {
+    if (sky.status === 'rejected') throw sky.reason;
+    return sky.value;
+  }
+  if (sky.status === 'rejected' && agg.status === 'rejected') throw sky.reason;
+
+  const problems = {};
+  if (sky.status === 'rejected') problems.opensky = sky.reason?.message || String(sky.reason);
+  if (agg.status === 'rejected') problems[CFG.adsbFeed] = agg.reason?.message || String(agg.reason);
+
+  const base = sky.status === 'fulfilled' ? sky.value : null;
+  const extra = agg.status === 'fulfilled' ? agg.value : [];
+  const STALE_AFTER = 120;
+  const all = mergeAircraft(base?.aircraft || [], extra);
+  const live = all.filter((a) => a.ageSec == null || a.ageSec <= STALE_AFTER);
+  const aggOk = agg.status === 'fulfilled';
+
+  return {
+    time: base?.time ?? Math.floor(Date.now() / 1000),
+    count: live.length,
+    dropped: (base?.dropped || 0) + (all.length - live.length),
+    staleAfter: STALE_AFTER,
+    // The aggregator publishes every second or so; OpenSky's slower budgeted
+    // answers are folded in whenever they come round.
+    resolutionSec: aggOk ? 5 : base.resolutionSec,
+    pollSec: aggOk ? 6 : base.pollSec,
+    credits: Number.isFinite(openSky.remaining) ? openSky.remaining : null,
+    creditFloor: OPENSKY_FLOOR,
+    covered: q.key,
+    authenticated: !!(CFG.openSkyId && CFG.openSkySecret),
+    feed: {
+      name: CFG.adsbFeed,
+      label: feed.label,
+      licence: feed.licence,
+      ok: aggOk,
+      count: extra.length,
+      military: live.filter((a) => a.military).length,
+    },
+    problems,
+    aircraft: live,
+  };
+}
+
+/**
+ * OpenSky as a contributor beside an aggregator: asked at the pace its
+ * credit budget allows, with the previous answer reused in between (its
+ * positions aged by how long it has been held). A spent budget or a 429 is
+ * then a reason to skip OpenSky, not to fail the layer.
+ */
+async function openSkyBudgeted(q) {
+  const res = (CFG.openSkyId && CFG.openSkySecret) ? 5 : 10;
+  // Held in the shared cache, so FLUSH and SYNC reach it like everything else.
+  const held = await cached(`opensky:held:${q.key}`, openSkyPollSec(res) * 1000,
+    async () => ({ at: Date.now(), value: await openSkyFlights(q) }));
+  const sec = Math.round((Date.now() - held.at) / 1000);
+  if (sec <= 0) return held.value;
+  return { ...held.value, aircraft: held.value.aircraft.map((a) => ({ ...a, ageSec: a.ageSec != null ? a.ageSec + sec : null })) };
+}
+
+async function openSkyFlights(q) {
   const url = new URL('https://opensky-network.org/api/states/all');
   url.searchParams.set('lamin', q.south.toFixed(4));
   url.searchParams.set('lomin', q.west.toFixed(4));
@@ -3280,7 +3511,123 @@ const NETINFRA_SOURCES = {
     note: 'WiGLE wardriving survey. Free accounts are heavily rate-limited.' },
   tor:   { label: 'Tor relays (by country)', color: '#7ee787', keyed: false,
     note: 'Onionoo stopped publishing per-relay coordinates, so this is country-level.' },
+  mesh:  { label: 'Mesh / LoRa', color: '#f15bb5', keyed: false,
+    note: 'Meshtastic (meshmap.net) and MeshCore (map.meshcore.io) radio nodes that publish their position.' },
 };
+
+/* --- Mesh / LoRa ------------------------------------------------------ */
+// Both maps publish their whole network as one file and take no area
+// filter, so each is fetched once for the world, slimmed to what the layer
+// draws, and held; a view is then a filter over that copy. Meshtastic
+// (meshmap.net, ~10k nodes, refreshed by its operator every minute) is held
+// for [network] mesh_live, MeshCore (map.meshcore.io, ~75k nodes, adverts
+// that change over days) for [network] mesh_directory.
+const MESHTASTIC_URL = 'https://meshmap.net/nodes.json';
+const MESHCORE_URL = 'https://map.meshcore.io/api/v1/nodes';
+const MESHCORE_TYPES = { __proto__: null, 1: 'Companion', 2: 'Repeater', 3: 'Room server', 4: 'Sensor' };
+// MeshCore keeps every node ever advertised; one silent this long is gone.
+const MESHCORE_MAX_AGE_MS = 30 * 86_400_000;
+
+const titleCaseRole = (r) => String(r).toLowerCase().split('_').map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+
+/**
+ * One meshmap.net node, or null. Positions are integers of 1e-7 degrees,
+ * truncated by the node to `precision` bits: the radius is that rounding,
+ * drawn so a deliberately blurred position is not read as exact.
+ */
+function normaliseMeshtastic(num, n) {
+  const lat = Number(n?.latitude) / 1e7;
+  const lon = Number(n?.longitude) / 1e7;
+  if (!Number.isFinite(lat) || !Number.isFinite(lon) || (!lat && !lon) || Math.abs(lat) > 90 || Math.abs(lon) > 180) return null;
+  const bits = Number(n.precision);
+  const radius = bits > 0 && bits < 32 ? Math.round(2 ** (32 - bits) * 1e-7 * 111_320 / 2) : null;
+  const heard = Math.max(0, ...Object.values(n.seenBy || {}).map(Number).filter(Number.isFinite),
+    Number(n.lastMapReport) || 0);
+  const id = Number(num);
+  return {
+    source: 'mesh',
+    id: `meshtastic:${Number.isFinite(id) ? id : clip(String(num), 20)}`,
+    lat, lon,
+    title: clip(String(n.longName || n.shortName || `!${id.toString(16).padStart(8, '0')}`).trim(), 80),
+    subtitle: ['Meshtastic', n.role ? titleCaseRole(n.role) : null, n.hwModel ? String(n.hwModel) : null]
+      .filter(Boolean).join(' · '),
+    network: 'Meshtastic',
+    radius,
+    heard: heard ? new Date(heard * 1000).toISOString() : null,
+    detail: {
+      'Node ID': Number.isFinite(id) ? `!${id.toString(16).padStart(8, '0')}` : null,
+      'Short name': n.shortName ? clip(String(n.shortName), 8) : null,
+      Region: n.region ? String(n.region) : null,
+      'Modem preset': n.modemPreset ? titleCaseRole(n.modemPreset) : null,
+      Firmware: n.fwVersion ? clip(String(n.fwVersion), 40) : null,
+      'Nodes it hears': Number.isFinite(n.onlineLocalNodes) ? n.onlineLocalNodes : null,
+      'Heard via MQTT': Object.keys(n.seenBy || {}).length || null,
+      'Position blurred to': radius ? `±${radius >= 1000 ? `${(radius / 1000).toFixed(1)} km` : `${radius} m`}` : null,
+    },
+  };
+}
+
+/** One map.meshcore.io node, or null if unplaced or silent too long. */
+function normaliseMeshcore(n, now = Date.now()) {
+  const lat = Number(n?.adv_lat);
+  const lon = Number(n?.adv_lon);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon) || (!lat && !lon) || Math.abs(lat) > 90 || Math.abs(lon) > 180) return null;
+  const heard = Date.parse(n.last_advert || n.updated_date || '');
+  if (!Number.isFinite(heard) || now - heard > MESHCORE_MAX_AGE_MS) return null;
+  const key = /^[0-9a-f]{64}$/i.test(n.public_key || '') ? n.public_key.toLowerCase() : null;
+  if (!key) return null;
+  const type = MESHCORE_TYPES[n.type] || null;
+  const p = n.params || {};
+  return {
+    source: 'mesh',
+    id: `meshcore:${key.slice(0, 16)}`,
+    lat, lon,
+    title: clip(String(n.adv_name || `MeshCore ${key.slice(0, 8)}`).trim(), 80),
+    subtitle: ['MeshCore', type].filter(Boolean).join(' · '),
+    network: 'MeshCore',
+    radius: null,
+    heard: new Date(heard).toISOString(),
+    detail: {
+      'Public key': `${key.slice(0, 16)}…`,
+      Radio: Number.isFinite(p.freq)
+        ? `${p.freq} MHz, BW ${p.bw} kHz, SF${p.sf}, CR 4/${p.cr}` : null,
+      'Listed since': n.inserted_date ? String(n.inserted_date).slice(0, 10) : null,
+    },
+  };
+}
+
+async function meshtasticWorld() {
+  return cachedPersistent('mesh:meshtastic:world', RETAIN['network.mesh_live'], async () => {
+    const raw = await grab(MESHTASTIC_URL, {}, { label: 'meshmap.net', timeoutMs: 60000 });
+    if (!raw || typeof raw !== 'object') throw new UpstreamError(502, 'meshmap.net returned no node list');
+    return Object.entries(raw).map(([k, v]) => normaliseMeshtastic(k, v)).filter(Boolean);
+  });
+}
+
+async function meshcoreWorld() {
+  return cachedPersistent('mesh:meshcore:world', RETAIN['network.mesh_directory'], async () => {
+    const raw = await grab(MESHCORE_URL, {}, { label: 'MeshCore map', timeoutMs: 120000 });
+    if (!Array.isArray(raw)) throw new UpstreamError(502, 'map.meshcore.io returned no node list');
+    const now = Date.now();
+    return raw.map((n) => normaliseMeshcore(n, now)).filter(Boolean);
+  });
+}
+
+async function meshNodes(b) {
+  const nets = [['Meshtastic', meshtasticWorld], ['MeshCore', meshcoreWorld]];
+  const settled = await Promise.allSettled(nets.map(([, f]) => f()));
+  const out = [];
+  const failed = [];
+  settled.forEach((s, i) => {
+    if (s.status === 'rejected') { failed.push(`${nets[i][0]}: ${s.reason?.message || s.reason}`); return; }
+    for (const n of s.value) if (inBox(b, n.lat, n.lon)) out.push(n);
+  });
+  if (failed.length === nets.length) throw new UpstreamError(502, failed.join('; '));
+  // Most recently heard first, so the cap on the answer drops the stalest.
+  out.sort((x, y) => String(y.heard || '').localeCompare(String(x.heard || '')));
+  if (failed.length) out.problem = failed.join('; ');
+  return out;
+}
 
 /* --- RIPE Atlas ------------------------------------------------------ */
 async function atlasProbes(raw_b) {
@@ -3459,14 +3806,14 @@ async function torRelays(b) {
 
 const NETINFRA_FETCHERS = {
   __proto__: null,
-  atlas: atlasProbes, cell: cellTowers, wigle: wigleNetworks, tor: torRelays,
+  atlas: atlasProbes, cell: cellTowers, wigle: wigleNetworks, tor: torRelays, mesh: meshNodes,
 };
 
 async function netinfra({ bbox, sources }) {
   const b = parseBbox(bbox);
   if (!b) throw new UpstreamError(400, 'bbox required as south,west,north,east');
 
-  const want = String(sources || 'atlas,cell,wigle,tor')
+  const want = String(sources || 'atlas,cell,wigle,tor,mesh')
     .split(',').map((s) => s.trim()).filter((s) => NETINFRA_FETCHERS[s]);
   if (!want.length) throw new UpstreamError(400, 'no valid sources requested');
 
@@ -3479,6 +3826,7 @@ async function netinfra({ bbox, sources }) {
     const name = want[i];
     if (r.status === 'rejected') { problems[name] = r.reason?.message || String(r.reason); return; }
     bySource[name] = r.value.length;
+    if (r.value.problem) problems[name] = r.value.problem;
     nodes.push(...r.value);
   });
 
@@ -4562,31 +4910,113 @@ function cloudSource(rainviewerFrames) {
 // WEBCAMS — intentionally-public cameras only
 // ---------------------------------------------------------------------------
 
-async function windyWebcams(b) {
-  if (!CFG.windyKey) return [];
-  const url = new URL('https://api.windy.com/webcams/api/v3/webcams');
-  url.searchParams.set('bbox', `${b.north},${b.east},${b.south},${b.west}`);
-  url.searchParams.set('limit', '50');
-  url.searchParams.set('include', 'location,images,player,urls');
-  const raw = await grab(url, { headers: { 'x-windy-api-key': CFG.windyKey } }, { label: 'Windy' });
-  return (raw.webcams || []).map((w) => ({
+/**
+ * Windy — worldwide public webcams.
+ *
+ * Windy answers at most 50 cameras a call and refuses offsets past 1,000, so
+ * one call over a city shows an arbitrary 50 and silently drops the rest.
+ * Each snapped cell is therefore paged to the end, and a cell too dense to
+ * page within the offset limit is split into quarters, each paged in turn.
+ *
+ * WINDY_MAX_CALLS bounds what one cell may cost; a cell that hits it says so
+ * in `truncated` rather than passing a partial answer off as the whole.
+ */
+const WINDY_URL = 'https://api.windy.com/webcams/api/v3/webcams';
+const WINDY_PAGE = 50;
+const WINDY_MAX_OFFSET = 1000;
+const WINDY_MAX_CALLS = 40;
+const WINDY_MAX_SPLIT = 2;
+
+function normaliseWindy(w, extra = {}) {
+  const lat = w.location?.latitude;
+  const lon = w.location?.longitude;
+  if (lat == null || lon == null) return null;
+  return {
     source: 'windy',
     id: `windy:${w.webcamId}`,
     title: w.title,
-    lat: w.location?.latitude,
-    lon: w.location?.longitude,
+    lat, lon,
     place: [w.location?.city, w.location?.country].filter(Boolean).join(', ') || null,
+    category: (w.categories || []).map((c) => c?.name || c?.id || c).filter((c) => typeof c === 'string')[0] || null,
     status: w.status,
     updated: w.lastUpdatedOn || null,
     image: safeUrl(w.images?.current?.preview || w.images?.current?.thumbnail),
     embed: safeUrl(w.player?.day || w.player?.live, { httpsOnly: true }),
     link: safeUrl(w.urls?.detail),
-  })).filter((w) => w.lat != null && w.lon != null);
+    ...extra,
+  };
+}
+
+/** Every camera in one box, paged; splits the box when it is too dense to page. */
+async function windyBox(box, budget, out, depth = 0) {
+  let total = null;
+  for (let offset = 0; offset <= WINDY_MAX_OFFSET; offset += WINDY_PAGE) {
+    if (budget.calls >= WINDY_MAX_CALLS) { budget.truncated = true; return; }
+    const url = new URL(WINDY_URL);
+    url.searchParams.set('bbox', `${box.north},${box.east},${box.south},${box.west}`);
+    url.searchParams.set('limit', String(WINDY_PAGE));
+    url.searchParams.set('offset', String(offset));
+    url.searchParams.set('include', 'location,images,player,urls,categories');
+    budget.calls++;
+    let raw;
+    try {
+      raw = await grab(url, { headers: { 'x-windy-api-key': CFG.windyKey } }, { label: 'Windy' });
+    } catch (e) {
+      // Past the last offset Windy allows, it answers 400. With pages
+      // already in hand that is the end of what this box can give, not a
+      // failure of the layer.
+      if (e.status === 400 && offset > 0) break;
+      throw e;
+    }
+    // Too dense to page within the offset limit: quarter it and page each
+    // quarter instead, rather than keep the first thousand and drop the rest.
+    total = Number.isFinite(raw.total) ? raw.total : total;
+    if (offset === 0 && total > WINDY_MAX_OFFSET + WINDY_PAGE && depth < WINDY_MAX_SPLIT) {
+      const midLat = (box.south + box.north) / 2;
+      const midLon = (box.west + box.east) / 2;
+      for (const q of [
+        { south: box.south, west: box.west, north: midLat, east: midLon },
+        { south: box.south, west: midLon, north: midLat, east: box.east },
+        { south: midLat, west: box.west, north: box.north, east: midLon },
+        { south: midLat, west: midLon, north: box.north, east: box.east },
+      ]) await windyBox(q, budget, out, depth + 1);
+      return;
+    }
+    const list = raw.webcams || [];
+    for (const w of list) {
+      const n = normaliseWindy(w);
+      if (n && !out.has(n.id)) out.set(n.id, n);
+    }
+    if (list.length < WINDY_PAGE) return;
+    if (total != null && offset + WINDY_PAGE >= total) return;
+  }
+  // Ran out of offsets before running out of cameras.
+  if (total == null || total > WINDY_MAX_OFFSET + WINDY_PAGE) budget.truncated = true;
+}
+
+async function windyCell(view) {
+  if (!CFG.windyKey) return { cams: [], truncated: false };
+  const q = viewCell(view, 'windy');
+  return cachedPersistent(`cams:windy:${q.key}`, RETAIN['cameras.windy'], async () => {
+    const budget = { calls: 0, truncated: false };
+    const out = new Map();
+    await windyBox(q, budget, out);
+    return { cams: [...out.values()], truncated: budget.truncated, calls: budget.calls };
+  });
+}
+
+async function windyWebcams(b) {
+  const cell = await windyCell(b);
+  const cams = cell.cams.filter((c) => inBox(b, c.lat, c.lon));
+  if (cell.truncated) cams.truncated = true;
+  return cams;
 }
 
 async function nycWebcams(b) {
   // NYC DOT publishes its traffic camera roster openly, no key required.
-  const raw = await cachedPersistent('cams:nyc', RETAIN['cameras.directories'], () =>
+  // NYC DOT reissues camera ids when it rebuilds its roster, and a held
+  // roster then points at pictures that 404: hold it like the agency lists.
+  const raw = await cachedPersistent('cams:nyc:v2', RETAIN['cameras.agency'], () =>
     grab('https://webcams.nyctmc.org/api/cameras', {}, { label: 'NYC DOT' }));
   const list = Array.isArray(raw) ? raw : (raw.cameras || raw.results || []);
   return list
@@ -4736,6 +5166,671 @@ async function alertCaWebcams(b) {
 
 const titleCase = (s) => String(s).replace(/\b\w/g, (c) => c.toUpperCase());
 
+/* --- Transport-agency cameras ---------------------------------------- */
+// Keyless camera directories that road agencies publish themselves, each a
+// whole-network list fetched once a fortnight ([cameras] directories) and
+// asked only when the view touches the agency's area. The images are the
+// agency's own, refreshed by the agency: the browser reloads them in place.
+const boxTouches = (b, [s, w, n, e]) => !(n < b.south || s > b.north || e < b.west || w > b.east);
+
+// Caltrans publishes one JSON file per district, D01 to D12.
+const CALTRANS_AREA = [32.4, -124.6, 42.1, -114.0];
+async function caltransWebcams(b) {
+  if (!boxTouches(b, CALTRANS_AREA)) return [];
+  const districts = Array.from({ length: 12 }, (_, i) => i + 1);
+  const settled = await Promise.allSettled(districts.map((d) => {
+    const dd = String(d).padStart(2, '0');
+    return cachedPersistent(`cams:caltrans:d${dd}`, RETAIN['cameras.directories'], () =>
+      grab(`https://cwwp2.dot.ca.gov/data/d${d}/cctv/cctvStatusD${dd}.json`, {}, { label: `Caltrans D${dd}`, timeoutMs: 30000 }));
+  }));
+  if (settled.every((r) => r.status === 'rejected')) throw settled[0].reason;
+  const out = [];
+  for (const r of settled) {
+    if (r.status !== 'fulfilled') continue;
+    for (const row of r.value?.data || []) {
+      const c = row.cctv || {};
+      const loc = c.location || {};
+      const lat = Number(loc.latitude);
+      const lon = Number(loc.longitude);
+      if (!Number.isFinite(lat) || !Number.isFinite(lon) || !inBox(b, lat, lon)) continue;
+      const still = safeUrl(c.imageData?.static?.currentImageURL, { httpsOnly: true });
+      if (!still) continue;
+      out.push({
+        source: 'caltrans',
+        id: `caltrans:${loc.district}:${c.index}`,
+        title: loc.locationName || 'Caltrans camera',
+        lat, lon,
+        place: [loc.nearbyPlace, loc.county ? `${loc.county} County` : null, 'CA'].filter(Boolean).join(', '),
+        category: [loc.route, loc.direction ? `facing ${String(loc.direction).toLowerCase()}` : null].filter(Boolean).join(', ') || 'Highway',
+        status: c.inService === 'true' ? 'active' : 'out of service',
+        updated: null,
+        image: still,
+        // Most cameras also stream: the panel plays this, the still is its poster.
+        hls: safeUrl(c.imageData?.streamingVideoURL, { httpsOnly: true }),
+        embed: null,
+        link: 'https://cwwp2.dot.ca.gov/vm/iframemap.htm',
+      });
+    }
+  }
+  return out;
+}
+
+// TfL JamCams: London's traffic cameras, a still and a short clip each.
+const TFL_AREA = [51.2, -0.6, 51.75, 0.4];
+async function tflWebcams(b) {
+  if (!boxTouches(b, TFL_AREA)) return [];
+  const list = await cachedPersistent('cams:tfl', RETAIN['cameras.directories'], () =>
+    grab('https://api.tfl.gov.uk/Place/Type/JamCam', {}, { label: 'TfL JamCams', timeoutMs: 30000 }));
+  return (Array.isArray(list) ? list : []).map((p) => {
+    const lat = Number(p.lat);
+    const lon = Number(p.lon);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon) || !inBox(b, lat, lon)) return null;
+    const prop = (k) => (p.additionalProperties || []).find((a) => a.key === k)?.value;
+    const still = safeUrl(prop('imageUrl'), { httpsOnly: true });
+    if (!still) return null;
+    return {
+      source: 'tfl',
+      id: `tfl:${p.id}`,
+      title: p.commonName || 'TfL JamCam',
+      lat, lon,
+      place: 'London',
+      category: prop('view') ? `Traffic, facing ${String(prop('view')).toLowerCase()}` : 'Traffic',
+      status: prop('available') === 'false' ? 'unavailable' : 'active',
+      updated: (p.additionalProperties || []).find((a) => a.key === 'imageUrl')?.modified || null,
+      image: still,
+      embed: null,
+      link: 'https://tfl.gov.uk/traffic/status/',
+    };
+  }).filter(Boolean);
+}
+
+// Digitraffic (Fintraffic): Finland's road weather cameras, several presets
+// (views) per station, each a JPEG at weathercam.digitraffic.fi/<preset>.jpg.
+const DIGITRAFFIC_AREA = [59.3, 19.0, 70.2, 31.7];
+async function digitrafficWebcams(b) {
+  if (!boxTouches(b, DIGITRAFFIC_AREA)) return [];
+  const raw = await cachedPersistent('cams:digitraffic', RETAIN['cameras.directories'], () =>
+    grab('https://tie.digitraffic.fi/api/weathercam/v1/stations', {
+      headers: { 'Digitraffic-User': 'OpenPanopticon' },
+    }, { label: 'Digitraffic', timeoutMs: 30000 }));
+  const out = [];
+  for (const f of raw.features || []) {
+    const [lon, lat] = f.geometry?.coordinates || [];
+    if (!Number.isFinite(lat) || !Number.isFinite(lon) || !inBox(b, lat, lon)) continue;
+    const p = f.properties || {};
+    const presets = (p.presets || []).filter((x) => x.inCollection !== false && /^[A-Z]\d{7}$/.test(x.id || ''));
+    presets.forEach((pr, i) => {
+      out.push({
+        source: 'digitraffic',
+        id: `digitraffic:${pr.id}`,
+        title: `${String(p.name || f.id).replace(/_/g, ' ')}${presets.length > 1 ? ` (view ${i + 1})` : ''}`,
+        // Views of one station share a mast: spread them a few metres apart so each can be clicked.
+        lat: lat + i * 0.00004, lon,
+        place: 'Finland',
+        category: 'Road weather',
+        status: p.collectionStatus === 'GATHERING' ? 'active' : String(p.collectionStatus || 'unknown').toLowerCase(),
+        updated: p.dataUpdatedTime || null,
+        image: `https://weathercam.digitraffic.fi/${pr.id}.jpg`,
+        embed: null,
+        link: 'https://www.digitraffic.fi/en/road-traffic/',
+      });
+    });
+  }
+  return out;
+}
+
+// DriveBC: British Columbia's highway cameras.
+const DRIVEBC_AREA = [48.2, -139.1, 60.1, -114.0];
+async function driveBcWebcams(b) {
+  if (!boxTouches(b, DRIVEBC_AREA)) return [];
+  const list = await cachedPersistent('cams:drivebc', RETAIN['cameras.directories'], () =>
+    grab('https://www.drivebc.ca/api/webcams/?format=json', {}, { label: 'DriveBC', timeoutMs: 30000 }));
+  return (Array.isArray(list) ? list : list?.results || []).map((c) => {
+    const [lon, lat] = c.location?.coordinates || [];
+    if (!Number.isFinite(lat) || !Number.isFinite(lon) || !inBox(b, lat, lon)) return null;
+    if (c.should_appear === false || !/^\d+$/.test(String(c.id))) return null;
+    return {
+      source: 'drivebc',
+      id: `drivebc:${c.id}`,
+      title: c.name || 'DriveBC camera',
+      lat, lon,
+      place: [c.region_name, 'BC'].filter(Boolean).join(', '),
+      category: [c.highway_display ? `Hwy ${c.highway_display}` : null, c.orientation ? `facing ${c.orientation}` : null].filter(Boolean).join(', ') || 'Highway',
+      status: c.is_on === false ? 'off' : c.marked_stale ? 'stale' : c.marked_delayed ? 'delayed' : 'active',
+      updated: c.last_update_modified || null,
+      description: c.caption || null,
+      image: `https://www.drivebc.ca/images/${c.id}.jpg`,
+      embed: null,
+      link: `https://www.drivebc.ca/cameras/${c.id}`,
+    };
+  }).filter(Boolean);
+}
+
+/* --- OSIRIS camera catalogue ----------------------------------------- */
+// OSIRIS (MIT, github.com/simplifaisoul/osiris) keeps about a hundred
+// adapters, one per road agency or camera publisher worldwide, and maps a
+// view to the "regions" whose adapters cover it. vendor/osiris/cctv.cjs is
+// those adapters compiled by utils/build-osiris-cctv.mjs, changed so every
+// request leaves with OpenPanopticon's own User-Agent and no forged
+// forwarding or Referer headers, and without its OpenCCTV adapter.
+//
+// What it returns is used only as far as a browser can use it straight from
+// the operator: cameras OSIRIS could serve only through its own image relay
+// (hotlink-protected, or plain http on an https-only page) are left out,
+// and the four that need a server-side step are served by /cams/frame.
+let osirisCctv = null;
+try {
+  osirisCctv = require('./vendor/osiris/cctv.cjs');
+  globalThis.__OP_CCTV_UA = USER_AGENT;
+} catch { /* not vendored: the source reports itself unavailable */ }
+// Tests swap in a catalogue of their own: the vendored adapters reach real
+// agencies, which the suite never calls.
+function useOsirisCatalogue(m) { osirisCctv = m; }
+
+// Hosts OSIRIS reaches only by sending the Referer of their own site, and
+// cameras this layer already draws from the operator directly.
+const OSIRIS_REFERER_HOSTS = ['stream.inmoves.nl', 'voyage.aprr.fr', 'etraffic.dgt.es', 'skylinewebcams.com'];
+const OSIRIS_COVERED_HOSTS = ['jamcams.tfl.gov.uk', 'cwwp2.dot.ca.gov', 'drivebc.ca', 'webcams.nyctmc.org',
+  'weathercam.digitraffic.fi', 'cameras.alertcalifornia.org', 'windy.com'];
+const hostIn = (u, list) => {
+  try { const h = new URL(u).hostname.toLowerCase(); return list.some((x) => h === x || h.endsWith(`.${x}`)); } catch { return false; }
+};
+
+/** An OSIRIS URL as one this server or the browser can load, or null. */
+function osirisUrl(u, { httpsOnly = true } = {}) {
+  if (typeof u !== 'string' || !u) return null;
+  if (u.startsWith('/api/cctv/proxy?')) {
+    const real = new URLSearchParams(u.split('?')[1]).get('url');
+    if (!real || hostIn(real, OSIRIS_REFERER_HOSTS)) return null;
+    return safeUrl(real, { httpsOnly: true });
+  }
+  const local = /^\/api\/cctv\/(texas\/snapshot|scotland\/picture|estonia|singapore)\?(.*)$/.exec(u);
+  if (local) {
+    const kind = local[1].split('/')[0];
+    const q = new URLSearchParams(local[2]);
+    q.set('kind', kind);
+    return `/cams/frame?${q}`;
+  }
+  if (u.startsWith('/')) return null;
+  if (hostIn(u, OSIRIS_REFERER_HOSTS)) return null;
+  return safeUrl(u, { httpsOnly });
+}
+
+/** The video id of a YouTube watch, live, short or embed address, or null. */
+function youtubeIdOf(u) {
+  let p;
+  try { p = new URL(u); } catch { return null; }
+  const h = p.hostname.toLowerCase().replace(/^(www|m)\./, '');
+  let id = null;
+  if (h === 'youtu.be') id = p.pathname.slice(1);
+  else if (h === 'youtube.com' || h === 'youtube-nocookie.com') {
+    id = p.searchParams.get('v') || (/^\/(embed|live|shorts)\/([^/?#]+)/.exec(p.pathname) || [])[2] || null;
+  }
+  return /^[\w-]{11}$/.test(id || '') ? id : null;
+}
+
+// Who publishes the pictures /cams/frame fetches.
+const OSIRIS_FRAME_SITES = {
+  __proto__: null,
+  texas: 'https://its.txdot.gov/',
+  scotland: 'https://trafficscotland.org/',
+  estonia: 'https://tarktee.ee/',
+  singapore: 'https://onemotoring.lta.gov.sg/',
+};
+
+function normaliseOsiris(c, region) {
+  const lat = Number(c.lat);
+  const lon = Number(c.lng ?? c.lon);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon) || (!lat && !lon)) return null;
+  const still = osirisUrl(c.feed_url);
+  const stream = osirisUrl(c.stream_url);
+  const kind = String(c.stream_type || '');
+  // Matched anywhere in the address: TfL's stills live under an S3 path
+  // named for the host, and relayed addresses carry the original encoded.
+  const covered = (u) => {
+    if (typeof u !== 'string') return false;
+    let plain = u;
+    try { plain = decodeURIComponent(u); } catch { /* keep as is */ }
+    return OSIRIS_COVERED_HOSTS.some((h) => plain.includes(h));
+  };
+  if (covered(c.feed_url) || covered(c.stream_url)) return null;
+  const rec = {
+    source: 'agency',
+    id: `osiris:${String(c.id).slice(0, 120)}`,
+    title: clip(String(c.name || 'Camera'), 160),
+    lat, lon,
+    place: [c.city, c.country].filter(Boolean).join(', ') || null,
+    category: c.source ? clip(String(c.source), 80) : null,
+    status: 'listed',
+    updated: null,
+    image: null,
+    mjpeg: null,
+    video: null,
+    hls: null,
+    embed: null,
+    link: safeUrl(c.external_url) || null,
+    region,
+  };
+  if (still && kind === 'mjpeg') rec.mjpeg = still;
+  else if (still) rec.image = still;
+  // OSIRIS embeds YouTube live streams with autoplay. Here they play like
+  // every other YouTube camera: the no-cookie player, loaded only on Play,
+  // with the referrer YouTube requires (it answers "Error 153" without one).
+  const ytId = youtubeIdOf(c.stream_url || '') || youtubeIdOf(c.external_url || '') || youtubeIdOf(c.feed_url || '');
+  if (ytId) {
+    rec.youtubeEmbed = `https://www.youtube-nocookie.com/embed/${ytId}`;
+    rec.videoId = ytId;
+    rec.image = rec.image || `https://i.ytimg.com/vi/${ytId}/hqdefault_live.jpg`;
+    rec.link = `https://www.youtube.com/watch?v=${ytId}`;
+    return rec;
+  }
+  if (stream) {
+    if (kind === 'mp4') rec.video = stream;
+    else if (kind === 'hls') rec.hls = stream;
+    else if (kind === 'mjpeg') rec.mjpeg = rec.mjpeg || stream;
+    else if (kind === 'iframe' && stream.startsWith('https:')) rec.embed = stream;
+  }
+  // Most adapters give no page for the camera: link the operator's own
+  // site, from the address the picture comes from, so every camera can be
+  // traced to who publishes it.
+  if (!rec.link) {
+    const local = /^\/cams\/frame\?/.test(rec.image || '') ? new URLSearchParams(rec.image.split('?')[1]).get('kind') : null;
+    const feed = rec.image || rec.mjpeg || rec.video || rec.hls;
+    if (local) rec.link = OSIRIS_FRAME_SITES[local] || null;
+    else if (feed) { try { rec.link = `${new URL(feed).origin}/`; } catch { /* not absolute */ } }
+  }
+  // HLS alone does not play in most browsers without a player library this
+  // app does not ship: such a camera is kept only if it can be opened.
+  if (!rec.image && !rec.mjpeg && !rec.video && !rec.embed && !(rec.hls && rec.link)) {
+    if (rec.hls) rec.link = rec.hls;
+    else return null;
+  }
+  return rec;
+}
+
+/** One OSIRIS region's cameras, held for [cameras] agency. */
+async function osirisRegion(region) {
+  return cachedPersistent(`cams:osiris:v2:${region}`, RETAIN['cameras.agency'], async () => {
+    const list = await osirisCctv.regionFetchers[region]();
+    return (Array.isArray(list) ? list : []).map((c) => normaliseOsiris(c, region)).filter(Boolean);
+  });
+}
+
+// A region slower than this is left out of the answer it was asked for, not
+// abandoned: it keeps filling the cache and is there on the next look.
+const OSIRIS_REGION_BUDGET_MS = 25_000;
+
+async function osirisWebcams(b) {
+  if (!osirisCctv) return [];
+  const c = bboxCenter(b);
+  const radiusKm = bboxRadiusKm(b);
+  // The regions under the view's middle and its corners.
+  const points = [[c.lat, c.lon], [b.south, b.west], [b.south, b.east], [b.north, b.west], [b.north, b.east]];
+  const regions = [...new Set(points.flatMap(([la, lo]) => osirisCctv.regionsFor(la, lo, radiusKm)))]
+    .filter((r) => typeof osirisCctv.regionFetchers[r] === 'function');
+  const slow = [];
+  const settled = await Promise.allSettled(regions.map((r) => Promise.race([
+    osirisRegion(r),
+    new Promise((_, reject) => setTimeout(() => { slow.push(r); reject(new Error('still loading')); }, OSIRIS_REGION_BUDGET_MS)),
+  ])));
+  const seen = new Set();
+  const out = [];
+  settled.forEach((s) => {
+    if (s.status !== 'fulfilled') return;
+    for (const cam of s.value) {
+      if (seen.has(cam.id) || !inBox(b, cam.lat, cam.lon)) continue;
+      seen.add(cam.id);
+      out.push(cam);
+    }
+  });
+  out.regions = regions;
+  out.slow = slow;
+  return out;
+}
+
+/**
+ * /cams/frame: the four OSIRIS cameras whose picture takes a server step.
+ * Texas serves base64 JPEGs inside JSON and Scotland inline JPEGs in a page;
+ * Estonia and Singapore change each picture's address, so this redirects to
+ * the current one. Outside /api/ because an <img> cannot send the app header.
+ */
+const camFrameCache = new Map();
+async function serveCamFrame(req, res, url) {
+  const q = url.searchParams;
+  const kind = q.get('kind');
+  const send = (status, body, type = 'text/plain') => {
+    res.writeHead(status, { ...SECURITY_HEADERS, 'Content-Type': type, 'Cache-Control': status === 200 ? 'public, max-age=20' : 'no-store' });
+    res.end(body);
+  };
+  if (!osirisCctv) { send(404, 'not available'); return; }
+  const key = `${kind}:${q.get('district') || ''}:${q.get('id') || q.get('sid') || ''}`;
+  const hit = camFrameCache.get(key);
+  if (hit && hit.until > Date.now()) { send(200, hit.buf, 'image/jpeg'); return; }
+  try {
+    if (kind === 'estonia' || kind === 'singapore') {
+      const id = q.get('id') || '';
+      if (!/^[\w-]{1,40}$/.test(id)) { send(400, 'bad id'); return; }
+      const fn = kind === 'estonia' ? osirisCctv.estoniaFrameUrl : osirisCctv.singaporeFrameUrl;
+      const to = safeUrl(await fn(id), { httpsOnly: true });
+      if (!to) { send(404, 'no current picture'); return; }
+      res.writeHead(302, { ...SECURITY_HEADERS, Location: to, 'Cache-Control': 'public, max-age=30' });
+      res.end();
+      return;
+    }
+    let buf = null;
+    if (kind === 'texas') {
+      const district = q.get('district') || '';
+      const id = q.get('id') || '';
+      if (!Object.hasOwn(osirisCctv.TEXAS_DISTRICTS, district) || !id.trim() || id.length > 256 || /[\x00-\x1f]/.test(id)) {
+        send(400, 'bad camera'); return;
+      }
+      const data = await grab(`${osirisCctv.TXDOT_BASE}GetCctvSnapshotByIcdId?${new URLSearchParams({ districtCode: district, icdId: id })}`,
+        {}, { label: 'TxDOT', timeoutMs: 8000 });
+      if (typeof data?.snippet === 'string' && data.snippet.length < 8_000_000) buf = Buffer.from(data.snippet, 'base64');
+    } else if (kind === 'scotland') {
+      const sid = q.get('sid') || '';
+      if (!/^\d{1,6}$/.test(sid)) { send(400, 'bad camera'); return; }
+      buf = await osirisCctv.fetchScotlandPicture(sid);
+    } else { send(400, 'unknown kind'); return; }
+    // A JPEG, or nothing: whatever else came back is not shown.
+    if (!buf || buf.length < 4 || buf[0] !== 0xff || buf[1] !== 0xd8) { send(404, 'no current picture'); return; }
+    camFrameCache.set(key, { buf, until: Date.now() + 20_000 });
+    if (camFrameCache.size > 500) camFrameCache.delete(camFrameCache.keys().next().value);
+    send(200, buf, 'image/jpeg');
+  } catch {
+    send(502, 'camera unavailable');
+  }
+}
+
+/* --- YouTube live cameras -------------------------------------------- */
+// 24/7 live streams that are cameras: towns, universities, ports, transport
+// departments and enthusiasts publish hundreds on YouTube. Nobody keeps a list,
+// so they are found three ways and checked by one filter:
+//
+//  1. Live streams whose owner set a location near the view (a geo search).
+//  2. Live streams named for the place in view ("Cary live cam"), for the
+//     many official channels that never set a location.
+//  3. Every live stream on the channels in YOUTUBE_CAM_CHANNELS, wherever
+//     they are, for the operators worth following whole.
+//
+// What was found is held a week ([cameras] youtube_live); whether each is
+// still live is asked far more cheaply every half hour.
+
+/** Words that make a live stream a camera, and ones that make it not one. */
+const YT_CAM_WORDS = /\b(live ?cams?|web ?cams?|cams?|cameras?|live view|live feed|24\s*\/\s*7|ptz|traffic|skyline|harbou?r|port|marina|beach|pier|downtown|weather|tower|belltower|security|airport|railway|railcam|bird ?cam|wildlife|nest|river|lake)\b/i;
+const YT_NOT_CAM = /\b(gameplay|gaming|minecraft|fortnite|roblox|valorant|podcast|radio|lo-?fi|music|playlist|dj set|sermon|worship|church service|holy mass|news live|breaking news|reaction|talk show|esports|asmr|study with me|tarot|giveaway|shopping)\b/i;
+const YT_NOT_CAM_CATEGORIES = new Set(['10', '20']);   // Music, Gaming
+
+/**
+ * Is this live stream a camera? Words in the title or description are the
+ * main signal; a stream that has run for more than half a day, or carries a
+ * location, counts too.
+ */
+function looksLikeCamera(v) {
+  const sn = v.snippet || {};
+  if (sn.liveBroadcastContent !== 'live') return false;
+  if (YT_NOT_CAM_CATEGORIES.has(String(sn.categoryId || ''))) return false;
+  const text = `${sn.title || ''}\n${String(sn.description || '').slice(0, 400)}`;
+  if (YT_NOT_CAM.test(sn.title || '')) return false;
+  let score = 0;
+  if (YT_CAM_WORDS.test(text)) score += 2;
+  const started = Date.parse(v.liveStreamingDetails?.actualStartTime || '');
+  if (Number.isFinite(started) && Date.now() - started > 12 * 3600e3) score += 1;
+  if (Number.isFinite(Number(v.recordingDetails?.location?.latitude))) score += 1;
+  return score >= 2;
+}
+
+// Nominatim asks for at most one request a second.
+const nominatimGate = { chain: Promise.resolve(), last: 0, gapMs: 1100 };
+function nominatimCall(url) {
+  const run = nominatimGate.chain.then(async () => {
+    const wait = nominatimGate.gapMs - (Date.now() - nominatimGate.last);
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    nominatimGate.last = Date.now();
+    return grab(url, { headers: { 'User-Agent': USER_AGENT } }, { label: 'Nominatim', timeoutMs: 15000 });
+  });
+  nominatimGate.chain = run.catch(() => {});
+  return run;
+}
+
+/** The town or city at a point, with its own coordinates. */
+async function placeAt(lat, lon) {
+  return cachedPersistent(`ytlive:revgeo:${lat.toFixed(2)},${lon.toFixed(2)}`, RETAIN['places.geocode'], async () => {
+    const url = new URL('https://nominatim.openstreetmap.org/reverse');
+    url.searchParams.set('lat', lat.toFixed(4));
+    url.searchParams.set('lon', lon.toFixed(4));
+    url.searchParams.set('format', 'jsonv2');
+    url.searchParams.set('zoom', '10');
+    const r = await nominatimCall(url);
+    const a = r?.address || {};
+    const name = a.city || a.town || a.village || a.municipality || a.county || null;
+    return name ? { name, lat: Number(r.lat), lon: Number(r.lon), state: a.state || null } : null;
+  });
+}
+
+/** Up to five places a free-text name resolves to, best first. */
+async function placeNamed(text) {
+  const q = String(text || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+  if (q.length < 3) return [];
+  return cachedPersistent(`ytlive:geo2:${q.toLowerCase()}`, RETAIN['places.geocode'], async () => {
+    const url = new URL('https://nominatim.openstreetmap.org/search');
+    url.searchParams.set('q', q);
+    url.searchParams.set('format', 'jsonv2');
+    url.searchParams.set('limit', '5');
+    const list = (await nominatimCall(url)) || [];
+    return (Array.isArray(list) ? list : []).map((r) => ({
+      name: String(r.name || ''), label: r.display_name || null, lat: Number(r.lat), lon: Number(r.lon),
+    })).filter((r) => Number.isFinite(r.lat) && Number.isFinite(r.lon));
+  });
+}
+
+/** A stream title with the camera words taken out, as a place to look up. */
+const CAM_WORDS_RE = /\b(live ?stream|live ?cam(era)?|web ?cam|live view|live feed|camera|cam|24\s*\/\s*7|live|hd|4k|ptz)\b/gi;
+const placeFromTitle = (t) => String(t || '')
+  .replace(CAM_WORDS_RE, ' ')
+  .replace(/[|•·—–\-:()[\]"!]+/g, ' ').replace(/\s+/g, ' ').trim();
+
+/** The title's parts between separators, each cleaned, then the whole. */
+const titlePlaces = (t) => [...new Set([
+  ...String(t || '').split(/\s[|•·—–\-:]\s|[|•·]|\s[—–]\s?/).map(placeFromTitle),
+  placeFromTitle(t),
+])].filter((x) => x.length >= 3);
+
+const plainWords = (s) => String(s || '').normalize('NFKD').replace(/[̀-ͯ]/g, '')
+  .toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+
+/**
+ * A place for this text only when the match is near certain: the place the
+ * geocoder found is itself named, word for word, in the text; no other
+ * place of that name is far away (ambiguous names such as "Springfield" or
+ * "Main Street" are refused); a one-word name only inside a searched
+ * area; and, for a camera found by searching an area, it lies in it. A stream that names somewhere else ("Monterey
+ * Bay Aquarium" found by searching Raleigh) is never moved to the search.
+ */
+async function confidentPlace(text, within) {
+  const hits = await placeNamed(text).catch(() => []);
+  const top = hits[0];
+  if (!top) return null;
+  const name = plainWords(top.name);
+  if (name.length < 4 || !` ${plainWords(text)} `.includes(` ${name} `)) return null;
+  // One word ("Shark", "Cary") is trusted only inside the searched area.
+  if (!within && !name.includes(' ')) return null;
+  const rival = hits.slice(1).some((h) => plainWords(h.name) === name
+    && haversineKm(top.lat, top.lon, h.lat, h.lon) > 25);
+  if (rival) return null;
+  if (within && !inBox(within, top.lat, top.lon)) return null;
+  return top;
+}
+
+const ytHeaders = () => ({ 'X-Goog-Api-Key': CFG.youtubeKey, Accept: 'application/json' });
+
+/** search.list for live videos, as ids. */
+async function ytLiveSearch(params, pages = 1) {
+  const ids = [];
+  let pageToken = '';
+  for (let i = 0; i < pages; i++) {
+    const url = new URL(`${YT_API}/search`);
+    url.searchParams.set('part', 'id');
+    url.searchParams.set('type', 'video');
+    url.searchParams.set('eventType', 'live');
+    url.searchParams.set('maxResults', '50');
+    for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+    if (pageToken) url.searchParams.set('pageToken', pageToken);
+    const page = await grab(url, { headers: ytHeaders() }, { label: 'YouTube live search' });
+    for (const it of page.items || []) {
+      const id = it.id?.videoId;
+      if (YT_ID.test(id || '') && !ids.includes(id)) ids.push(id);
+    }
+    pageToken = page.nextPageToken;
+    if (!pageToken) break;
+  }
+  return ids;
+}
+
+/** videos.list with what deciding and drawing a camera needs. */
+async function ytLiveDetails(ids, parts = 'snippet,liveStreamingDetails,recordingDetails') {
+  const items = [];
+  for (let i = 0; i < ids.length; i += 50) {
+    const url = new URL(`${YT_API}/videos`);
+    url.searchParams.set('part', parts);
+    url.searchParams.set('id', ids.slice(i, i + 50).join(','));
+    url.searchParams.set('maxResults', '50');
+    const page = await grab(url, { headers: ytHeaders() }, { label: 'YouTube videos' });
+    items.push(...(page.items || []));
+  }
+  return items;
+}
+
+/**
+ * Where a camera is, or null to leave it off the map: its own location if
+ * the owner set one, else a place its title or channel names that matches
+ * beyond reasonable doubt (see confidentPlace). Being found by a search
+ * about a town is never enough by itself: YouTube's search returns famous
+ * streams from anywhere for "<town> live cam".
+ */
+async function placeCamera(v, { within = null, budget }) {
+  const loc = v.recordingDetails?.location;
+  const lat = Number(loc?.latitude);
+  const lon = Number(loc?.longitude);
+  if (Number.isFinite(lat) && Number.isFinite(lon) && (lat || lon)) return { lat, lon, placement: 'geotag' };
+  for (const q of [...titlePlaces(v.snippet?.title), v.snippet?.channelTitle]) {
+    if (budget.geocodes <= 0) break;
+    if (!q || String(q).trim().length < 3) continue;
+    budget.geocodes--;
+    const hit = await confidentPlace(q, within);
+    if (hit) return { lat: hit.lat, lon: hit.lon, placement: 'named', place: hit.label || hit.name };
+  }
+  return null;
+}
+
+function ytLiveRecord(v, at) {
+  const sn = v.snippet || {};
+  const th = sn.thumbnails || {};
+  return {
+    source: 'ytlive',
+    id: `ytlive:${v.id}`,
+    videoId: v.id,
+    title: sn.title || 'YouTube live camera',
+    channel: sn.channelTitle || null,
+    channelLink: /^UC[\w-]{22}$/.test(sn.channelId || '') ? `https://www.youtube.com/channel/${sn.channelId}` : null,
+    lat: at.lat, lon: at.lon,
+    place: at.place || v.recordingDetails?.locationDescription || null,
+    placement: at.placement,
+    approximate: at.placement !== 'geotag',
+    category: 'YouTube live',
+    status: 'live',
+    updated: v.liveStreamingDetails?.actualStartTime || null,
+    image: safeUrl((th.high || th.medium || th.default || {}).url, { httpsOnly: true }),
+    // Played only when asked to, like the YouTube layer: see WebcamLayer.
+    embed: null,
+    youtubeEmbed: `https://www.youtube-nocookie.com/embed/${v.id}`,
+    link: `https://www.youtube.com/watch?v=${v.id}`,
+  };
+}
+
+/** Live-camera video ids shown as cameras, so the YouTube layer can leave them out. */
+const ytLiveShown = new Set();
+
+/** Cameras found for one cell: the geo search and the place-name search. */
+async function ytLiveCell(q) {
+  return cachedPersistent(`cams:ytlive:v2:${q.key}`, RETAIN['cameras.youtube_live'], async () => {
+    const c = bboxCenter(q);
+    const radiusKm = Math.min(1000, Math.max(1, Math.ceil(bboxRadiusKm(q))));
+    const geo = await ytLiveSearch({ location: `${c.lat.toFixed(5)},${c.lon.toFixed(5)}`, locationRadius: `${radiusKm}km` }, 2);
+    const town = await placeAt(c.lat, c.lon).catch(() => null);
+    const named = town
+      ? await ytLiveSearch({ q: `${town.name} live cam|${town.name} webcam|${town.name} live view` }).catch(() => [])
+      : [];
+    const ids = [...new Set([...geo, ...named])];
+    const items = (await ytLiveDetails(ids)).filter(looksLikeCamera);
+    const budget = { geocodes: 12 };
+    const cams = [];
+    for (const v of items) {
+      // Placed in this cell or not at all: a stream found here that names
+      // somewhere else belongs to that place's own search.
+      const at = await placeCamera(v, { within: q, budget });
+      if (at && inBox(q, at.lat, at.lon)) cams.push(ytLiveRecord(v, at));
+    }
+    return { town: town?.name || null, found: ids.length, cams };
+  });
+}
+
+/** Cameras on the listed channels, wherever they are. */
+async function ytLiveChannels() {
+  if (!CFG.ytCamChannels.length) return { cams: [] };
+  return cachedPersistent(`cams:ytlive:channels:v2:${CFG.ytCamChannels.join(',')}`, RETAIN['cameras.youtube_live'], async () => {
+    const ids = [];
+    const problems = [];
+    for (const ch of CFG.ytCamChannels) {
+      try {
+        let channelId = ch;
+        if (ch.startsWith('@')) {
+          const url = new URL(`${YT_API}/channels`);
+          url.searchParams.set('part', 'id');
+          url.searchParams.set('forHandle', ch);
+          const r = await grab(url, { headers: ytHeaders() }, { label: 'YouTube channels' });
+          channelId = r.items?.[0]?.id;
+          if (!/^UC[\w-]{22}$/.test(channelId || '')) { problems.push(`${ch}: no such channel`); continue; }
+        }
+        for (const id of await ytLiveSearch({ channelId })) if (!ids.includes(id)) ids.push(id);
+      } catch (e) { problems.push(`${ch}: ${e.message}`); }
+    }
+    // A listed channel is trusted to be cameras: only "is it live" is asked.
+    const items = (await ytLiveDetails(ids)).filter((v) => v.snippet?.liveBroadcastContent === 'live');
+    const budget = { geocodes: 25 };
+    const cams = [];
+    for (const v of items) {
+      const at = await placeCamera(v, { budget });
+      if (at) cams.push(ytLiveRecord(v, at));
+    }
+    return { cams, problems };
+  });
+}
+
+/** Which of these videos are live right now, asked once per check period. */
+async function ytStillLive(key, ids) {
+  if (!ids.length) return new Set();
+  const live = await cached(`ytlive:check:${key}`, RETAIN['cameras.youtube_live_check'], async () =>
+    (await ytLiveDetails(ids, 'snippet')).filter((v) => v.snippet?.liveBroadcastContent === 'live').map((v) => v.id));
+  return new Set(live);
+}
+
+async function ytLiveWebcams(b) {
+  if (!CFG.youtubeKey) return [];
+  const q = viewCell(b, 'ytlive');
+  const [cell, chans] = await Promise.all([ytLiveCell(q), ytLiveChannels().catch(() => ({ cams: [] }))]);
+  const byId = new Map();
+  for (const c of [...(chans.cams || []), ...(cell.cams || [])]) {
+    if (inBox(b, c.lat, c.lon) && !byId.has(c.videoId)) byId.set(c.videoId, c);
+  }
+  const ids = [...byId.keys()].sort();
+  const live = await ytStillLive(`${q.key}:${ids.join(',')}`, ids);
+  const cams = [...byId.values()].filter((c) => live.has(c.videoId));
+  for (const c of cams) ytLiveShown.add(c.videoId);
+  if (ytLiveShown.size > 5000) ytLiveShown.clear();
+  return cams;
+}
+
 async function webcams({ bbox }) {
   const b = parseBbox(bbox);
   if (!b) throw new UpstreamError(400, 'bbox required as south,west,north,east');
@@ -4743,22 +5838,32 @@ async function webcams({ bbox }) {
   const named = [
     ['windy', windyWebcams], ['nycdot', nycWebcams],
     ['openwebcamdb', owcdbWebcams], ['alertca', alertCaWebcams],
+    ['ytlive', ytLiveWebcams],
+    ['caltrans', caltransWebcams], ['tfl', tflWebcams],
+    ['digitraffic', digitrafficWebcams], ['drivebc', driveBcWebcams],
+    ['agency', osirisWebcams],
   ];
   const results = await Promise.allSettled(named.map(([, fn]) => fn(b)));
 
   const cams = [];
   const problems = {};
   const bySource = {};
+  const truncated = [];
   results.forEach((r, i) => {
     const name = named[i][0];
-    if (r.status === 'fulfilled') { bySource[name] = r.value.length; cams.push(...r.value); }
-    else problems[name] = r.reason?.message || String(r.reason);
+    if (r.status === 'fulfilled') {
+      bySource[name] = r.value.length;
+      cams.push(...r.value);
+      if (r.value.truncated) truncated.push(name);
+    } else problems[name] = r.reason?.message || String(r.reason);
   });
 
   return {
     count: cams.length,
     bySource,
+    truncated,
     windyConfigured: !!CFG.windyKey,
+    youtubeLiveConfigured: !!CFG.youtubeKey,
     owcdbConfigured: !!CFG.owcdbKey,
     problems,
     webcams: cams,
@@ -4862,6 +5967,8 @@ async function youtubeVideos({ bbox }) {
 
   const videos = (raw.items || [])
     .filter((v) => YT_ID.test(v.id || '') && Number.isFinite(v.lat) && Number.isFinite(v.lon))
+    // A live camera already drawn under Public cameras is not drawn twice.
+    .filter((v) => !ytLiveShown.has(v.id))
     .map((v) => ({
       source: 'youtube',
       id: `yt:${v.id}`,
@@ -4916,7 +6023,16 @@ const EVENT_SOURCES = {
   nws:   { label: 'NWS alerts', color: '#4cc9f0', note: 'US watches, warnings and advisories. Only ~15% carry polygons.' },
   firms: { label: 'NASA FIRMS fires', color: '#ff6b35', note: 'VIIRS active-fire detections. Needs FIRMS_MAP_KEY.' },
   edis:  { label: 'RSOE EDIS', color: '#c77dff', note: 'Enterprise feed — needs EDIS_API_URL + EDIS_API_KEY.' },
+  emsc:  { label: 'EMSC quakes', color: '#e5383b', note: 'Euro-Mediterranean Seismological Centre, last 24 hours. Better coverage than USGS outside the Americas; a quake both report is drawn once.' },
+  tfr:   { label: 'FAA flight restrictions', color: '#ffd60a', note: 'Active US TFRs (VIP, security, hazards, space operations) as their published boundaries.' },
+  meteoalarm: { label: 'MeteoAlarm warnings', color: '#90e0ef', note: 'Official weather warnings from ~38 European met services. Warnings published without a shape are grouped per country.' },
+  cems:  { label: 'Copernicus EMS', color: '#80ffdb', note: 'Copernicus Emergency Management rapid-mapping activations, with their mapped extent.' },
+  odin:  { label: 'Power outages (ODIN)', color: '#ffbe0b', note: 'US electricity outages by county, from utilities reporting to DOE/ORNL\'s Outage Data Initiative. Graded by the share of customers out.' },
+  acled: { label: 'ACLED conflict', color: '#e63946', note: 'Coded political violence and protest events, last 30 days. Needs ACLED_EMAIL + ACLED_PASSWORD (free account); updated weekly, and research-tier accounts lag by a year.' },
 };
+
+/** Sources drawn when nothing else has been chosen. */
+const EVENT_DEFAULTS = ['gdacs', 'eonet', 'usgs', 'nws', 'emsc', 'tfr', 'meteoalarm', 'cems', 'odin', 'acled'];
 
 /** GDACS event-type codes → readable names. */
 const GDACS_TYPES = {
@@ -5209,18 +6325,498 @@ async function edisEvents(b) {
   }).filter((e) => e && inBox(b, e.lat, e.lon));
 }
 
+/* --- shared geometry helpers ---------------------------------------- */
+
+/** The mean of a ring's vertices, as [lat, lon]. */
+function ringCentre(ring) {
+  const n = ring.length || 1;
+  return [ring.reduce((s, c) => s + c[1], 0) / n, ring.reduce((s, c) => s + c[0], 0) / n];
+}
+
+/** The outer ring of a GeoJSON Polygon or the first part of a MultiPolygon. */
+function outerRing(geom) {
+  if (geom?.type === 'Polygon') return geom.coordinates?.[0] || null;
+  if (geom?.type === 'MultiPolygon') return geom.coordinates?.[0]?.[0] || null;
+  return null;
+}
+
+/**
+ * A WKT POINT, POLYGON or MULTIPOLYGON as { point: [lat, lon] } or
+ * { ring: [[lon, lat], ...] } (the outer ring of the first part).
+ */
+function parseWkt(wkt) {
+  const s = String(wkt || '').replace(/^SRID=\d+;/i, '').trim();
+  const nums = (t) => t.trim().split(/\s*,\s*/).map((p) => p.split(/\s+/).map(Number))
+    .filter((c) => c.length >= 2 && Number.isFinite(c[0]) && Number.isFinite(c[1]));
+  let m = /^POINT\s*\(\s*([-\d.eE+]+)\s+([-\d.eE+]+)/i.exec(s);
+  if (m) return { point: [Number(m[2]), Number(m[1])] };
+  m = /^(?:MULTI)?POLYGON\s*\(+\s*([^()]+)\)/i.exec(s);
+  if (m) {
+    const ring = nums(m[1]).map(([x, y]) => [x, y]);
+    return ring.length > 2 ? { ring } : null;
+  }
+  return null;
+}
+
+/** Does a ring's bounding box overlap the view? */
+function ringTouches(b, ring) {
+  let s = 90, w = 180, n = -90, e = -180;
+  for (const [x, y] of ring) { s = Math.min(s, y); n = Math.max(n, y); w = Math.min(w, x); e = Math.max(e, x); }
+  return !(n < b.south || s > b.north || e < b.west || w > b.east);
+}
+
+/* --- EMSC ------------------------------------------------------------ */
+async function emscEvents(b) {
+  const url = new URL('https://www.seismicportal.eu/fdsnws/event/1/query');
+  url.searchParams.set('format', 'json');
+  url.searchParams.set('limit', '1500');
+  // The cache key stays fixed for its hour, so the window is "the 24 hours
+  // up to when it was asked", like the USGS day feed.
+  url.searchParams.set('start', new Date(Date.now() - 86400_000).toISOString().slice(0, 19));
+  const raw = await cached('ev:emsc', RETAIN['current.events'], () =>
+    grab(url, {}, { label: 'EMSC', timeoutMs: 25000 }));
+
+  return (raw.features || []).map((f) => {
+    const p = f.properties || {};
+    const lat = Number(p.lat ?? f.geometry?.coordinates?.[1]);
+    const lon = Number(p.lon ?? f.geometry?.coordinates?.[0]);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+    const m = Number(p.mag);
+    const depth = Number(p.depth);
+    const unid = p.unid || f.id;
+    return {
+      source: 'emsc',
+      id: `emsc:${unid}`,
+      title: `${p.magtype ? p.magtype.toUpperCase() : 'M'} ${Number.isFinite(m) ? m.toFixed(1) : '?'} — ${p.flynn_region || 'earthquake'}`,
+      kind: p.evtype && p.evtype !== 'ke' ? `Seismic event (${p.evtype})` : 'Earthquake',
+      lat, lon,
+      severity: m >= 6 ? 'red' : m >= 4.5 ? 'orange' : 'green',
+      severityLabel: Number.isFinite(m) ? `M ${m.toFixed(1)}` : 'Magnitude unknown',
+      magnitude: Number.isFinite(m) ? m : null,
+      magnitudeUnit: 'M',
+      magnitudeText: `${p.magtype || 'M'} ${Number.isFinite(m) ? m.toFixed(1) : '?'}, depth ${Number.isFinite(depth) ? depth.toFixed(0) : '?'} km`,
+      country: p.flynn_region || null,
+      time: p.time || null,
+      endTime: null,
+      description: [p.auth ? `Reported by ${p.auth}` : null, p.lastupdate ? `updated ${p.lastupdate}` : null]
+        .filter(Boolean).join(' · ') || null,
+      url: unid ? `https://www.seismicportal.eu/eventdetails.html?unid=${encodeURIComponent(unid)}` : null,
+      polygon: null,
+      depthKm: Number.isFinite(depth) ? depth : null,
+    };
+  }).filter((e) => e && inBox(b, e.lat, e.lon));
+}
+
+/**
+ * Drop EMSC events that USGS also reported: within a minute, 100 km and half
+ * a magnitude of each other is the same earthquake drawn twice.
+ */
+function dropDuplicateQuakes(list) {
+  const usgs = list.filter((e) => e.source === 'usgs');
+  if (!usgs.length) return list;
+  const t = (e) => Date.parse(e.time || '');
+  return list.filter((e) => {
+    if (e.source !== 'emsc') return true;
+    return !usgs.some((u) => Math.abs(t(u) - t(e)) <= 60_000
+      && haversineKm(u.lat, u.lon, e.lat, e.lon) <= 100
+      && Math.abs((u.magnitude ?? 0) - (e.magnitude ?? 0)) <= 0.5);
+  });
+}
+
+function haversineKm(lat1, lon1, lat2, lon2) {
+  const r = Math.PI / 180;
+  const a = Math.sin((lat2 - lat1) * r / 2) ** 2
+    + Math.cos(lat1 * r) * Math.cos(lat2 * r) * Math.sin((lon2 - lon1) * r / 2) ** 2;
+  return 12742 * Math.asin(Math.sqrt(a));
+}
+
+/* --- FAA temporary flight restrictions ------------------------------- */
+// tfr.faa.gov publishes the list (type, facility, state, description) and,
+// from the GeoServer behind its own map, the boundaries as GeoJSON with
+// circles and arcs already turned into polygons. Both keyless; joined on the
+// NOTAM number. US airspace only.
+const TFR_LIST_URL = 'https://tfr.faa.gov/tfrapi/exportTfrList';
+const TFR_SHAPES_URL = 'https://tfr.faa.gov/geoserver/TFR/ows?service=WFS&version=1.1.0'
+  + '&request=GetFeature&typeName=TFR:V_TFR_LOC&outputFormat=application/json&srsname=EPSG:4326';
+const TFR_SEVERITY = { __proto__: null, SECURITY: 'red', VIP: 'red', 'SPACE OPERATIONS': 'orange', HAZARDS: 'orange', SPECIAL: 'orange', AIRSHOW: 'green' };
+
+/** "6/1234" out of whatever form a NOTAM number arrives in. */
+const notamNo = (v) => (/(\d{1,2}\/\d{3,5})/.exec(String(v || '')) || [])[1] || null;
+
+async function tfrEvents(b) {
+  const [shapes, list] = await Promise.all([
+    cached('ev:tfr:shapes', RETAIN['current.events'], () =>
+      grab(TFR_SHAPES_URL, {}, { label: 'FAA TFR map', timeoutMs: 30000 })),
+    // The list only adds words; without it the shapes still draw.
+    cached('ev:tfr:list', RETAIN['current.events'], () =>
+      grab(TFR_LIST_URL, {}, { label: 'FAA TFR list', timeoutMs: 30000 })).catch(() => []),
+  ]);
+  const info = new Map();
+  for (const t of (Array.isArray(list) ? list : list?.tfrs || list?.data || [])) {
+    const no = notamNo(t.notam_id ?? t.notam ?? t.NOTAM_ID);
+    if (no) info.set(no, t);
+  }
+
+  const seen = new Set();
+  return (shapes.features || []).map((f, i) => {
+    const p = f.properties || {};
+    const ring = outerRing(f.geometry);
+    if (!ring?.length || !ringTouches(b, ring)) return null;
+    const no = notamNo(p.NOTAM_KEY ?? p.notam_key ?? p.NOTAM_ID ?? p.notam_id ?? f.id);
+    const key = `${no || i}:${ring.length}`;
+    if (seen.has(key)) return null;
+    seen.add(key);
+    const t = (no && info.get(no)) || {};
+    const type = String(t.type ?? p.LEGAL ?? p.TYPE ?? '').toUpperCase();
+    const [lat, lon] = ringCentre(ring);
+    const floor = p.LOWER_VAL ?? p.lower_val;
+    const ceil = p.UPPER_VAL ?? p.upper_val;
+    return {
+      source: 'tfr',
+      id: `tfr:${no || f.id || i}:${i}`,
+      title: p.TITLE ?? p.title ?? (no ? `TFR ${no}` : 'Flight restriction'),
+      kind: type ? `TFR · ${titleCase(type.toLowerCase())}` : 'Flight restriction',
+      lat, lon,
+      severity: TFR_SEVERITY[type] || 'orange',
+      severityLabel: no ? `NOTAM ${no}` : 'Active TFR',
+      magnitude: null, magnitudeUnit: null,
+      magnitudeText: floor != null || ceil != null ? `${floor ?? 'SFC'} to ${ceil ?? '?'} ${p.UPPER_UOM ?? ''}`.trim() : null,
+      country: [t.facility ?? p.CNS_LOCATION_ID, t.state ?? p.STATE].filter(Boolean).join(' · ') || null,
+      time: p.DATE_EFFECTIVE ?? p.date_effective ?? t.mod_date ?? t.date ?? null,
+      endTime: p.DATE_EXPIRE ?? p.date_expire ?? null,
+      description: t.description ?? p.DESCRIPTION ?? null,
+      url: no ? `https://tfr.faa.gov/tfr3/?page=detail_${no.replace('/', '_')}` : 'https://tfr.faa.gov/',
+      polygon: ring,
+    };
+  }).filter(Boolean);
+}
+
+/* --- MeteoAlarm (European national weather warnings) ----------------- */
+// The keyless per-country CAP feeds behind meteoalarm.org. A warning comes
+// with a polygon when the issuing service draws one; many send only a
+// region code, so those are grouped into one marker per country rather than
+// stacked on top of each other at a guessed spot.
+const METEOALARM_COUNTRIES = {
+  __proto__: null,
+  // feed slug: [ISO code, south, west, north, east]
+  andorra: ['AD', 42.4, 1.4, 42.7, 1.8], austria: ['AT', 46.4, 9.5, 49.0, 17.2],
+  belgium: ['BE', 49.5, 2.5, 51.5, 6.4], 'bosnia-herzegovina': ['BA', 42.5, 15.7, 45.3, 19.6],
+  bulgaria: ['BG', 41.2, 22.3, 44.2, 28.6], croatia: ['HR', 42.4, 13.5, 46.6, 19.5],
+  cyprus: ['CY', 34.5, 32.2, 35.7, 34.6], czechia: ['CZ', 48.5, 12.1, 51.1, 18.9],
+  denmark: ['DK', 54.5, 8.0, 57.8, 15.2], estonia: ['EE', 57.5, 21.7, 59.7, 28.2],
+  finland: ['FI', 59.8, 20.5, 70.1, 31.6], france: ['FR', 41.3, -5.2, 51.1, 9.6],
+  germany: ['DE', 47.2, 5.8, 55.1, 15.1], greece: ['GR', 34.8, 19.3, 41.8, 29.7],
+  hungary: ['HU', 45.7, 16.1, 48.6, 22.9], iceland: ['IS', 63.3, -24.6, 66.6, -13.4],
+  ireland: ['IE', 51.4, -10.5, 55.4, -5.9], israel: ['IL', 29.4, 34.2, 33.4, 35.9],
+  italy: ['IT', 36.6, 6.6, 47.1, 18.6], latvia: ['LV', 55.6, 20.9, 58.1, 28.3],
+  lithuania: ['LT', 53.9, 20.9, 56.5, 26.9], luxembourg: ['LU', 49.4, 5.7, 50.2, 6.6],
+  malta: ['MT', 35.8, 14.2, 36.1, 14.6], moldova: ['MD', 45.4, 26.6, 48.5, 30.2],
+  montenegro: ['ME', 41.8, 18.4, 43.6, 20.4], netherlands: ['NL', 50.7, 3.3, 53.6, 7.3],
+  'north-macedonia': ['MK', 40.8, 20.4, 42.4, 23.1], norway: ['NO', 57.9, 4.5, 71.2, 31.2],
+  poland: ['PL', 49.0, 14.1, 54.9, 24.2], portugal: ['PT', 32.6, -31.3, 42.2, -6.2],
+  romania: ['RO', 43.6, 20.2, 48.3, 29.7], serbia: ['RS', 42.2, 18.8, 46.2, 23.0],
+  slovakia: ['SK', 47.7, 16.8, 49.6, 22.6], slovenia: ['SI', 45.4, 13.4, 46.9, 16.6],
+  spain: ['ES', 27.6, -18.2, 43.8, 4.4], sweden: ['SE', 55.3, 11.1, 69.1, 24.2],
+  switzerland: ['CH', 45.8, 5.9, 47.8, 10.5], ukraine: ['UA', 44.4, 22.1, 52.4, 40.2],
+  'united-kingdom': ['GB', 49.9, -8.2, 60.9, 1.8],
+};
+const CAP_SEVERITY = { __proto__: null, Extreme: 'red', Severe: 'orange', Moderate: 'green', Minor: 'info', Unknown: 'info' };
+
+/** "lat,lon lat,lon ..." (CAP's order) to a GeoJSON-order ring. */
+function capPolygon(text) {
+  const ring = String(text || '').trim().split(/\s+/).map((pair) => pair.split(',').map(Number))
+    .filter((c) => c.length === 2 && Number.isFinite(c[0]) && Number.isFinite(c[1]))
+    .map(([la, lo]) => [lo, la]);
+  return ring.length > 2 ? ring : null;
+}
+
+/** The English (or else the first) info block of a CAP alert. */
+const capInfo = (alert) => {
+  const infos = Array.isArray(alert?.info) ? alert.info : alert?.info ? [alert.info] : [];
+  return infos.find((i) => /^en/i.test(i.language || '')) || infos[0] || null;
+};
+
+async function meteoalarmCountry(slug) {
+  const raw = await cached(`ev:meteoalarm:${slug}`, RETAIN['current.events'], () =>
+    grab(`https://feeds.meteoalarm.org/api/v1/warnings/feeds-${slug}`, {},
+      { label: `MeteoAlarm ${slug}`, timeoutMs: 25000 }));
+  return raw.warnings || [];
+}
+
+async function meteoalarmEvents(b) {
+  const now = Date.now();
+  const touching = Object.entries(METEOALARM_COUNTRIES)
+    .filter(([, [, s, w, n, e]]) => !(n < b.south || s > b.north || e < b.west || w > b.east));
+  // Outside Europe there is nothing to ask: not an answer of "no warnings".
+  if (!touching.length) return Object.assign([], { notCovered: true });
+  // One country failing (a feed that is down) costs only that country.
+  const settled = await Promise.allSettled(touching.map(([slug]) => meteoalarmCountry(slug)));
+  const out = [];
+  settled.forEach((r, ci) => {
+    if (r.status !== 'fulfilled') return;
+    const [slug, [cc]] = touching[ci];
+    const shapeless = [];
+    for (const w of r.value) {
+      const alert = w.alert || w;
+      const info = capInfo(alert);
+      if (!info) continue;
+      const ends = Date.parse(info.expires || '');
+      if (Number.isFinite(ends) && ends < now) continue;
+      const areas = Array.isArray(info.area) ? info.area : info.area ? [info.area] : [];
+      const base = {
+        source: 'meteoalarm',
+        title: info.headline || info.event || 'Weather warning',
+        kind: info.event || 'Weather warning',
+        severity: CAP_SEVERITY[info.severity] || 'info',
+        severityLabel: [info.severity, info.urgency].filter(Boolean).join(' · ') || 'Warning',
+        magnitude: null, magnitudeUnit: null,
+        magnitudeText: info.certainty ? `Certainty: ${info.certainty}` : null,
+        time: info.onset || info.effective || alert.sent || null,
+        endTime: info.expires || null,
+        description: info.description || null,
+        instruction: info.instruction || null,
+        url: safeUrl(info.web) || 'https://meteoalarm.org/',
+      };
+      let drawn = false;
+      areas.forEach((a, ai) => {
+        const polys = (Array.isArray(a.polygon) ? a.polygon : a.polygon ? [a.polygon] : []).map(capPolygon).filter(Boolean);
+        polys.forEach((ring, pi) => {
+          if (!ringTouches(b, ring)) return;
+          const [lat, lon] = ringCentre(ring);
+          out.push({ ...base, id: `meteoalarm:${alert.identifier || w.uuid}:${ai}:${pi}`, lat, lon,
+            country: a.areaDesc || cc, polygon: ring });
+          drawn = true;
+        });
+      });
+      if (!drawn && !areas.some((a) => a.polygon)) {
+        shapeless.push({ ...base, areas: areas.map((a) => a.areaDesc).filter(Boolean) });
+      }
+    }
+    // One marker per country for the warnings that came without a shape.
+    if (shapeless.length) {
+      const c = COUNTRY_CENTROIDS[cc];
+      if (!c || !inBox(b, c[0], c[1])) return;
+      const worst = shapeless.reduce((x, y) => ((SEVERITY_RANK[y.severity] ?? 0) > (SEVERITY_RANK[x.severity] ?? 0) ? y : x));
+      out.push({
+        ...worst,
+        id: `meteoalarm:${slug}:regions`,
+        title: `${shapeless.length} weather warning${shapeless.length === 1 ? '' : 's'} in ${titleCase(slug.replace(/-/g, ' '))}`,
+        kind: 'Weather warnings (regional)',
+        lat: c[0], lon: c[1],
+        country: cc,
+        description: shapeless.slice(0, 25).map((x) => `${x.kind}: ${x.areas.join(', ') || 'region not named'} (${x.severityLabel})`).join('\n')
+          + (shapeless.length > 25 ? `\n…and ${shapeless.length - 25} more` : ''),
+        instruction: null,
+        polygon: null,
+        approximate: true,
+      });
+    }
+  });
+  return out;
+}
+
+/* --- Copernicus EMS rapid mapping ------------------------------------ */
+const CEMS_BASE = 'https://rapidmapping.emergency.copernicus.eu/backend/dashboard-api';
+
+async function cemsEvents(b) {
+  const raw = await cached('ev:cems:list', RETAIN['current.events'], () =>
+    grab(`${CEMS_BASE}/public-activations-info/?limit=100`, {}, { label: 'Copernicus EMS', timeoutMs: 25000 }));
+  const recent = Date.now() - 90 * 86400_000;
+  const hits = (raw.results || []).map((a) => {
+    const c = parseWkt(a.centroid)?.point;
+    if (!c || !inBox(b, c[0], c[1])) return null;
+    const last = Date.parse(a.lastUpdate || a.activationTime || '');
+    if (a.closed && Number.isFinite(last) && last < recent) return null;
+    return { a, lat: c[0], lon: c[1] };
+  }).filter(Boolean);
+
+  // The mapped extent for the few in view, one call each, held like the list.
+  const extents = await Promise.allSettled(hits.slice(0, 12).map(({ a }) =>
+    cached(`ev:cems:${a.code}`, RETAIN['current.events'], () =>
+      grab(`${CEMS_BASE}/public-activations/?code=${encodeURIComponent(a.code)}`, {},
+        { label: 'Copernicus EMS', timeoutMs: 25000 }))));
+
+  return hits.map(({ a, lat, lon }, i) => {
+    const d = extents[i]?.status === 'fulfilled' ? extents[i].value : null;
+    const rec = d?.results?.[0] || d;
+    const ring = parseWkt(rec?.extent)?.ring || null;
+    const countries = Array.isArray(a.countries) ? a.countries.map((c) => c.short_name || c.name || c).join(', ') : a.countries;
+    return {
+      source: 'cems',
+      id: `cems:${a.code}`,
+      title: `${a.code} — ${a.name || a.category || 'activation'}`,
+      kind: a.category ? `Copernicus EMS · ${a.category}` : 'Copernicus EMS',
+      lat, lon,
+      severity: a.closed ? 'green' : 'orange',
+      severityLabel: a.closed ? 'Activation closed' : 'Activation ongoing',
+      magnitude: null, magnitudeUnit: null,
+      magnitudeText: [a.n_aois != null ? `${a.n_aois} areas mapped` : null,
+        a.n_products != null ? `${a.n_products} products` : null].filter(Boolean).join(' · ') || null,
+      country: typeof countries === 'string' ? countries : null,
+      time: a.eventTime || a.activationTime || null,
+      endTime: null,
+      description: `Activated ${a.activationTime || '?'}; last update ${a.lastUpdate || '?'}.`
+        + (a.gdacsId ? ` GDACS ${a.gdacsId}.` : ''),
+      url: `https://rapidmapping.emergency.copernicus.eu/${encodeURIComponent(a.code)}/`,
+      polygon: ring,
+    };
+  });
+}
+
+/* --- ODIN power outages ---------------------------------------------- */
+// DOE/ORNL's Outage Data Initiative Nationwide: utilities report outages to
+// it, and its public map is served county by county, with each county's
+// boundary, from /odi/map. That is the endpoint ODIN's own map calls; it is
+// not separately documented, so the record shape is read defensively.
+async function odinEvents(view) {
+  const b = viewCell(view, 'odin');
+  const url = new URL('https://odin.ornl.gov/odi/map');
+  url.searchParams.set('scale', 'COUNTY');
+  url.searchParams.set('minx', String(b.west));
+  url.searchParams.set('miny', String(b.south));
+  url.searchParams.set('maxx', String(b.east));
+  url.searchParams.set('maxy', String(b.north));
+  const raw = await cached(`ev:odin:${b.key}`, RETAIN['current.outages'], () =>
+    grab(url, {}, { label: 'ODIN', timeoutMs: 30000 }));
+
+  return (Array.isArray(raw) ? raw : []).map((r, i) => {
+    const ring = outerRing(r.feature?.geometry || r.feature);
+    const outs = Array.isArray(r.outages) ? r.outages : [];
+    const out = Number(r.metersOut ?? r.feature?.properties?.metersOut) || 0;
+    const served = outs.reduce((s, o) => s + (Number(o.metersServed) || 0), 0);
+    let lat, lon;
+    if (ring?.length) [lat, lon] = ringCentre(ring);
+    else {
+      const e = outs[0]?.envelope;
+      if (!e) return null;
+      lat = (e.minY + e.maxY) / 2;
+      lon = (e.minX + e.maxX) / 2;
+    }
+    // A single customer out is a household, not an outage worth a marker.
+    if (!Number.isFinite(lat) || !Number.isFinite(lon) || out <= 1) return null;
+    const pct = served > 0 ? (100 * out) / served : null;
+    const place = [r.countyName ? `${r.countyName} County` : null, r.stateName].filter(Boolean).join(', ');
+    const utilities = [...new Set(outs.map((o) => o.utilityName).filter(Boolean))];
+    return {
+      source: 'odin',
+      id: `odin:${r.id || i}`,
+      title: `${out.toLocaleString('en-US')} customer${out === 1 ? '' : 's'} without power${place ? ` — ${place}` : ''}`,
+      kind: 'Power outage',
+      lat, lon,
+      severity: pct == null ? (out >= 10000 ? 'orange' : 'green')
+        : pct >= 10 ? 'red' : pct >= 1 ? 'orange' : pct >= 0.1 ? 'green' : 'info',
+      severityLabel: pct != null ? `${pct < 0.1 ? '<0.1' : pct.toFixed(pct < 10 ? 1 : 0)}% of ${served.toLocaleString('en-US')} customers out` : `${out} out`,
+      magnitude: out, magnitudeUnit: 'customers',
+      magnitudeText: r.precisionLabel || null,
+      country: place || null,
+      time: null, endTime: null,
+      description: utilities.length ? `Reported by ${utilities.join(', ')}.` : null,
+      url: 'https://odin.ornl.gov/map',
+      polygon: ring && ring.length > 2 ? ring : null,
+    };
+  }).filter((e) => e && inBox(view, e.lat, e.lon));
+}
+
+/* --- ACLED political violence and protest ---------------------------- */
+// The ACLED API takes an OAuth password grant against a free myACLED
+// account: a 24-hour access token and a 14-day refresh token. Held in
+// memory only, and the events too: ACLED's EULA limits redistribution, so
+// nothing from it is written to the disk cache.
+let acledToken = { value: null, refresh: null, expires: 0 };
+
+async function acledAuth() {
+  if (acledToken.value && acledToken.expires > Date.now() + 60_000) return acledToken.value;
+  const body = acledToken.refresh
+    ? new URLSearchParams({ refresh_token: acledToken.refresh, grant_type: 'refresh_token', client_id: 'acled' })
+    : new URLSearchParams({ username: CFG.acledEmail, password: CFG.acledPassword,
+      grant_type: 'password', client_id: 'acled', scope: 'authenticated' });
+  let tok;
+  try {
+    tok = await grab('https://acleddata.com/oauth/token', {
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body,
+    }, { label: 'ACLED auth' });
+  } catch (e) {
+    // A refresh token past its 14 days: start again from the login.
+    if (acledToken.refresh) { acledToken = { value: null, refresh: null, expires: 0 }; return acledAuth(); }
+    throw e;
+  }
+  if (!tok?.access_token) throw new UpstreamError(502, 'ACLED did not issue a token: check ACLED_EMAIL / ACLED_PASSWORD');
+  acledToken = {
+    value: tok.access_token,
+    refresh: tok.refresh_token || null,
+    expires: Date.now() + (tok.expires_in || 86400) * 1000,
+  };
+  return acledToken.value;
+}
+
+const ACLED_FIELDS = ['event_id_cnty', 'event_date', 'disorder_type', 'event_type', 'sub_event_type', 'actor1', 'actor2',
+  'country', 'admin1', 'admin2', 'location', 'latitude', 'longitude', 'geo_precision', 'source', 'notes', 'fatalities', 'timestamp'];
+
+async function acledEvents(view) {
+  // Not set up is not an answer of "nothing here".
+  if (!CFG.acledEmail || !CFG.acledPassword) return Object.assign([], { notCovered: true });
+  const b = viewCell(view, 'events');
+  const day = (ms) => new Date(Date.now() - ms).toISOString().slice(0, 10);
+  const url = new URL('https://acleddata.com/api/acled/read');
+  url.searchParams.set('event_date', `${day(30 * 86400_000)}|${day(0)}`);
+  url.searchParams.set('event_date_where', 'BETWEEN');
+  url.searchParams.set('latitude', `${b.south}|${b.north}`);
+  url.searchParams.set('latitude_where', 'BETWEEN');
+  url.searchParams.set('longitude', `${b.west}|${b.east}`);
+  url.searchParams.set('longitude_where', 'BETWEEN');
+  url.searchParams.set('fields', ACLED_FIELDS.join('|'));
+  url.searchParams.set('limit', '2000');
+  const raw = await cached(`ev:acled:${b.key}`, RETAIN['current.events'], async () => {
+    const token = await acledAuth();
+    return grab(url, { headers: { Authorization: `Bearer ${token}` } }, { label: 'ACLED', timeoutMs: 30000 });
+  });
+  if (raw && raw.success === false) {
+    throw new UpstreamError(502, `ACLED: ${raw.error?.message || raw.message || 'request refused'}`);
+  }
+
+  return (raw?.data || []).map((e) => {
+    const lat = Number(e.latitude);
+    const lon = Number(e.longitude);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+    const dead = Number(e.fatalities) || 0;
+    const violent = /battle|explosion|violence against civilians/i.test(e.event_type || '');
+    const actors = [e.actor1, e.actor2].filter(Boolean).join(' vs ');
+    return {
+      source: 'acled',
+      id: `acled:${e.event_id_cnty}`,
+      title: `${e.sub_event_type || e.event_type || 'Event'} — ${e.location || e.admin1 || e.country || ''}`.replace(/ — $/, ''),
+      kind: e.event_type || 'Conflict event',
+      lat, lon,
+      severity: dead >= 10 ? 'red' : dead > 0 || violent ? 'orange' : 'green',
+      severityLabel: dead ? `${dead} reported fatalit${dead === 1 ? 'y' : 'ies'}` : (e.disorder_type || 'No fatalities reported'),
+      magnitude: dead, magnitudeUnit: 'fatalities',
+      magnitudeText: actors || null,
+      country: [e.location, e.admin2, e.admin1, e.country].filter(Boolean).join(', ') || null,
+      time: e.event_date || null,
+      endTime: null,
+      description: [clip(String(e.notes || ''), 1200) || null, e.source ? `Sources: ${e.source}` : null,
+        e.geo_precision && Number(e.geo_precision) > 1 ? 'Location is approximate (ACLED geo-precision '
+          + `${e.geo_precision}).` : null].filter(Boolean).join('\n') || null,
+      url: 'https://acleddata.com/explorer/',
+      polygon: null,
+    };
+  }).filter((x) => x && inBox(view, x.lat, x.lon));
+}
+
 /* --- unified endpoint ------------------------------------------------ */
 const EVENT_FETCHERS = {
   __proto__: null,
   gdacs: gdacsEvents, eonet: eonetEvents, usgs: usgsEvents,
   nws: nwsEvents, firms: firmsEvents, edis: edisEvents,
+  emsc: emscEvents, tfr: tfrEvents, meteoalarm: meteoalarmEvents, cems: cemsEvents,
+  odin: odinEvents, acled: acledEvents,
 };
 
 async function events({ bbox, sources, minSeverity }) {
   const b = parseBbox(bbox);
   if (!b) throw new UpstreamError(400, 'bbox required as south,west,north,east');
 
-  const want = String(sources || 'gdacs,eonet,usgs,nws')
+  const want = String(sources || EVENT_DEFAULTS.join(','))
     .split(',').map((s) => s.trim()).filter((s) => EVENT_FETCHERS[s]);
   if (!want.length) throw new UpstreamError(400, 'no valid sources requested');
 
@@ -5236,11 +6832,20 @@ async function events({ bbox, sources, minSeverity }) {
     const name = want[i];
     if (r.status === 'rejected') { problems[name] = r.reason?.message || String(r.reason); return; }
     const list = r.value || [];
+    if (list.notCovered) return;
     if (list.zoneOnly) zoneOnly += list.zoneOnly;
     const kept = list.filter((e) => (SEVERITY_RANK[e.severity] ?? 0) >= floor);
     bySource[name] = kept.length;
     all.push(...kept);
   });
+
+  // The same earthquake from USGS and EMSC is drawn once, as USGS's.
+  const deduped = dropDuplicateQuakes(all);
+  if (deduped.length !== all.length) {
+    bySource.emsc = (bySource.emsc || 0) - (all.length - deduped.length);
+    all.length = 0;
+    all.push(...deduped);
+  }
 
   // Most severe first, then most recent.
   all.sort((x, y) => (SEVERITY_RANK[y.severity] ?? 0) - (SEVERITY_RANK[x.severity] ?? 0)
@@ -6277,6 +7882,7 @@ const CREDENTIAL_RESETS = {
   opensky: () => { openSkyToken = { value: null, expires: 0 }; },
   spacetrack: () => { spaceTrackCookie = null; },
   gee: () => { geeToken = { value: null, expires: 0 }; },
+  acled: () => { acledToken = { value: null, refresh: null, expires: 0 }; },
   ais: () => {
     clearTimeout(ais.reconnectTimer);
     ais.reconnectDelay = 2000;
@@ -6333,6 +7939,12 @@ const CREDENTIALS = [
   { name: 'FIRMS_MAP_KEY', group: 'Hazards', label: 'NASA FIRMS map key',
     url: 'https://firms.modaps.eosdis.nasa.gov/api/map_key/',
     note: 'Active-fire detections.', set: (v) => { CFG.firmsKey = v; } },
+  { name: 'ACLED_EMAIL', group: 'Hazards', label: 'ACLED account email', secret: false,
+    url: 'https://acleddata.com/register/',
+    note: 'Political violence and protest events. Free myACLED account; the API logs in with it.',
+    set: (v) => { CFG.acledEmail = v; }, reset: 'acled' },
+  { name: 'ACLED_PASSWORD', group: 'Hazards', label: 'ACLED account password',
+    set: (v) => { CFG.acledPassword = v; }, reset: 'acled' },
   { name: 'EDIS_API_URL', group: 'Hazards', label: 'RSOE EDIS feed URL', secret: false, kind: 'url',
     sendsKey: 'EDIS_API_KEY',
     note: 'Enterprise feed; needs the URL and the key. Changing the URL alone clears the key.',
@@ -6676,13 +8288,23 @@ const ROUTES = {
       windy: CFG.windyKey ? 'configured' : 'missing WINDY_API_KEY (other cam sources still work)',
       openwebcamdb: CFG.owcdbKey ? 'configured' : 'missing OPENWEBCAMDB_API_KEY',
       alertcalifornia: 'open (wildfire PTZ cameras)',
+      caltrans: 'open (California highway cameras)', tfl: 'open (London JamCams)',
+      digitraffic: 'open (Finland road weather cameras)', drivebc: 'open (British Columbia highway cameras)',
+      agencyCameras: osirisCctv ? `open (OSIRIS catalogue ${String(osirisCctv.OSIRIS_COMMIT).slice(0, 7)}, ${Object.keys(osirisCctv.regionFetchers).length} regions)` : 'not vendored',
       youtube: CFG.youtubeKey ? 'configured' : 'missing YOUTUBE_API_KEY',
+      youtubeLive: CFG.youtubeKey
+        ? `configured (live cameras; ${CFG.ytCamChannels.length} listed channel${CFG.ytCamChannels.length === 1 ? '' : 's'})`
+        : 'missing YOUTUBE_API_KEY',
       wikimediaPhotos: 'open (nearby photos)',
       flickr: CFG.flickrKey ? 'configured (nearby photos)' : 'not set (optional, nearby photos)',
       mapillary: CFG.mapillaryToken ? 'configured (nearby photos)' : 'not set (optional, nearby photos)',
       streetView: streetViewKey() ? 'configured (embedded panorama)' : 'not set (link to Google Maps only)',
       cesiumIon: CFG.cesiumIonToken ? 'configured' : 'not set (OSM basemap only)',
       gdacs: 'open', eonet: 'open', usgs: 'open', nws: 'open',
+      emsc: 'open', tfr: 'open (FAA, US only)', meteoalarm: 'open (Europe)', cems: 'open',
+      odin: 'open (US power outages)',
+      acled: CFG.acledEmail && CFG.acledPassword ? 'configured' : 'missing ACLED_EMAIL / ACLED_PASSWORD',
+      adsb: adsbFeed() ? `${adsbFeed().label} (unfiltered ADS-B, ${adsbFeed().licence})` : 'off (ADSB_FEED)',
       alpr: 'open (OpenStreetMap via Overpass)',
       geoip: 'open (ipwho.is)',
       adsbdb: 'open (flight routes)',
@@ -6691,6 +8313,7 @@ const ROUTES = {
       ais: CFG.aisKey ? `configured (stream: ${ais.status})` : 'missing AISSTREAM_API_KEY',
       atlas: 'open (RIPE Atlas probes)',
       tor: 'open (country-level only — Onionoo dropped relay coordinates)',
+      mesh: 'open (Meshtastic via meshmap.net, MeshCore via map.meshcore.io)',
       opencellid: CFG.openCellIdKey ? 'configured' : 'missing OPENCELLID_API_KEY',
       wigle: CFG.wigleName ? 'configured' : 'missing WIGLE_API_NAME / WIGLE_API_TOKEN',
       sensorCommunity: 'open (IoT air + noise sensors)',
@@ -6723,7 +8346,9 @@ const ROUTES = {
       fiveElevenHosts: Object.keys(FIVE_ELEVEN_HOSTS),
       events: Object.fromEntries(Object.entries(EVENT_SOURCES).map(([k, v]) => [k, {
         label: v.label, color: v.color, note: v.note,
-        available: k === 'firms' ? !!CFG.firmsKey : k === 'edis' ? !!CFG.edisUrl : true,
+        available: k === 'firms' ? !!CFG.firmsKey : k === 'edis' ? !!CFG.edisUrl
+          : k === 'acled' ? !!(CFG.acledEmail && CFG.acledPassword) : true,
+        default: EVENT_DEFAULTS.includes(k),
       }])),
     },
   }),
@@ -7369,6 +8994,11 @@ async function handleRequest(req, res) {
       await serveCachedTile(req, res, url);
       return;
     }
+    if (pathname === '/cams/frame') {
+      await serveCamFrame(req, res, url);
+      done();
+      return;
+    }
     const cartoTile = CARTO_TILE_RE.exec(pathname);
     if (cartoTile) {
       await serveCartoTile(req, res, cartoTile);
@@ -7554,6 +9184,13 @@ module.exports = {
   waybackTiming,
   shodanGate, shodanGrab,
   openSky, openSkyPollSec, openSkyRefillSec, noteOpenSkyHeaders, assertOpenSkyCredit, OPENSKY_FLOOR,
+  ADSB_FEEDS, normaliseAdsb, mergeAircraft,
+  WINDY_MAX_CALLS, normaliseWindy,
+  looksLikeCamera, placeFromTitle, titlePlaces, confidentPlace, parseList, ytLiveShown, nominatimGate,
+  osirisUrl, normaliseOsiris, useOsirisCatalogue, camFrameCache, youtubeIdOf,
+  normaliseMeshtastic, normaliseMeshcore,
+  EVENT_SOURCES, EVENT_DEFAULTS, parseWkt, capPolygon, notamNo, dropDuplicateQuakes,
+  METEOALARM_COUNTRIES,
   SAT_GROUPS, fetchTle, readCachedTle, writeCachedTle, tleCachePath,
   nearbyPhotos, photoTakenAt, orbitalElements, SPACETRACK_GROUPS, celestrakHold, CREDENTIAL_RESETS,
   overpassGate, overpassQuery, mirrorFailure, OVERPASS_PRESETS, OVERPASS_ENDPOINTS,

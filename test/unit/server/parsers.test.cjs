@@ -284,6 +284,66 @@ describe('no version number', () => {
     assert.equal(S.VERSION, undefined);
   });
 
+  test('WKT: points, polygons and the first part of a multipolygon', () => {
+    assert.deepEqual(S.parseWkt('POINT (2.5 48.8)'), { point: [48.8, 2.5] });
+    assert.deepEqual(S.parseWkt('SRID=4326;POLYGON ((0 0, 1 0, 1 1, 0 0))'), { ring: [[0, 0], [1, 0], [1, 1], [0, 0]] });
+    assert.deepEqual(S.parseWkt('MULTIPOLYGON (((0 0, 2 0, 2 2, 0 0)), ((5 5, 6 5, 6 6, 5 5)))').ring[1], [2, 0]);
+    for (const bad of ['', null, 'LINESTRING (0 0, 1 1)', 'POLYGON ((0 0, 1 1))', 'POINT (x y)']) {
+      assert.equal(S.parseWkt(bad), null, String(bad));
+    }
+  });
+
+  test('CAP polygons are lat,lon and come out lon,lat', () => {
+    assert.deepEqual(S.capPolygon('50.2,8.2 50.4,8.4 50.2,8.4 50.2,8.2'), [[8.2, 50.2], [8.4, 50.4], [8.4, 50.2], [8.2, 50.2]]);
+    assert.equal(S.capPolygon('50,8 51,9'), null);
+    assert.equal(S.capPolygon(undefined), null);
+  });
+
+  test('NOTAM numbers out of the forms the FAA uses', () => {
+    assert.equal(S.notamNo('6/1234-1-FDC-F'), '6/1234');
+    assert.equal(S.notamNo('FDC 5/0123'), '5/0123');
+    assert.equal(S.notamNo('nothing'), null);
+  });
+
+  test('EMSC duplicates of USGS quakes: same minute, 100 km and half a magnitude', () => {
+    const t = '2026-11-21T10:00:00Z';
+    const u = { source: 'usgs', lat: 35, lon: -100, magnitude: 4.7, time: t };
+    const dup = { source: 'emsc', lat: 35.3, lon: -100, magnitude: 4.9, time: '2026-11-21T10:00:30Z' };
+    const other = { source: 'emsc', lat: 35, lon: -100, magnitude: 6.0, time: t };
+    assert.deepEqual(S.dropDuplicateQuakes([u, dup, other]), [u, other]);
+  });
+
+  test('every event source has a fetcher-facing label and the defaults are known sources', () => {
+    for (const k of S.EVENT_DEFAULTS) assert.ok(S.EVENT_SOURCES[k], k);
+    for (const [slug, [cc, s, w, n, e]] of Object.entries(S.METEOALARM_COUNTRIES)) {
+      assert.match(cc, /^[A-Z]{2}$/, slug);
+      assert.ok(s < n && w < e, slug);
+    }
+  });
+
+  test('camera filter: camera words or long-running and located; never gaming, music or talk', () => {
+    const live = (title, extra = {}) => ({ snippet: { title, liveBroadcastContent: 'live', categoryId: '22', ...extra.snippet },
+      liveStreamingDetails: extra.live || {}, recordingDetails: extra.rec || {} });
+    const old = { actualStartTime: new Date(Date.now() - 3 * 86400e3).toISOString() };
+    assert.equal(S.looksLikeCamera(live('Live View — Downtown Cary Park')), true);
+    assert.equal(S.looksLikeCamera(live('NC State Security Live Stream - NCSU Belltower')), true);
+    assert.equal(S.looksLikeCamera(live('Untitled', { live: old, rec: { location: { latitude: 1, longitude: 2 } } })), true);
+    assert.equal(S.looksLikeCamera(live('Untitled', { live: old })), false);
+    assert.equal(S.looksLikeCamera(live('Harbour cam', { snippet: { categoryId: '20' } })), false);
+    assert.equal(S.looksLikeCamera(live('lofi beats to study cam')), false);
+    assert.equal(S.looksLikeCamera(live('Harbour cam', { snippet: { liveBroadcastContent: 'none' } })), false);
+    assert.equal(S.looksLikeCamera(live('Annual report live')), false, '"report" is not "port"');
+  });
+
+  test('camera titles reduced to a place to look up', () => {
+    assert.equal(S.placeFromTitle('Live View — Downtown Cary Park'), 'Downtown Cary Park');
+    assert.equal(S.placeFromTitle('Times Square LIVE Cam 24/7 [4K]'), 'Times Square');
+  });
+
+  test('YOUTUBE_CAM_CHANNELS: @handles and UC ids, deduplicated', () => {
+    assert.deepEqual(S.parseList('@ncsu-sat, @ncsu-sat,UCcaryncgovTESTchann0002,bad,@x,UCshort'), ['@ncsu-sat', 'UCcaryncgovTESTchann0002']);
+  });
+
   test('user agent names the app and a contact URL, without a version', () => {
     assert.match(S.USER_AGENT, /^OpenPanopticon \(.*\+https:\/\/github\.com\//);
     assert.doesNotMatch(S.USER_AGENT, /\d+\.\d+\.\d+/);

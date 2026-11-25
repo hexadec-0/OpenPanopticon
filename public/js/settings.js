@@ -79,7 +79,7 @@ export function collect(wv) {
     enabled: Object.fromEntries(Object.entries(L).map(([k, l]) => [k, l.enabled])),
 
     shodan: { colorBy: L.shodan.colorBy, lookups: L.shodan.lookupsOn, settleMs: wv.shodanSettleMs },
-    flights: { showLabels: L.flights.showLabels, showTrails: L.flights.showTrails },
+    flights: { showLabels: L.flights.showLabels, showTrails: L.flights.showTrails, militaryOnly: !!L.flights.militaryOnly },
     satellites: { group: L.satellites.group, limit: L.satellites.limit },
     overpass: { presets: set(L.overpass.presets) },
     alpr: {
@@ -153,6 +153,7 @@ export function apply(wv, s) {
   if (s.flights) {
     L.flights.showLabels = bool(s.flights.showLabels, L.flights.showLabels);
     L.flights.showTrails = bool(s.flights.showTrails, L.flights.showTrails);
+    L.flights.militaryOnly = bool(s.flights.militaryOnly, L.flights.militaryOnly);
   }
   if (s.satellites) {
     L.satellites.group = s.satellites.group || L.satellites.group;

@@ -332,8 +332,9 @@ describe('FlightLayer', () => {
     const l = on(new L.FlightLayer(viewer));
     await l.refresh(ctx());
     assert.equal(l.status, 'ok', l.error);
-    assert.equal(l.count, 3);
-    assert.equal(l.dropped, 1);
+    assert.equal(l.count, 4, 'OpenSky\'s three plus the military contact only adsb.lol hears');
+    assert.equal(l.dropped, 2);
+    assert.equal(l.military, 1);
     assert.equal(l.resolutionSec, 5);
     assert.ok(l.pollSec >= 6);
     assert.equal(l.credits, 3900);
@@ -343,13 +344,29 @@ describe('FlightLayer', () => {
     assert.equal(byId.ffeedd.label.fillColor.css, '#8b949e', 'on the ground is grey');
     assert.match(byId.a1b2c3.label.text, /^TST123\n33100ft 447kt$/);
     assert.match(byId.ffeedd.label.text, /GND/);
+    assert.equal(byId.ae1234.label.fillColor.css, '#c77dff', 'military is violet');
+    assert.match(byId.ae1234.label.text, /^RCH417 · MIL\n/);
     assert.ok(byId.a1b2c3.position instanceof Cesium.CallbackPositionProperty);
+  });
+
+  test('military only, and the military detail rows', async () => {
+    const l = on(new L.FlightLayer(viewer));
+    l.militaryOnly = true;
+    await l.refresh(ctx());
+    assert.deepEqual(ents(l).map((e) => e.id), ['ae1234']);
+    assert.equal(l.count, 1);
+    const d = l.detail(ents(l)[0].properties.record.value);
+    assert.equal(d.kind, 'AIR CONTACT · MILITARY');
+    assert.match(d.html, /07-7177/);
+    assert.match(d.html, /NIC 0 · NACp 0 — degraded/);
+    assert.match(d.html, /adsb\.lol/);
   });
 
   test('aircraft that drop out of the box are retired with their trails', async () => {
     const l = on(new L.FlightLayer(viewer));
     await l.refresh(ctx());
     s.mock.on('/api/states/all', () => json({ time: Math.floor(Date.now() / 1000), states: [] }));
+    s.mock.on('api.adsb.lol', () => json({ ac: [] }));
     s.mod.cache.clear();
     await l.refresh(ctx(), { force: true });
     assert.equal(ents(l).length, 0);
@@ -682,6 +699,22 @@ describe('EventLayer', () => {
     assert.ok(!ents(l).some((e) => e.polygon));
   });
 
+  test('a TFR is its outline and one pin: no fill, no pulsing halo', async () => {
+    const l = on(new L.EventLayer(viewer));
+    l.sources = new Set(['tfr']);
+    await l.refresh(ctx());
+    assert.equal(l.status, 'ok', l.error);
+    assert.ok(l.count > 0, 'the fixture has TFRs in view');
+    const e = ents(l);
+    assert.ok(!e.some((x) => x.ellipse || x.polygon || x.point), 'no circle, fill or dot');
+    assert.equal(e.filter((x) => x.billboard).length, l.count, 'one pin each');
+    assert.ok(e.some((x) => x.polyline), 'the restricted area outlined');
+    l.showPolygons = false;
+    l.redraw();
+    assert.ok(!ents(l).some((x) => x.polyline));
+    assert.equal(ents(l).filter((x) => x.billboard).length, l.count);
+  });
+
   test('severity and source filters apply at draw time', async () => {
     const l = on(new L.EventLayer(viewer));
     await l.refresh(ctx());
@@ -695,10 +728,25 @@ describe('EventLayer', () => {
   });
 
   test('every source failing is a layer error', async () => {
-    for (const h of ['www.gdacs.org', 'eonet', 'earthquake.usgs.gov', 'api.weather.gov']) s.mock.fail(h, 500);
+    for (const h of ['www.gdacs.org', 'eonet', 'earthquake.usgs.gov', 'api.weather.gov',
+      'seismicportal', 'tfr.faa.gov', 'meteoalarm', 'rapidmapping', 'odin.ornl.gov', 'acleddata.com']) s.mock.fail(h, 500);
     const l = on(new L.EventLayer(viewer));
     await l.refresh(ctx(), { isRetry: true });
     assert.equal(l.status, 'error');
+    clearTimeout(l._retryTimer);
+  });
+
+  test('one source failing in a quiet view is a note, not a layer error', async () => {
+    s.mock.fail('eonet', 500);
+    // These two place a fixture inside any box asked about: quiet them too.
+    s.mock.on('odin.ornl.gov', () => json([]));
+    s.mock.on('/api/acled/read', () => json({ success: true, data: [] }));
+    const l = on(new L.EventLayer(viewer));
+    // Far from every fixture event: the other sources answer with nothing.
+    await l.refresh(ctx('-60,100,-59,101'), { isRetry: true });
+    assert.equal(l.status, 'ok', l.error);
+    assert.equal(l.count, 0);
+    assert.match(l.problems.eonet, /HTTP 500/);
     clearTimeout(l._retryTimer);
   });
 
@@ -716,6 +764,7 @@ describe('EventLayer', () => {
     assertInert(bad.html);
     assert.ok(!bad.html.includes('Open source report'));
   });
+
 });
 
 describe('WebcamLayer', () => {
@@ -723,7 +772,136 @@ describe('WebcamLayer', () => {
     const l = on(new L.WebcamLayer(viewer));
     await l.refresh(ctx('34.9,-100.1,35.1,-99.9'));
     assert.equal(l.status, 'ok', l.error);
-    assert.deepEqual(l.bySource, { windy: 2, nycdot: 1, openwebcamdb: 1, alertca: 2 });
+    assert.deepEqual(l.bySource, { windy: 2, nycdot: 1, openwebcamdb: 1, alertca: 2, ytlive: 3, agency: 6 },
+      'the regional agency sources draw nothing outside their areas; the OSIRIS stand-in covers this one');
+  });
+
+  test('HLS plays through hls.js with the still as poster; a dead stream falls back to the still', async () => {
+    const made = [];
+    class FakeHls {
+      static isSupported() { return FakeHls.ok; }
+      static Events = { MANIFEST_PARSED: 'parsed', ERROR: 'error' };
+      constructor() { this.handlers = {}; this.destroyed = false; made.push(this); }
+      on(ev, fn) { this.handlers[ev] = fn; }
+      loadSource(u) { this.src = u; }
+      attachMedia(v) { this.media = v; }
+      destroy() { this.destroyed = true; }
+    }
+    globalThis.Hls = FakeHls;
+    try {
+      FakeHls.ok = true;
+      const l = new L.WebcamLayer(viewer);
+      const root = new FakeElement('div');
+      const rec = { source: 'caltrans', title: 'I-110', image: 'https://cwwp2.dot.ca.gov/x.jpg',
+        hls: 'https://wzmedia.dot.ca.gov/D7/CCTV-196.stream/playlist.m3u8' };
+      await l.enrich(rec, root);
+      await new Promise((r) => setTimeout(r, 0));
+      const stage = root.querySelector('[data-slot="camstage"]');
+      const v = stage.children[0];
+      assert.equal(v.tagName, 'VIDEO');
+      assert.equal(v.poster, 'https://cwwp2.dot.ca.gov/x.jpg');
+      assert.equal(made[0].src, rec.hls);
+      assert.equal(made[0].media, v);
+      made[0].handlers.error?.(null, { fatal: true });
+      assert.equal(made[0].destroyed, true, 'a dead stream stops downloading');
+      assert.equal(stage.children.find((c) => c.tagName === 'IMG')?.className, 'cam-live', 'the refreshed still instead');
+      l.stopLive();
+
+      FakeHls.ok = false;
+      const r2 = new FakeElement('div');
+      await l.enrich(rec, r2);
+      await new Promise((r) => setTimeout(r, 0));
+      assert.ok(r2.querySelector('[data-slot="camstage"]').children.some((c) => c.tagName === 'IMG'), 'no MSE: the still');
+      l.stopLive();
+    } finally { delete globalThis.Hls; }
+  });
+
+  test('every camera links its source, and its feed where that is a different address', () => {
+    const l = new L.WebcamLayer(viewer);
+    const base = { source: 'agency', title: 'Cam', lat: 1, lon: 2 };
+    const d = l.detail({ ...base, image: 'https://cams.example.gov/1.jpg', link: 'https://cams.example.gov/' }).html;
+    assert.match(d, /href="https:\/\/cams\.example\.gov\/"[^>]*>Open source page/);
+    assert.match(d, /href="https:\/\/cams\.example\.gov\/1\.jpg"[^>]*>Open feed/);
+    const yt = l.detail({ ...base, source: 'ytlive', image: 'https://i.ytimg.com/vi/x/hq.jpg', youtubeEmbed: 'https://www.youtube-nocookie.com/embed/AbCdEfGhIj0', link: 'https://www.youtube.com/watch?v=AbCdEfGhIj0' }).html;
+    assert.doesNotMatch(yt, /Open feed/);
+    assert.doesNotMatch(l.detail({ ...base, image: '/cams/frame?kind=texas' }).html, /Open feed/);
+    assert.doesNotMatch(l.detail({ ...base, image: 'javascript:alert(1)' }).html, /Open feed/);
+  });
+
+  test('agency streams: MJPEG in an image, MP4 in a muted video, HLS in a player', async () => {
+    const l = new L.WebcamLayer(viewer);
+    const stageOf = async (rec) => {
+      const root = new FakeElement('div');
+      await l.enrich({ source: 'agency', title: 'Cam', ...rec }, root);
+      l.stopLive();
+      return root.querySelector('[data-slot="camstage"]');
+    };
+    const m = await stageOf({ mjpeg: 'https://mjpeg.example.net/video.mjpg' });
+    assert.equal(m.children[0].tagName, 'IMG');
+    assert.equal(m.children[0].src, 'https://mjpeg.example.net/video.mjpg');
+    const v = await stageOf({ video: 'https://clips.example.net/c.mp4' });
+    assert.equal(v.children[0].tagName, 'VIDEO');
+    assert.equal(v.children[0].muted, true);
+    const h = await stageOf({ hls: 'https://hls.example.net/live.m3u8', link: 'https://hls.example.net/' });
+    assert.equal(h.children[0].tagName, 'VIDEO', 'HLS gets a player, not a link');
+    const yt = await stageOf({ embed: 'https://www.youtube.com/embed/AbCdEfGhIj0' });
+    assert.equal(yt.children[0].getAttribute('referrerpolicy'), 'strict-origin', 'YouTube needs the origin');
+    const other = await stageOf({ embed: 'https://player.example.net/x' });
+    assert.equal(other.children[0].getAttribute('referrerpolicy'), 'no-referrer');
+    const bad = await stageOf({ mjpeg: 'http://plain.example.net/v.mjpg' });
+    assert.ok(!bad.children.some((c) => c.src === 'http://plain.example.net/v.mjpg'));
+  });
+
+  test('a YouTube live camera shows its thumbnail and plays only when asked', async () => {
+    const l = new L.WebcamLayer(viewer);
+    const root = new FakeElement('div');
+    const rec = { source: 'ytlive', title: 'Live View — Downtown Cary Park', videoId: 'YVXZk3-kzcI',
+      image: 'https://i.ytimg.com/vi/YVXZk3-kzcI/hqdefault_live.jpg',
+      youtubeEmbed: 'https://www.youtube-nocookie.com/embed/YVXZk3-kzcI' };
+    await l.enrich(rec, root);
+    const stage = root.querySelector('[data-slot="camstage"]');
+    assert.deepEqual(stage.children.map((c) => c.tagName), ['IMG', 'BUTTON']);
+    stage.children[1].onclick();
+    const frame = stage.children.find((c) => c.tagName === 'IFRAME');
+    assert.ok(frame, 'the player is mounted on Play');
+    assert.equal(frame.src, 'https://www.youtube-nocookie.com/embed/YVXZk3-kzcI?autoplay=1&mute=1&rel=0');
+    assert.equal(frame.getAttribute('referrerpolicy'), 'strict-origin');
+    l.stopLive();
+    const other = new FakeElement('div');
+    await l.enrich({ ...rec, youtubeEmbed: 'https://evil.example/embed/x', image: null }, other);
+    assert.ok(!other.querySelector('[data-slot="camstage"]').children.some((c) => c.tagName === 'IFRAME'));
+    const d = l.detail({ ...rec, lat: 35.79, lon: -78.78, placement: 'named', channel: 'Cary, NC',
+      channelLink: 'https://www.youtube.com/channel/UCcaryncgovTESTchann0002', updated: '2026-10-15T00:00:00Z' });
+    assert.match(d.html, /YouTube live camera/);
+    assert.match(d.html, /Live since/);
+    assert.match(d.html, /approximate/);
+    assert.match(d.html, /Channel ↗/);
+  });
+
+  test('a YouTube live camera shows its thumbnail, and the player only on Play', async () => {
+    const l = new L.WebcamLayer(viewer);
+    const root = new FakeElement('div');
+    const rec = { source: 'ytlive', title: 'Live View', image: 'https://i.ytimg.com/vi/YVXZk3-kzcI/hqdefault_live.jpg',
+      youtubeEmbed: 'https://www.youtube-nocookie.com/embed/YVXZk3-kzcI', embed: null };
+    await l.enrich(rec, root);
+    const stage = root.querySelector('[data-slot="camstage"]');
+    const [img, play] = stage.children;
+    assert.equal(img.tagName, 'IMG');
+    assert.equal(play.tagName, 'BUTTON');
+    assert.ok(!stage.children.some((c) => c.tagName === 'IFRAME'), 'nothing from YouTube until asked');
+    play.onclick();
+    const frame = stage.children.find((c) => c.tagName === 'IFRAME');
+    assert.equal(frame.src, 'https://www.youtube-nocookie.com/embed/YVXZk3-kzcI?autoplay=1&mute=1&rel=0');
+    assert.equal(frame.getAttribute('referrerpolicy'), 'strict-origin');
+    l.stopLive();
+    assert.equal(frame.src, 'about:blank');
+  });
+
+  test('a YouTube live embed from anywhere but youtube-nocookie is not played', async () => {
+    const l = new L.WebcamLayer(viewer);
+    const root = new FakeElement('div');
+    await l.enrich({ source: 'ytlive', title: 't', youtubeEmbed: 'https://evil.example/embed/x' }, root);
+    assert.ok(!root.querySelector('[data-slot="camstage"]').children.some((c) => c.tagName === 'BUTTON'));
   });
 
   test('a player is mounted in a locked-down iframe', async () => {

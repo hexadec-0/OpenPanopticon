@@ -54,7 +54,8 @@ e2e('boot', () => {
     // Flights repolls every few seconds and refetches when the boot fly-in
     // settles, so by the time the slower layers are ready its count may be
     // showing a fetch in progress (···). Wait for it to settle on the number.
-    for (const [id, want] of [['flights', '3'], ['satellites', '2']]) {
+    // Flights: OpenSky's three live contacts plus the military one adsb.lol adds.
+    for (const [id, want] of [['flights', '4'], ['satellites', '2']]) {
       const sel = `${row(id)} .layer-count`;
       await page.waitForFunction((s, w) => document.querySelector(s)?.textContent === w,
         { timeout: 15_000, polling: 100 }, sel, want).catch(() => {});
@@ -218,6 +219,7 @@ e2e('boot without any API keys', () => {
     stack.server.mock.on('www.gdacs.org', () => status(500, 'boom'));
     stack.server.mock.on('eonet', () => status(500, 'boom'));
     stack.server.mock.on('api.weather.gov', () => status(500, 'boom'));
+    for (const h of ['seismicportal', 'tfr.faa.gov', 'rapidmapping', 'odin.ornl.gov', 'acleddata.com']) stack.server.mock.on(h, () => status(500, 'boom'));
     const { page } = await stack.open();
     await waitForLayer(page, 'events', { status: 'error' });
     await page.waitForFunction(() => document.querySelector('.layer[data-layer="events"]').classList.contains('failed'));

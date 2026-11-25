@@ -1794,9 +1794,17 @@ class OpenPanopticon {
         this.layers.flights.source.entities.values.forEach((e) => { if (e.polyline) e.polyline.show = v; });
         this.persist();
       }),
+      checkbox('Military only', this.layers.flights.militaryOnly, (v) => {
+        this.layers.flights.militaryOnly = v;
+        this.persist();
+        if (this.layers.flights.enabled) this.refreshOne('flights');
+      }),
       el('p', 'note', this.health.sources.opensky === 'authenticated'
         ? 'OpenSky authenticated — 5s resolution, 4,000 credits/day.'
         : 'OpenSky anonymous — 10s resolution, 400 credits/day. Add OPENSKY_CLIENT_ID/SECRET to raise it.'),
+      el('p', 'note', /^off/.test(this.health.sources.adsb || 'off')
+        ? 'No unfiltered feed: set ADSB_FEED to adsb.lol, airplanes.live or adsb.fi to add military and privacy-listed aircraft.'
+        : `Merged with ${this.health.sources.adsb}: unfiltered, so military and privacy-listed aircraft show (violet = military).`),
     );
     mk('flights', 'Live aircraft', airCtl);
 
@@ -1974,7 +1982,7 @@ class OpenPanopticon {
       netChips.append(c);
     }
     netCtl.append(netChips,
-      checkbox('Draw estimated cell ranges', this.layers.netinfra.showRanges, (v) => {
+      checkbox('Draw estimated ranges (cells, blurred mesh positions)', this.layers.netinfra.showRanges, (v) => {
         this.layers.netinfra.showRanges = v;
         this.layers.netinfra.redraw();
         this.renderLayerStatus();
@@ -2038,8 +2046,11 @@ class OpenPanopticon {
     const camSources = [
       ['NYC DOT traffic cams', true],
       ['ALERTCalifornia wildfire cams', true],
+      ['Caltrans, TfL, Digitraffic (FI), DriveBC (BC)', true],
+      ['Road agencies worldwide (OSIRIS catalogue)', String(this.health.sources.agencyCameras || '').startsWith('open')],
       ['Windy Webcams', this.health.sources.windy === 'configured'],
       ['OpenWebcamDB', this.health.sources.openwebcamdb === 'configured'],
+      ['YouTube live cameras', String(this.health.sources.youtubeLive || '').startsWith('configured')],
     ];
     const camList = el('div', 'srclist');
     for (const [name, on] of camSources) {
@@ -2050,7 +2061,8 @@ class OpenPanopticon {
     }
     camCtl.append(camList, el('p', 'note',
       'Cameras their operators publish for public viewing. Add WINDY_API_KEY and '
-      + 'OPENWEBCAMDB_API_KEY in .env to widen coverage.'));
+      + 'OPENWEBCAMDB_API_KEY in .env to widen coverage. YouTube live cameras use '
+      + 'YOUTUBE_API_KEY; follow whole channels with YOUTUBE_CAM_CHANNELS.'));
     mk('webcams', 'Public cameras', camCtl);
 
     /* --- YouTube -------------------------------------------------- */
@@ -2777,6 +2789,13 @@ class OpenPanopticon {
           // A map that quietly polls more slowly looks like a map that has
           // stopped working, so the budget is part of the readout.
           const bits = [`${layer.count.toLocaleString()} contacts`];
+          if (layer.military) bits.push(`${layer.military.toLocaleString()} military`);
+          if (layer.feed) {
+            bits.push(layer.feed.ok
+              ? `${layer.feed.count.toLocaleString()} heard by ${layer.feed.label}, merged with OpenSky`
+              : `${layer.feed.label} unavailable: OpenSky only`);
+          }
+          if (layer.problems?.opensky) bits.push(`OpenSky skipped: ${layer.problems.opensky}`);
           bits.push(`feed updates every ${layer.resolutionSec}s`);
           if (layer.dropped) {
             bits.push(`${layer.dropped} dropped — not heard from in over 2 min, `

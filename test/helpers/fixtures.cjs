@@ -41,6 +41,8 @@ const TEST_KEYS = Object.freeze({
   OPENSKY_CLIENT_ID: 'test-opensky-id',
   OPENSKY_CLIENT_SECRET: 'test-opensky-SECRET-cccc',
   FIVE_ELEVEN_KEYS: 'GA:test-511ga-SECRET-dddd',
+  ACLED_EMAIL: 'analyst@example.org',
+  ACLED_PASSWORD: 'test-acled-SECRET-ffff',
 });
 
 const near = (dLat = 0, dLon = 0) => ({ lat: HOME.lat + dLat, lon: HOME.lon + dLon });
@@ -472,7 +474,58 @@ function rainviewer() {
 
 // YouTube Data API: two search pages, then the videos.list lookup. Of the
 // three ids found, one has no geotag and one is a live stream.
+// YouTube live cameras. Two real channels from the README's examples
+// (NC State's belltower, Downtown Cary Park), neither with a location set;
+// a geotagged harbour camera; and streams the camera filter must refuse.
+const YT_CH = { '@ncsu-sat': 'UCncsusatTESTchannel0001', '@caryncgovchannel': 'UCcaryncgovTESTchann0002' };
+
+function youtubeLiveSearch({ params }) {
+  const ch = params.get('channelId');
+  if (ch === YT_CH['@ncsu-sat']) return json({ items: [{ id: { videoId: 'D9nujG0PUTQ' } }] });
+  if (ch === YT_CH['@caryncgovchannel']) return json({ items: [{ id: { videoId: 'YVXZk3-kzcI' } }] });
+  if (ch) return json({ items: [] });
+  if (params.get('location')) {
+    return json({ items: ['ytcamGEO001', 'ytgameGEO02', 'ytendedGEO4'].map((videoId) => ({ id: { videoId } })) });
+  }
+  // A place-name search ("Testville live cam|…").
+  return json({ items: ['YVXZk3-kzcI', 'yttalkshow3', 'ytnamedcam5', 'ytaquarium7', 'ytspring008', 'ytsquare009'].map((videoId) => ({ id: { videoId } })) });
+}
+
+function youtubeChannels({ params }) {
+  const id = YT_CH[params.get('forHandle')];
+  return json(id ? { items: [{ id }] } : { items: [] });
+}
+
+function youtubeLiveVideo(id) {
+  const p = near(0.004, -0.004);
+  const long = new Date(Date.now() - 40 * 86400e3).toISOString();
+  const v = (title, channelTitle, channelId, extra = {}) => ({
+    id,
+    snippet: { title, channelTitle, channelId, categoryId: '22', liveBroadcastContent: 'live', description: '',
+      thumbnails: { high: { url: `https://i.ytimg.com/vi/${id}/hqdefault_live.jpg` } }, ...extra.snippet },
+    liveStreamingDetails: { actualStartTime: long, ...extra.live },
+    recordingDetails: extra.rec || {},
+  });
+  return {
+    'D9nujG0PUTQ': v('NC State Security Live Stream - NCSU Belltower', 'NC State Security Applications & Technologies', YT_CH['@ncsu-sat']),
+    'YVXZk3-kzcI': v('Live View — Downtown Cary Park', 'Cary, NC', YT_CH['@caryncgovchannel']),
+    ytcamGEO001: v('Testville Harbour 24/7', 'Harbour Cams', 'UCharbourcamsTESTchan003',
+      { rec: { location: { latitude: p.lat, longitude: p.lon } } }),
+    ytgameGEO02: v('Minecraft gameplay LIVE', 'Gamer', 'UCgamerTESTchannel000004',
+      { snippet: { categoryId: '20' }, rec: { location: { latitude: p.lat, longitude: p.lon } } }),
+    ytendedGEO4: v('Harbour cam (ended)', 'Harbour Cams', 'UCharbourcamsTESTchan003',
+      { snippet: { liveBroadcastContent: 'none' }, rec: { location: { latitude: p.lat, longitude: p.lon } } }),
+    yttalkshow3: v('Testville talk show live', 'Local TV', 'UClocaltvTESTchannel0005'),
+    ytnamedcam5: v('Testville Main Street webcam', 'Main Street Assn', 'UCmainstTESTchannel00006'),
+    // Found by searching Testville, but somewhere else entirely.
+    ytaquarium7: v('Monterey Bay Aquarium Live Cam | Shark Cam', 'Monterey Bay Aquarium', 'UCmbaTESTchannel00000007'),
+    ytspring008: v('Springfield live cam', 'Springfield Cams', 'UCspringTESTchannel00008'),
+    ytsquare009: v('Testville Square live cam', 'Plaza Cams', 'UCplazaTESTchannel000009'),
+  }[id];
+}
+
 function youtubeSearch({ params }) {
+  if (params.get('eventType') === 'live') return youtubeLiveSearch({ params });
   const second = params.get('pageToken') === 'p2';
   return json({
     items: second
@@ -514,7 +567,7 @@ function youtubeVideos({ params }) {
     },
   };
   const ids = String(params.get('id') || '').split(',');
-  return json({ items: ids.map((id) => all[id]).filter(Boolean) });
+  return json({ items: ids.map((id) => all[id] || youtubeLiveVideo(id)).filter(Boolean) });
 }
 
 // Esri World Imagery Wayback. Four releases, one entry pointing elsewhere
@@ -567,7 +620,8 @@ function spaceTrackCatalog({ call }) {
 function windy({ params }) {
   const [n, e, s, w] = String(params.get('bbox') || '').split(',').map(Number);
   const p = place({ south: s, west: w, north: n, east: e }, 0.003, 0.0);
-  return json({ webcams: [
+  if (Number(params.get('offset') || 0) > 0) return json({ total: 3, webcams: [] });
+  return json({ total: 3, webcams: [
     { webcamId: 9001, title: 'Test Ridge', status: 'active', lastUpdatedOn: '2026-10-21T10:00:00Z',
       location: { latitude: p.lat, longitude: p.lon, city: 'Testville', country: 'Testland' },
       images: { current: { preview: 'https://images.windy.example/9001.jpg' } },
@@ -708,9 +762,300 @@ function edis() {
   ] });
 }
 
+/** An ADSBx-v2 aggregator answer around /point/{lat}/{lon}/{nm}. */
+function adsbPoint({ url }) {
+  const m = /\/(-?[\d.]+)\/(-?[\d.]+)\/([\d.]+)$/.exec(url.pathname)
+    || /\/lat\/(-?[\d.]+)\/lon\/(-?[\d.]+)\/dist\/([\d.]+)$/.exec(url.pathname);
+  const [lat, lon, nm] = m ? m.slice(1).map(Number) : [HOME.lat, HOME.lon, 50];
+  const dLat = nm / 60;
+  const dLon = nm / 60 / Math.cos(lat * Math.PI / 180);
+  const box = { south: lat - dLat / 2, north: lat + dLat / 2, west: lon - dLon / 2, east: lon + dLon / 2 };
+  const a = place(box, 0.004, -0.004);
+  const mil = place(box, 0.008, 0.002);
+  const g = place(box, -0.003, 0.001);
+  return json({ now: Date.now(), total: 5, ac: [
+    // Also in OpenSky, but heard longer ago here: OpenSky's position stays,
+    // the registration and type are added from this side.
+    { hex: 'a1b2c3', flight: 'TST123  ', r: 'N123TS', t: 'B738', lat: a.lat, lon: a.lon, alt_baro: 33000,
+      alt_geom: 33200, gs: 447, track: 90, baro_rate: 0, squawk: '1200', category: 'A3', nic: 8, nac_p: 10,
+      dbFlags: 0, seen_pos: 30, seen: 1 },
+    // Only here: a military transport with degraded navigation integrity.
+    { hex: 'ae1234', flight: 'RCH417  ', r: '07-7177', t: 'C17', desc: 'BOEING C-17 Globemaster III',
+      lat: mil.lat, lon: mil.lon, alt_baro: 31000, alt_geom: 31400, gs: 442, track: 270, geom_rate: -640,
+      squawk: '4521', category: 'A5', nic: 0, nac_p: 0, dbFlags: 1, seen_pos: 1.2, seen: 0.5, mlat: [] },
+    { hex: 'ffeedd', flight: 'GND1', lat: g.lat, lon: g.lon, alt_baro: 'ground', gs: 0, seen_pos: 4 },
+    // Last heard five minutes ago, and one with no position at all.
+    { hex: 'c0ffee', flight: 'OLDMIL', lat: a.lat, lon: a.lon, alt_baro: 20000, dbFlags: 1, seen_pos: 300 },
+    { hex: 'bad000', flight: 'NOPOS', seen: 2 },
+  ] });
+}
+
+/** EMSC: one quake USGS also reported (us1), one only EMSC heard. */
+function emsc() {
+  const a = near(0.003, -0.005);
+  const b = near(-0.008, 0.009);
+  const t = (msAgo) => new Date(Date.now() - msAgo).toISOString().replace('Z', '');
+  const f = (unid, p, mag, when, extra = {}) => ({
+    type: 'Feature', id: unid, geometry: { type: 'Point', coordinates: [p.lon, p.lat, -10] },
+    properties: { unid, lat: p.lat, lon: p.lon, depth: 10, mag, magtype: 'mb', time: when,
+      flynn_region: 'TEST REGION', auth: 'EMSC', evtype: 'ke', lastupdate: when, ...extra },
+  });
+  return json({ type: 'FeatureCollection', features: [
+    f('20261121_0000001', a, 4.8, t(3600_000 + 20_000)),
+    f('20261121_0000002', b, 5.1, t(1800_000)),
+    { type: 'Feature', id: 'bad', geometry: null, properties: {} },
+  ] });
+}
+
+/** FAA TFR boundaries (GeoServer WFS) and the list they are joined to. */
+function tfrShapes() {
+  const p = near(0.01, -0.01);
+  const ring = [[p.lon - 0.02, p.lat - 0.02], [p.lon + 0.02, p.lat - 0.02], [p.lon + 0.02, p.lat + 0.02],
+    [p.lon - 0.02, p.lat + 0.02], [p.lon - 0.02, p.lat - 0.02]];
+  const far = ring.map(([x, y]) => [x + 20, y]);
+  return json({ type: 'FeatureCollection', features: [
+    { type: 'Feature', id: 'V_TFR_LOC.1', geometry: { type: 'Polygon', coordinates: [ring] },
+      properties: { NOTAM_KEY: '6/1234-1-FDC-F', TITLE: 'TESTVILLE, TX, Monday, VIP movement', LEGAL: 'VIP',
+        CNS_LOCATION_ID: 'ZKC', STATE: 'TX', LOWER_VAL: 0, UPPER_VAL: 17999, UPPER_UOM: 'FT' } },
+    // The same NOTAM's boundary repeated: drawn once.
+    { type: 'Feature', id: 'V_TFR_LOC.2', geometry: { type: 'Polygon', coordinates: [ring] },
+      properties: { NOTAM_KEY: '6/1234-1-FDC-F', TITLE: 'duplicate' } },
+    { type: 'Feature', id: 'V_TFR_LOC.3', geometry: { type: 'Polygon', coordinates: [far] },
+      properties: { NOTAM_KEY: '6/9999-1-FDC-F', TITLE: 'Far away' } },
+    { type: 'Feature', id: 'V_TFR_LOC.4', geometry: null, properties: {} },
+  ] });
+}
+
+function tfrList() {
+  return json([
+    { notam_id: '6/1234', type: 'VIP', facility: 'ZKC', state: 'TX', description: 'Testville, TX — VIP movement' },
+    { notam_id: '6/9999', type: 'HAZARDS', facility: 'ZAB', state: 'NM', description: 'Far away' },
+  ]);
+}
+
+/**
+ * MeteoAlarm: Germany has one warning drawn as a polygon around 50.3N 8.3E,
+ * one sent with only a region code, and one already expired. Every other
+ * country is quiet.
+ */
+function meteoalarm({ url }) {
+  if (!url.pathname.endsWith('feeds-germany')) return json({ warnings: [] });
+  const soon = new Date(Date.now() + 6 * 3600_000).toISOString();
+  const gone = new Date(Date.now() - 3600_000).toISOString();
+  const info = (extra) => ({ language: 'en-GB', event: 'Wind', severity: 'Severe', urgency: 'Immediate',
+    certainty: 'Likely', headline: 'Orange wind warning', description: 'Gusts up to 100 km/h.',
+    onset: new Date().toISOString(), expires: soon, ...extra });
+  return json({ warnings: [
+    { uuid: 'w1', alert: { identifier: '2.49.0.0.276.0.DWD.1', sent: new Date().toISOString(), info: [
+      info({ language: 'de-DE', headline: 'Amtliche Unwetterwarnung' }),
+      info({ area: [{ areaDesc: 'Testkreis', polygon: ['50.2,8.2 50.2,8.4 50.4,8.4 50.4,8.2 50.2,8.2'] }] }),
+    ] } },
+    { uuid: 'w2', alert: { identifier: '2.49.0.0.276.0.DWD.2', info: [
+      info({ event: 'Snow', severity: 'Moderate', headline: 'Snow', area: [{ areaDesc: 'Bergland', geocode: [{ valueName: 'EMMA_ID', value: 'DE999' }] }] }),
+    ] } },
+    { uuid: 'w3', alert: { identifier: '2.49.0.0.276.0.DWD.3', info: [
+      info({ expires: gone, area: [{ areaDesc: 'Old', polygon: '50.2,8.2 50.2,8.4 50.4,8.4 50.2,8.2' }] }),
+    ] } },
+  ] });
+}
+
+/** Copernicus EMS: one live activation at HOME, one closed years ago. */
+function cemsList() {
+  const p = near(0.002, 0.002);
+  return json({ count: 2, next: null, results: [
+    { code: 'EMSR900', name: 'Flood in Testville', countries: [{ short_name: 'Testland' }],
+      centroid: `POINT (${p.lon} ${p.lat})`, eventTime: '2026-11-20T06:00:00', activationTime: '2026-11-20T09:00:00',
+      category: 'Flood', lastUpdate: new Date().toISOString(), closed: false, gdacsId: null, n_aois: 2, n_products: 5 },
+    { code: 'EMSR001', name: 'Old flood', centroid: `POINT (${p.lon} ${p.lat})`, category: 'Flood',
+      activationTime: '2015-01-01T00:00:00', lastUpdate: '2015-02-01T00:00:00', closed: true },
+  ] });
+}
+
+function cemsActivation({ params }) {
+  if (params.get('code') !== 'EMSR900') return json({ count: 0, results: [] });
+  const { lat, lon } = near(0.002, 0.002);
+  return json({ count: 1, results: [{ code: 'EMSR900',
+    extent: `SRID=4326;MULTIPOLYGON (((${lon - 0.05} ${lat - 0.05}, ${lon + 0.05} ${lat - 0.05}, ${lon + 0.05} ${lat + 0.05}, ${lon - 0.05} ${lat + 0.05}, ${lon - 0.05} ${lat - 0.05})))` }] });
+}
+
+/**
+ * ODIN county outages inside the asked box: one county near HOME with 4%
+ * of customers out, one with no one out, and one record with no geometry.
+ */
+function odinMap({ params }) {
+  if (params.get('scale') !== 'COUNTY') return json({ error: 'bad scale' }, { status: 400 });
+  const box = { south: num(params.get('miny')), west: num(params.get('minx')), north: num(params.get('maxy')), east: num(params.get('maxx')) };
+  const p = place(box, 0.02, 0.02);
+  const ring = [[p.lon - 0.2, p.lat - 0.2], [p.lon + 0.2, p.lat - 0.2], [p.lon + 0.2, p.lat + 0.2], [p.lon - 0.2, p.lat + 0.2], [p.lon - 0.2, p.lat - 0.2]];
+  const outage = (id, county, out, served) => ({
+    id, countyName: county, stateName: 'Test State', metersOut: out, outageType: 'COUNTY',
+    precisionLabel: 'County-level outage summary', sourceType: 'COUNTY',
+    feature: { type: 'Polygon', coordinates: [ring], properties: { outage_type: 'COUNTY', metersOut: String(out), county } },
+    outages: [{ county: id, metersOut: out, metersServed: served, utilityName: 'TEST ELECTRIC COOP',
+      envelope: { minX: p.lon - 0.2, maxX: p.lon + 0.2, minY: p.lat - 0.2, maxY: p.lat + 0.2 } }],
+  });
+  return json([
+    outage('99001', 'Testco', 400, 10000),
+    outage('99002', 'Quietco', 0, 5000),
+    outage('99004', 'Onehouseco', 1, 8000),
+    { id: '99003', countyName: 'Nowhere', metersOut: 5, outages: [] },
+  ]);
+}
+
+/** ACLED: a token for the test account, then two events near HOME. */
+function acledToken({ body }) {
+  const f = new URLSearchParams(String(body || ''));
+  if (f.get('grant_type') === 'password' && f.get('username') === 'analyst@example.org' && f.get('password') === 'test-acled-SECRET-ffff') {
+    return json({ access_token: 'acled-test-token', refresh_token: 'acled-refresh', expires_in: 86400, token_type: 'Bearer' });
+  }
+  if (f.get('grant_type') === 'refresh_token' && f.get('refresh_token') === 'acled-refresh') {
+    return json({ access_token: 'acled-test-token-2', refresh_token: 'acled-refresh', expires_in: 86400 });
+  }
+  return json({ error: 'invalid_grant', error_description: 'Invalid credentials' }, { status: 400 });
+}
+
+function acledRead({ params, call }) {
+  if (!/^Bearer acled-test-token/.test(call.headers?.authorization || '')) return json({ message: 'Unauthorized' }, { status: 401 });
+  const [s, n] = String(params.get('latitude') || '').split('|').map(Number);
+  const [w, e] = String(params.get('longitude') || '').split('|').map(Number);
+  const p = place({ south: s, north: n, west: w, east: e }, 0.01, -0.01);
+  const q = place({ south: s, north: n, west: w, east: e }, -0.01, 0.01);
+  return json({ success: true, count: 2, data: [
+    { event_id_cnty: 'TST1001', event_date: '2026-11-20', disorder_type: 'Political violence', event_type: 'Battles',
+      sub_event_type: 'Armed clash', actor1: 'Test Militia', actor2: 'Test Army', country: 'Testland', admin1: 'Test State',
+      location: 'Testville', latitude: String(p.lat), longitude: String(p.lon), geo_precision: '1', source: 'Test Times',
+      notes: 'Clash on the outskirts of Testville.', fatalities: '12', timestamp: '1763600000' },
+    { event_id_cnty: 'TST1002', event_date: '2026-11-21', disorder_type: 'Demonstrations', event_type: 'Protests',
+      sub_event_type: 'Peaceful protest', actor1: 'Protesters (Testland)', country: 'Testland', admin1: 'Test State',
+      location: 'Testville', latitude: String(q.lat), longitude: String(q.lon), geo_precision: '2', source: 'Local paper',
+      notes: 'Residents rallied at city hall.', fatalities: '0', timestamp: '1763690000' },
+    { event_id_cnty: 'TST1003', latitude: '', longitude: '' },
+  ] });
+}
+
+/** Caltrans: District 7 has two cameras in Los Angeles (one with no image); the rest are empty. */
+function caltrans({ url }) {
+  if (!url.pathname.includes('/d7/')) return json({ data: [] });
+  const cam = (index, name, lat, lon, image, inService = 'true') => ({ cctv: { index, inService,
+    location: { district: '7', locationName: name, nearbyPlace: 'Cypress Park', county: 'Los Angeles', route: 'I-110',
+      direction: 'South', latitude: String(lat), longitude: String(lon) },
+    imageData: { static: { currentImageURL: image }, streamingVideoURL: index === '1' ? 'https://wzmedia.dot.ca.gov/D7/CCTV-196.stream/playlist.m3u8' : '' } } });
+  return json({ data: [
+    cam('1', 'I-110 : (196) Avenue 26 Off Ramp', 34.0837, -118.2215, 'https://cwwp2.dot.ca.gov/data/d7/cctv/image/i110196/i110196.jpg'),
+    cam('2', 'I-5 : No image', 34.09, -118.23, ''),
+    cam('3', 'I-10 : Out', 34.05, -118.25, 'https://cwwp2.dot.ca.gov/data/d7/cctv/image/i10/i10.jpg', 'false'),
+  ] });
+}
+
+function tflJamCams() {
+  const prop = (key, value) => ({ key, value, modified: '2026-11-20T11:06:05.68Z' });
+  return json([
+    { id: 'JamCams_00002.00865', commonName: 'A406 Billet Upass E', lat: 51.6, lon: -0.04, additionalProperties: [
+      prop('available', 'true'), prop('imageUrl', 'https://s3-eu-west-1.amazonaws.com/jamcams.tfl.gov.uk/00002.00865.jpg'), prop('view', 'West')] },
+    { id: 'JamCams_bad', commonName: 'No image', lat: 51.5, lon: -0.1, additionalProperties: [prop('imageUrl', 'javascript:alert(1)')] },
+  ]);
+}
+
+function digitraffic({ call }) {
+  if (call.headers['digitraffic-user'] !== 'OpenPanopticon') return json({ error: 'missing Digitraffic-User' }, { status: 400 });
+  return json({ type: 'FeatureCollection', features: [
+    { type: 'Feature', id: 'C01503', geometry: { type: 'Point', coordinates: [23.99616, 60.05374, 0] },
+      properties: { id: 'C01503', name: 'kt51_Inkoo', collectionStatus: 'GATHERING', dataUpdatedTime: '2026-11-24T15:25:34Z',
+        presets: [{ id: 'C0150301', inCollection: true }, { id: 'C0150302', inCollection: true }, { id: 'C0150309', inCollection: false }] } },
+  ] });
+}
+
+function driveBc() {
+  return json([
+    { id: 1033, name: 'Hwy 19A at 17 Street Bridge - N', caption: 'Highway 19A at 17 Street Bridge in Courtenay, looking northbound.',
+      location: { type: 'Point', coordinates: [-124.987935, 49.686445] }, highway_display: '19A', orientation: 'N',
+      region_name: 'Vancouver Island', is_on: true, should_appear: true, marked_stale: false, marked_delayed: false,
+      last_update_modified: '2026-11-24T11:36:38-07:00' },
+    { id: 9999, name: 'Hidden', location: { type: 'Point', coordinates: [-124.98, 49.68] }, should_appear: false },
+  ]);
+}
+
+// The OSIRIS catalogue as the server sees it, with one region whose adapter
+// reads from a mock host, so the suite never reaches a real agency.
+const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0x10, 0x4a, 0x46, 0x49, 0x46, 0, 1, 0xff, 0xd9]);
+function osirisCatalogue() {
+  return {
+    OSIRIS_COMMIT: 'fixture0000000',
+    TEXAS_DISTRICTS: { AUS: 'Austin' },
+    TXDOT_BASE: 'https://its.txdot.gov/its/DistrictIts/',
+    regionFetchers: {
+      'test-region': async () => (await fetch('https://osiris-fixture.example/cameras')).json(),
+      'other-region': async () => { throw new Error('not reached'); },
+    },
+    regionsFor: (lat, lng) => (Math.abs(lat - HOME.lat) < 5 && Math.abs(lng - HOME.lon) < 5 ? ['test-region'] : []),
+    fetchScotlandPicture: async (sid) => (sid === '42' ? JPEG : null),
+    estoniaFrameUrl: async (id) => (id === 'ee1' ? 'https://pilt.example.ee/cam/ee1-1700000000.jpg' : null),
+    singaporeFrameUrl: async () => 'javascript:alert(1)',
+  };
+}
+
+function osirisCameras() {
+  const at = (dLat, dLon) => ({ lat: HOME.lat + dLat, lng: HOME.lon + dLon });
+  return json([
+    { id: 'tx-1', ...at(0.01, 0.01), name: 'I-35 at Test Rd', city: 'Testville', country: 'US', source: 'TxDOT',
+      feed_url: '/api/cctv/texas/snapshot?district=AUS&id=I35%20Test', stream_type: 'jpg' },
+    { id: 'still-1', ...at(0.02, 0), name: 'Harbour still', source: 'Example DOT',
+      feed_url: 'https://cams.example.gov/still/1.jpg', stream_type: 'jpg', external_url: 'https://cams.example.gov/' },
+    { id: 'relay-ok', ...at(0.03, 0), name: 'Relayed but open',
+      feed_url: `/api/cctv/proxy?url=${encodeURIComponent('https://open.example.org/c.jpg')}`, stream_type: 'jpg' },
+    { id: 'relay-referer', ...at(0.04, 0), name: 'Hotlink protected',
+      feed_url: `/api/cctv/proxy?url=${encodeURIComponent('https://stream.inmoves.nl/x.jpg')}`, stream_type: 'jpg' },
+    { id: 'mjpeg-1', ...at(0.05, 0), name: 'MJPEG cam', feed_url: 'https://mjpeg.example.net/video.mjpg', stream_type: 'mjpeg' },
+    { id: 'hls-1', ...at(0.06, 0), name: 'HLS only', stream_url: 'https://hls.example.net/live.m3u8', stream_type: 'hls' },
+    { id: 'iframe-http', ...at(0.07, 0), name: 'Plain http player', stream_url: 'http://player.example.net/', stream_type: 'iframe' },
+    { id: 'tfl-dup', ...at(0.08, 0), name: 'Already drawn', feed_url: 'https://s3-eu-west-1.amazonaws.com/jamcams.tfl.gov.uk/1.jpg' },
+    { id: 'js', ...at(0.09, 0), name: 'Bad scheme', feed_url: 'javascript:alert(1)' },
+    { id: 'yt-1', ...at(0.035, 0), name: 'Harbour on YouTube', stream_type: 'iframe',
+      stream_url: 'https://www.youtube.com/embed/AbCdEfGhIj0?autoplay=1&mute=1&controls=0' },
+    { id: 'far', lat: HOME.lat + 3, lng: HOME.lon, name: 'Outside the view', feed_url: 'https://cams.example.gov/far.jpg' },
+  ]);
+}
+
+// meshmap.net's whole-world file: node number -> node, positions in 1e-7 deg.
+function meshtasticNodes() {
+  const now = Math.floor(Date.now() / 1000);
+  return json({
+    9197318: { longName: 'Testville Ridge Router', shortName: 'TRR', hwModel: 'SEEED_SOLAR_NODE', role: 'ROUTER_LATE',
+      latitude: Math.round((HOME.lat + 0.01) * 1e7), longitude: Math.round((HOME.lon + 0.01) * 1e7), precision: 15,
+      region: 'US', modemPreset: 'LONG_FAST', fwVersion: '2.8.2.7c30267', onlineLocalNodes: 12,
+      seenBy: { 'msh/US/2/e/LongFast/!aaaa0001': now - 600, 'msh/US/2/map/': now - 60 } },
+    7: { longName: 'Exact handheld', latitude: Math.round((HOME.lat - 0.02) * 1e7), longitude: Math.round(HOME.lon * 1e7),
+      precision: 32, role: 'CLIENT', seenBy: { 'msh/US/2/e/LongFast/!aaaa0002': now - 7200 } },
+    8: { longName: 'Elsewhere', latitude: 515000000, longitude: -1000000, precision: 13, seenBy: {} },
+    9: { longName: 'No position', latitude: 0, longitude: 0 },
+  });
+}
+
+// map.meshcore.io's whole-world list.
+function meshcoreNodes() {
+  const ago = (days) => new Date(Date.now() - days * 86_400_000).toISOString();
+  const key = (c) => c.repeat(64);
+  return json([
+    { adv_lat: HOME.lat + 0.03, adv_lon: HOME.lon - 0.01, adv_name: 'TV-Repeater-1', public_key: key('a'), type: 2,
+      last_advert: ago(0.5), inserted_date: '2026-06-01T00:00:00.000Z', inserted_by: key('f'),
+      params: { freq: 910.525, bw: 62.5, sf: 7, cr: 5 }, link: 'meshcore://00' },
+    { adv_lat: HOME.lat + 0.04, adv_lon: HOME.lon, adv_name: 'Silent since spring', public_key: key('b'), type: 2,
+      last_advert: ago(200) },
+    { adv_lat: HOME.lat, adv_lon: HOME.lon, adv_name: 'Bad key', public_key: 'zz', type: 1, last_advert: ago(1) },
+    { adv_lat: 0, adv_lon: 0, adv_name: 'Unplaced', public_key: key('c'), type: 1, last_advert: ago(1) },
+  ]);
+}
+
 function nominatim({ params }) {
   const q = String(params.get('q') || '').toLowerCase();
   if (q.includes('nowhere')) return json([]);
+  const one = (name, lat, lon, display) => json([{ name, display_name: display || name, lat: String(lat), lon: String(lon) }]);
+  if (q === 'downtown cary park') return one('Downtown Cary Park', 35.7868, -78.7811, 'Downtown Cary Park, Cary, North Carolina');
+  if (q.includes('monterey bay aquarium')) return one('Monterey Bay Aquarium', 36.6182, -121.9019);
+  if (q.startsWith('springfield')) {
+    return json([{ name: 'Springfield', lat: '39.80', lon: '-89.65' }, { name: 'Springfield', lat: '37.21', lon: '-93.29' }]);
+  }
+  if (q === 'testville square') return one('Testville Square', HOME.lat + 0.004, HOME.lon + 0.003);
   return json([
     { display_name: 'Testville, Test County, Test State, Testland', name: 'Testville',
       lat: String(HOME.lat), lon: String(HOME.lon), type: 'city', category: 'place',
@@ -878,6 +1223,8 @@ function registerDefaults(mock) {
   mock.on(host('opencellid.org', '/cell/getInArea'), openCellId);
   mock.on(host('api.wigle.net', '/api/v2/network/search'), wigle);
   mock.on(host('onionoo.torproject.org', '/details'), onionoo);
+  mock.on(host('meshmap.net', '/nodes.json'), meshtasticNodes);
+  mock.on(host('map.meshcore.io', '/api/v1/nodes'), meshcoreNodes);
   mock.on(host('data.sensor.community', '/airrohr/v1/filter/'), sensorCommunity);
 
   mock.on(host('feodotracker.abuse.ch'), () => json(FEODO));
@@ -903,6 +1250,17 @@ function registerDefaults(mock) {
   mock.on(host('services8.arcgis.com'), alertCa);
   mock.on(host('www.googleapis.com', '/youtube/v3/search'), youtubeSearch);
   mock.on(host('www.googleapis.com', '/youtube/v3/videos'), youtubeVideos);
+  mock.on(host('www.googleapis.com', '/youtube/v3/channels'), youtubeChannels);
+  mock.on(host('cwwp2.dot.ca.gov', '/data/'), caltrans);
+  mock.on(host('api.tfl.gov.uk', '/Place/Type/JamCam'), tflJamCams);
+  mock.on(host('tie.digitraffic.fi', '/api/weathercam/v1/stations'), digitraffic);
+  mock.on(host('www.drivebc.ca', '/api/webcams/'), driveBc);
+  mock.on(host('osiris-fixture.example', '/cameras'), osirisCameras);
+  mock.on(host('its.txdot.gov', '/its/DistrictIts/GetCctvSnapshotByIcdId'), ({ params }) => (
+    params.get('districtCode') === 'AUS' && params.get('icdId') === 'I35 Test'
+      ? json({ snippet: JPEG.toString('base64') }) : json({ snippet: '' })));
+  mock.on(host('nominatim.openstreetmap.org', '/reverse'), () => json({
+    lat: String(HOME.lat), lon: String(HOME.lon), address: { city: 'Testville', state: 'Test State' } }));
 
   mock.on(host('www.gdacs.org'), gdacs);
   mock.on(host('eonet.gsfc.nasa.gov'), eonet);
@@ -912,6 +1270,17 @@ function registerDefaults(mock) {
   mock.on(host('edis.example'), edis);
 
   mock.on(host('nominatim.openstreetmap.org', '/search'), nominatim);
+
+  mock.on((url) => ['api.adsb.lol', 'api.airplanes.live', 'opendata.adsb.fi'].includes(url.hostname), adsbPoint);
+  mock.on(host('odin.ornl.gov', '/odi/map'), odinMap);
+  mock.on(host('acleddata.com', '/oauth/token'), acledToken);
+  mock.on(host('acleddata.com', '/api/acled/read'), acledRead);
+  mock.on(host('www.seismicportal.eu', '/fdsnws/event/1/query'), emsc);
+  mock.on((url) => url.hostname === 'tfr.faa.gov' && url.pathname.startsWith('/geoserver/'), tfrShapes);
+  mock.on(host('tfr.faa.gov', '/tfrapi/exportTfrList'), tfrList);
+  mock.on(host('feeds.meteoalarm.org', '/api/v1/warnings/'), meteoalarm);
+  mock.on(host('rapidmapping.emergency.copernicus.eu', '/backend/dashboard-api/public-activations-info/'), cemsList);
+  mock.on(host('rapidmapping.emergency.copernicus.eu', '/backend/dashboard-api/public-activations/'), cemsActivation);
   mock.on(host('earth-search.aws.element84.com', '/v1/search'), stac);
   mock.on(host('s3-us-west-2.amazonaws.com', '/config.maptiles.arcgis.com/waybackconfig.json'), waybackConfig);
   mock.on(host('wayback.maptiles.arcgis.com', '/arcgis/rest/services/World_Imagery/MapServer/tilemap/'), waybackTilemap);
@@ -924,6 +1293,6 @@ function registerDefaults(mock) {
 }
 
 module.exports = {
-  HOME, TEST_KEYS, near, place, registerDefaults, stationsTle, tleEpoch, tleChecksum, FEODO, waybackTilemap,
+  HOME, TEST_KEYS, near, place, registerDefaults, osirisCatalogue, JPEG, stationsTle, tleEpoch, tleChecksum, FEODO, waybackTilemap,
   status,
 };

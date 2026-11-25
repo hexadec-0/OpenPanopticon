@@ -305,10 +305,12 @@ describe('/api/shodan/host', () => {
 describe('/api/flights', () => {
   test('returns live aircraft, drops stale and unpositioned ones', async () => {
     const d = (await s.api('/api/flights', { bbox: BBOX })).json();
-    assert.equal(d.count, 3);
-    assert.equal(d.dropped, 1);
+    // OpenSky's three live contacts plus the military one only adsb.lol hears;
+    // one stale contact from each side is dropped.
+    assert.equal(d.count, 4);
+    assert.equal(d.dropped, 2);
     assert.equal(d.staleAfter, 120);
-    assert.deepEqual(d.aircraft.map((a) => a.icao24).sort(), ['a1b2c3', 'd4e5f6', 'ffeedd']);
+    assert.deepEqual(d.aircraft.map((a) => a.icao24).sort(), ['a1b2c3', 'ae1234', 'd4e5f6', 'ffeedd']);
     const a = d.aircraft.find((x) => x.icao24 === 'a1b2c3');
     assert.equal(a.callsign, 'TST123');
     assert.equal(a.altitude, 10100, 'geometric altitude preferred');
@@ -360,6 +362,8 @@ describe('/api/flights', () => {
   });
 
   test('a 429 blocks further automatic polls for as long as OpenSky asked', async () => {
+    // With the unfiltered feed also down, OpenSky's refusal is the answer.
+    s.mock.fail('api.adsb.lol', 503, 'down');
     s.mock.on('/api/states/all', () => status(429, 'Too many requests', { 'x-rate-limit-retry-after-seconds': '120' }));
     const r = await s.api('/api/flights', { bbox: BBOX });
     assert.equal(r.status, 429);
@@ -372,7 +376,7 @@ describe('/api/flights', () => {
   });
 
   test('anonymous: no auth call and the slower resolution', async () => {
-    const t = await startServer();
+    const t = await startServer({ env: { ADSB_FEED: 'off' } });
     try {
       const d = (await t.api('/api/flights', { bbox: BBOX })).json();
       assert.equal(d.authenticated, false);
@@ -384,6 +388,110 @@ describe('/api/flights', () => {
 
   test('bbox is required', async () => {
     assert.equal((await s.api('/api/flights', {})).status, 400);
+  });
+});
+
+describe('/api/flights with an unfiltered ADS-B feed', () => {
+  test('asks adsb.lol by point and radius over the snapped cell', async () => {
+    const d = (await s.api('/api/flights', { bbox: BBOX })).json();
+    const call = s.mock.callsTo('api.adsb.lol')[0];
+    assert.match(new URL(call.url).pathname, /^\/v2\/point\/35\/-100\/\d+$/);
+    const nm = Number(new URL(call.url).pathname.split('/').pop());
+    assert.ok(nm >= 75 && nm <= 250, `radius ${nm} nm covers the 2x2 degree cell corners`);
+    assert.deepEqual({ ...d.feed, count: undefined }, {
+      name: 'adsb.lol', label: 'adsb.lol', licence: 'ODbL', ok: true, count: undefined, military: 1 });
+    assert.equal(d.resolutionSec, 5);
+    assert.deepEqual(d.problems, {});
+  });
+
+  test('merges by hex: OpenSky\'s fresher fix, the feed\'s registration and type', async () => {
+    const d = (await s.api('/api/flights', { bbox: BBOX })).json();
+    const a = d.aircraft.find((x) => x.icao24 === 'a1b2c3');
+    assert.deepEqual(a.sources, ['opensky', 'adsb.lol']);
+    assert.equal(a.registration, 'N123TS');
+    assert.equal(a.aircraftType, 'B738');
+    assert.equal(a.country, 'United States', 'OpenSky\'s registration country kept');
+    assert.equal(a.nic, 8);
+  });
+
+  test('military aircraft only the feed hears, in OpenSky\'s units', async () => {
+    const d = (await s.api('/api/flights', { bbox: BBOX })).json();
+    const m = d.aircraft.find((x) => x.icao24 === 'ae1234');
+    assert.equal(m.military, true);
+    assert.equal(m.callsign, 'RCH417');
+    assert.equal(m.category, 'Heavy');
+    assert.equal(Math.round(m.altitude), Math.round(31400 * 0.3048));
+    assert.equal(Math.round(m.velocity), Math.round(442 * 0.514444));
+    assert.equal(Math.round(m.verticalRate * 100), Math.round(-640 * 0.00508 * 100));
+    assert.equal(m.nic, 0);
+    assert.equal(m.nacp, 0);
+    const g = d.aircraft.find((x) => x.icao24 === 'ffeedd');
+    assert.equal(g.onGround, true);
+  });
+
+  test('OpenSky refusing is a note, not a failure, while the feed answers', async () => {
+    s.mock.on('/api/states/all', () => status(429, 'Too many requests', { 'x-rate-limit-retry-after-seconds': '120' }));
+    const r = await s.api('/api/flights', { bbox: BBOX });
+    assert.equal(r.status, 200);
+    const d = r.json();
+    assert.match(d.problems.opensky, /429|rate/i);
+    assert.deepEqual(d.aircraft.map((a) => a.icao24).sort(), ['a1b2c3', 'ae1234', 'ffeedd']);
+    assert.deepEqual(d.aircraft.find((a) => a.icao24 === 'a1b2c3').sources, ['adsb.lol']);
+  });
+
+  test('OpenSky is asked at its budgeted pace, the feed every poll', async () => {
+    await s.api('/api/flights', { bbox: BBOX });
+    await new Promise((r) => setTimeout(r, 5100));   // past the feed's 5s cache
+    await s.api('/api/flights', { bbox: BBOX });
+    assert.equal(s.mock.callsTo('api.adsb.lol').length, 2);
+    assert.equal(s.mock.callsTo('/api/states/all').length, 1, 'held OpenSky answer reused');
+  });
+
+  test('airplanes.live and adsb.fi use the same adapter; off asks neither', async () => {
+    for (const [feed, host, path] of [
+      ['airplanes.live', 'api.airplanes.live', /^\/v2\/point\//],
+      ['adsb.fi', 'opendata.adsb.fi', /^\/api\/v2\/lat\/35\/lon\/-100\/dist\/\d+$/],
+    ]) {
+      const t = await startServer({ env: { ADSB_FEED: feed } });
+      try {
+        const d = (await t.api('/api/flights', { bbox: BBOX })).json();
+        assert.equal(d.feed.name, feed);
+        assert.match(new URL(t.mock.callsTo(host)[0].url).pathname, path);
+        assert.ok(d.aircraft.some((a) => a.military));
+      } finally { await t.close(); }
+    }
+    const off = await startServer({ env: { ADSB_FEED: 'off' } });
+    try {
+      const d = (await off.api('/api/flights', { bbox: BBOX })).json();
+      assert.equal(d.feed, undefined);
+      assert.equal(off.mock.callsTo('adsb').length, 0);
+    } finally { await off.close(); }
+  });
+});
+
+describe('ADS-B normalising and merging', () => {
+  test('ground, missing fields and privacy flags', () => {
+    const g = s.mod.normaliseAdsb({ hex: 'ABC123', lat: 1, lon: 2, alt_baro: 'ground', dbFlags: 8 }, 'adsb.lol');
+    assert.equal(g.icao24, 'abc123');
+    assert.equal(g.onGround, true);
+    assert.equal(g.altitude, 0);
+    assert.equal(g.privacyBlocked, true);
+    assert.equal(g.military, false);
+    assert.equal(s.mod.normaliseAdsb({ hex: 'x', lat: 'nope', lon: 2 }, 'adsb.lol'), null);
+    assert.equal(s.mod.normaliseAdsb({ lat: 1, lon: 2 }, 'adsb.lol'), null);
+    assert.equal(s.mod.normaliseAdsb({ hex: 'e1', lat: 1, lon: 2, squawk: '7700' }, 'x').alert, 'EMERGENCY');
+  });
+
+  test('the fresher position wins; flags and alerts from either side survive', () => {
+    const sky = { icao24: 'aa', lat: 1, lon: 1, ageSec: 20, country: 'X', alert: null, sources: ['opensky'] };
+    const feed = { icao24: 'aa', lat: 2, lon: 2, ageSec: 1, country: null, military: true, alert: 'EMERGENCY', registration: 'R', sources: ['adsb.lol'] };
+    const [m] = s.mod.mergeAircraft([sky], [feed]);
+    assert.equal(m.lat, 2);
+    assert.equal(m.country, 'X');
+    assert.equal(m.military, true);
+    assert.equal(m.alert, 'EMERGENCY');
+    assert.equal(m.registration, 'R');
+    assert.deepEqual(m.sources, ['opensky', 'adsb.lol']);
   });
 });
 

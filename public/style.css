@@ -806,7 +806,6 @@ details.svc pre { margin: 6px 0 4px; }
 
 body[data-mode="flir"] { --hud: #ffb45c; }
 body[data-mode="sar"]  { --hud: #9fd8ff; }
-body[data-mode="cel"]  { --hud: #ffd4a3; }
 
 /* ---------------------------------------------------------------- */
 /* Narrow screens                                                    */

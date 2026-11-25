@@ -28,7 +28,7 @@ const CONFIG_VARS = [
   'SHODAN_API_KEY', 'WINDY_API_KEY', 'YOUTUBE_API_KEY', 'GOOGLE_MAPS_EMBED_KEY', 'FLICKR_API_KEY', 'MAPILLARY_TOKEN', 'CESIUM_ION_TOKEN', 'OPENSKY_CLIENT_ID', 'OPENSKY_CLIENT_SECRET', 'SPACETRACK_USER', 'SPACETRACK_PASSWORD',
   'OPENWEBCAMDB_API_KEY', 'FIRMS_MAP_KEY', 'EDIS_API_URL', 'EDIS_API_KEY', 'AISSTREAM_API_KEY',
   'OPENCELLID_API_KEY', 'WIGLE_API_NAME', 'WIGLE_API_TOKEN', 'GREYNOISE_API_KEY', 'EIA_API_KEY',
-  'CLOUDFLARE_API_TOKEN', 'CARTO_API_KEY', 'FIVE_ELEVEN_KEYS',
+  'CLOUDFLARE_API_TOKEN', 'CARTO_API_KEY', 'FIVE_ELEVEN_KEYS', 'ADSB_FEED', 'ACLED_EMAIL', 'ACLED_PASSWORD', 'YOUTUBE_CAM_CHANNELS',
   'SHODAN_CELL_DEG', 'SHODAN_MAX_DEG', 'SHODAN_CREDIT_FLOOR', 'SHODAN_MIN_GAP_MS', 'OPENSKY_CREDIT_FLOOR',
   'SHORTBREAD_URL', 'TITILER_URL', 'GEE_PROJECT', 'GEE_CLIENT_EMAIL', 'GEE_PRIVATE_KEY',
   'OPENPANOPTICON_OPEN_BROWSER', 'OPENPANOPTICON_DATA_DIR', 'OPENPANOPTICON_ENV_FILE', 'OPENPANOPTICON_QUIET',
@@ -74,6 +74,10 @@ function loadServer({ env = {}, mock = null, dataDir = null } = {}) {
 
   delete require.cache[SERVER];
   const mod = require(SERVER);
+  // Nominatim's one-a-second spacing is for the real service, not the mock.
+  if (mod.nominatimGate) mod.nominatimGate.gapMs = 0;
+  // The vendored OSIRIS adapters call real agencies; tests use a stand-in.
+  mod.useOsirisCatalogue?.(require('./fixtures.cjs').osirisCatalogue());
 
   const restore = () => {
     if (mock) mock.uninstall();
