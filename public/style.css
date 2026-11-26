@@ -834,11 +834,11 @@ body[data-mode="sar"]  { --hud: #9fd8ff; }
 /* A layer standing down because the camera is too high reads as paused,
    not failed: no red, and the reason is in the tooltip. */
 .layer.held .layer-count { color: var(--dim); opacity: .8; }
-#hud-gate {
+#hud-gate, #hud-wide {
   cursor: pointer; border-bottom: 1px dotted rgba(120,160,150,.5);
 }
-#hud-gate:hover { color: var(--hud); }
-#hud-gate.holding { color: #ffb45c; }
+#hud-gate:hover, #hud-wide:hover { color: var(--hud); }
+#hud-gate.holding, #hud-wide.holding { color: #ffb45c; }
 
 /* Attribution ------------------------------------------------------ */
 

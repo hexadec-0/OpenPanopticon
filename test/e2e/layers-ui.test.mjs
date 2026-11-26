@@ -303,8 +303,12 @@ e2e('layers and the detail panel', () => {
     await page.evaluate(() => [...document.querySelectorAll('.layer[data-layer="netinfra"] .chip')]
       .filter((c) => !c.classList.contains('on')).forEach((c) => c.click()));
     await enable('netinfra');
-    await page.waitForFunction(() => WV.layers.netinfra.status === 'ok' && WV.layers.netinfra.sources.size === 4);
-    await page.waitForFunction(() => WV.layers.netinfra.count === 6, { timeout: 15_000 });
+    await page.waitForFunction(() => WV.layers.netinfra.status === 'ok' && WV.layers.netinfra.sources.size === 5);
+    // Probes, cells, WiFi and Tor (6), plus the Mesh / LoRa nodes in view.
+    await page.waitForFunction(() => {
+      const l = WV.layers.netinfra;
+      return l.bySource.mesh > 0 && l.count === 6 + l.bySource.mesh;
+    }, { timeout: 15_000 });
     await enable('iot');
     assert.match(await text$(page, `${row('iot')} .srclist`), /reporting air quality\s*1\s*reporting noise\s*1/);   // the indoor sensor is hidden
     await page.select(`${row('iot')} select.ctl`, 'noise');

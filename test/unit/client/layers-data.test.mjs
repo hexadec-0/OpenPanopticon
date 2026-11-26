@@ -1210,6 +1210,53 @@ describe('overlays', () => {
     } finally { mock.timers.reset(); }
   });
 
+  test('weather radar: a refresh follows the newest frame, or keeps a picked one', async () => {
+    const t = Math.floor(Date.now() / 1000);
+    let frames = [{ time: t - 1200, path: '/v2/radar/1' }, { time: t - 600, path: '/v2/radar/2' }];
+    s.mock.on((url) => url.hostname === 'api.rainviewer.com', () => json({
+      generated: t, host: 'https://tilecache.rainviewer.com',
+      radar: { past: frames, nowcast: [] }, satellite: { infrared: [] },
+    }));
+    let renders = 0;
+    viewer.scene.requestRender = () => { renders++; };
+    const w = new L.WeatherOverlay(viewer);
+    let updates = 0;
+    w.onUpdate = () => { updates++; };
+    await w.setRadar(true);
+    assert.match(w.radarLayer.imageryProvider.url, /\/v2\/radar\/2\//);
+
+    // An unchanged list leaves the layer as it is.
+    const layer = w.radarLayer;
+    s.mod.cache.clear();
+    await w.refresh();
+    assert.equal(w.radarLayer, layer, 'same frame, same layer');
+
+    // A new frame replaces the one on screen without a toggle.
+    frames = [...frames.slice(1), { time: t, path: '/v2/radar/3' }];
+    s.mod.cache.clear();
+    const before = updates;
+    const drawn = renders;
+    await w.refresh();
+    assert.match(w.radarLayer.imageryProvider.url, /\/v2\/radar\/3\//);
+    assert.ok(renders > drawn, 'a frame is asked for, or the old image stays on screen');
+    assert.equal(viewer.imageryLayers.length, 1, 'replaced, not stacked');
+    assert.ok(updates > before, 'the bar hears about the new frame');
+
+    // A frame picked on the slider stays picked as the list shifts.
+    w.setFrame(0);
+    frames = [...frames, { time: t + 600, path: '/v2/radar/4' }];
+    s.mod.cache.clear();
+    await w.refresh();
+    assert.equal(w.currentFrame().time, t - 600);
+
+    // Switching radar off and on again starts from the newest frame.
+    await w.setRadar(false);
+    s.mod.cache.clear();
+    await w.setRadar(true);
+    assert.match(w.radarLayer.imageryProvider.url, /\/v2\/radar\/4\//);
+    await w.setRadar(false);
+  });
+
   test('cloud imagery falls back to NASA GIBS when RainViewer has no frames', async () => {
     const w = new L.WeatherOverlay(viewer);
     await w.setSatellite(true);

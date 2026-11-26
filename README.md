@@ -118,8 +118,10 @@ of the screen, keeping its tilt and distance.
 
 **Nothing loading?** Layers only fetch below the altitude ceiling (45 km by
 default). Click **FETCH** in the HUD to raise it to 100, 250, or 500 km; higher
-ceilings use more API credits. Shodan is the exception: it is searched only
-below 45 km, whatever FETCH is set to. See [Altitude gate](#altitude-gate).
+ceilings use more API credits. Aircraft, events (TFRs, weather alerts, quakes)
+and vessels follow the separate **WIDE** ceiling instead (250 km by default).
+Shodan is the exception: it is searched only below 45 km, whatever FETCH is set
+to. See [Altitude gate](#altitude-gate).
 
 > [!IMPORTANT]
 > `SHODAN_API_KEY` is the one key the headline layer needs. Every other key in
@@ -270,6 +272,15 @@ toggle, which pauses automatic refetching at any altitude; see
 [Rate limits](#rate-limits-worth-knowing).) Anything already found stays
 drawn, and coverage is kept, so descending does not refetch ground already
 covered. Layers resume on their own as the camera settles below the ceiling.
+
+**Wide-area layers have their own, higher ceiling.** Live aircraft,
+situational awareness (TFRs, NWS and MeteoAlarm alerts, quakes, GDACS and the
+rest) and vessels describe things that span a region, so they keep loading
+below the **WIDE** ceiling, 250 km by default, while the local layers hold at
+FETCH. Click the **WIDE** cell in the HUD to cycle it through 100 / 250 /
+500 km; the choice sticks. WIDE never sits below FETCH: raising FETCH past it
+lifts these layers too. The query box is still capped at 4° (~440 km), so from
+very high up a fetch covers only the middle of the view.
 
 **Shodan has a fixed 45 km limit of its own.** It ignores the FETCH ceiling:
 raising FETCH to 500 km lets every other layer query from there, but Shodan

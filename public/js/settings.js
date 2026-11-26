@@ -68,6 +68,7 @@ export function collect(wv) {
 
     mode: wv.mode,
     queryCeilingM: wv.queryCeilingM,
+    wideCeilingM: wv.wideCeilingM,
     autoRefresh: wv.autoRefresh,
     cycle: wv.autoCycle ? {
       on: wv.autoCycle.on,
@@ -238,6 +239,7 @@ export function apply(wv, s) {
     overlays: o,
     mode: typeof s.mode === 'string' ? s.mode : null,
     queryCeilingM: Number.isFinite(s.queryCeilingM) ? s.queryCeilingM : null,
+    wideCeilingM: Number.isFinite(s.wideCeilingM) ? s.wideCeilingM : null,
     autoRefresh: bool(s.autoRefresh, null),
     cycle: s.cycle && typeof s.cycle === 'object'
       ? {

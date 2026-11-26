@@ -16,6 +16,7 @@ function fakeApp() {
   return {
     mode: 'flir',
     queryCeilingM: 100_000,
+    wideCeilingM: 500_000,
     autoRefresh: false,
     shodanSettleMs: 15000,
     autoCycle: { on: true, intervalS: 30, excluded: new Set(['satellites']) },
@@ -118,6 +119,7 @@ describe('collect', () => {
     assert.ok(Date.parse(s.savedAt));
     assert.equal(s.mode, 'flir');
     assert.equal(s.queryCeilingM, 100_000);
+    assert.equal(s.wideCeilingM, 500_000);
     assert.equal(s.autoRefresh, false);
     assert.deepEqual(s.cycle, { on: true, intervalS: 30, excluded: ['satellites'] });
     assert.equal(s.sidebarCollapsed, true);
@@ -188,6 +190,7 @@ describe('apply', () => {
     assert.equal(out.overlays.night, true);
     assert.equal(out.mode, 'flir');
     assert.equal(out.queryCeilingM, 100_000);
+    assert.equal(out.wideCeilingM, 500_000);
     assert.equal(out.autoRefresh, false);
     assert.deepEqual(out.cycle, { on: true, intervalS: 30, excluded: ['satellites'] });
     assert.equal(out.enabled.overpass, true);

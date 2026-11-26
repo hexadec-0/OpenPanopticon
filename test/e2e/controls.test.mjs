@@ -143,9 +143,10 @@ e2e('top bar, HUD and keyboard', () => {
       await page.click('#hud-gate');
       await page.waitForFunction((k) => document.querySelector('#hud-gate').textContent.includes(`${k}km`), {}, km);
     }
-    // Climb above the ceiling: view-bound layers hold, orbits carry on.
+    // Climb above both ceilings (FETCH 45 km, WIDE 250 km): view-bound
+    // layers hold, orbits carry on.
     try {
-      await lookAt(page, { lat: HOME.lat, lon: HOME.lon, h: 200_000 });
+      await lookAt(page, { lat: HOME.lat, lon: HOME.lon, h: 300_000 });
       // A fetch already in flight when the camera climbed can still land and
       // report "ok", so settle and ask again until the hold shows.
       await page.waitForFunction(async () => {
@@ -157,8 +158,36 @@ e2e('top bar, HUD and keyboard', () => {
       await page.waitForFunction(() => /HOLD ▲45km/.test(document.querySelector('#hud-gate').textContent), { timeout: 20_000 });
       assert.equal(await text$(page, `${row('flights')} .layer-count`), '↓');
       assert.equal(await page.evaluate(() => WV.layers.satellites.status), 'ok');
-      await waitToast(page, /Holding at 200 km/);
+      await waitToast(page, /Holding at 300 km/);
     } finally {
+      await lookAt(page, { lat: HOME.lat, lon: HOME.lon, h: 4000 });
+      await page.evaluate(() => WV.refreshAll());
+      await waitForLayer(page, 'flights');
+    }
+  });
+
+  test('wide-area layers follow the WIDE ceiling, not FETCH', async () => {
+    // The HUD is redrawn per frame, and the previous test has just brought
+    // the camera back down from above both ceilings.
+    await page.waitForFunction(() => document.querySelector('#hud-wide').textContent === 'ON <250km', { timeout: 20_000 });
+    try {
+      // Above FETCH (45 km) but below WIDE (250 km): aircraft keep loading.
+      await lookAt(page, { lat: HOME.lat, lon: HOME.lon, h: 150_000 });
+      await page.waitForFunction(() => /HOLD ▲45km/.test(document.querySelector('#hud-gate').textContent), { timeout: 20_000 });
+      assert.equal(await page.evaluate(() => WV.heldFor(WV.layers.flights)), false);
+      assert.equal(await page.evaluate(() => WV.heldFor(WV.layers.events)), false);
+      assert.equal(await page.evaluate(() => WV.heldFor(WV.layers.overpass)), true);
+      await page.evaluate(() => WV.refreshAll());
+      await waitForLayer(page, 'flights');
+      // Lowering WIDE to 100 km holds them too.
+      await page.click('#hud-wide');
+      await page.click('#hud-wide');
+      await waitToast(page, /now load below 100 km/);
+      assert.equal(await page.evaluate(() => WV.heldFor(WV.layers.flights)), true);
+    } finally {
+      // Back to the 250 km default.
+      await page.click('#hud-wide');
+      await page.waitForFunction(() => /250km/.test(document.querySelector('#hud-wide').textContent));
       await lookAt(page, { lat: HOME.lat, lon: HOME.lon, h: 4000 });
       await page.evaluate(() => WV.refreshAll());
       await waitForLayer(page, 'flights');
@@ -186,8 +215,16 @@ e2e('top bar, HUD and keyboard', () => {
   });
 
   test('the aircraft tooltip shows the poll interval and remaining credits', async () => {
-    await page.evaluate(() => WV.renderLayerStatus());
-    assert.match(await page.$eval(`${row('flights')} .layer-count`, (n) => n.title), /Polling every \d+s[\s\S]*OpenSky credits left today/);
+    // The live poll runs on its own timer, and while a fetch is in flight
+    // the readout is the loading tooltip instead. Check the status, redraw
+    // and read the title in one step, so a poll cannot land in between.
+    const sel = `${row('flights')} .layer-count`;
+    const title = await page.waitForFunction((s) => {
+      if (WV.layers.flights.status !== 'ok') return false;
+      WV.renderLayerStatus();
+      return document.querySelector(s).title;
+    }, { timeout: 20_000, polling: 100 }, sel).then((h) => h.jsonValue());
+    assert.match(title, /Polling every \d+s[\s\S]*OpenSky credits left today/);
   });
 
   // Regression: renderLayerStatus() used to empty #alerts on every redraw,

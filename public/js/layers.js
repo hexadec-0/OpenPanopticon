@@ -395,6 +395,11 @@ class Layer {
     // that takes a bbox is; orbital assets are not, and must keep working
     // from altitude because that is where you look at them from.
     this.viewportBound = true;
+    // Wide-area layers hold things that span a region (aircraft, hazard and
+    // airspace polygons, shipping lanes), which are read from a few hundred
+    // kilometres up. They answer to the WIDE ceiling instead of FETCH; see
+    // heldFor() in app.js.
+    this.wideArea = false;
     this.source = new Cesium.CustomDataSource(id);
     viewer.dataSources.add(this.source);
     this.source.show = false;
@@ -1507,6 +1512,7 @@ const SERVICE_COLORS = {
 export class FlightLayer extends Layer {
   constructor(viewer) {
     super(viewer, 'flights', 'Live aircraft');
+    this.wideArea = true;
     this.showLabels = true;
     this.showTrails = true;
     // Only contacts the aggregator's database flags as military.
@@ -2805,6 +2811,7 @@ const SEVERITY_STYLE = {
 export class EventLayer extends Layer {
   constructor(viewer) {
     super(viewer, 'events', 'Situational awareness');
+    this.wideArea = true;
     // Hazards resolve, so keep them a shorter time than static infrastructure.
     this.accumulate = true;
     this.cacheTtlMs = CURRENT_COVERAGE_MS;
@@ -3557,6 +3564,7 @@ const vesselColor = (t) => VESSEL_COLORS[t] || '#8ac6ff';
 export class VesselLayer extends Layer {
   constructor(viewer) {
     super(viewer, 'vessels', 'Vessels (AIS)');
+    this.wideArea = true;
     this.byType = {};
     this.stream = {};
     this.showNames = true;
@@ -4053,10 +4061,24 @@ export class WeatherOverlay {
   }
 
   async refresh() {
+    // A new frame list shifts every index, so the frame on screen is
+    // remembered by its timestamp. Watching the newest frame means following
+    // the newest frame; a frame picked on the slider stays picked until it
+    // ages out of the list.
+    const before = this.currentFrame();
+    const followLatest = this.frameIndex < 0 || before === this.frames[this.frames.length - 1];
     this.data = await api('/api/weather', this.forced ? { fresh: 1 } : null);
+    this.fetchedAt = Date.now();
+    this.frameIndex = followLatest ? -1 : this.frames.findIndex((f) => f.time === before?.time);
     if (this.radarOn) this.applyRadar();
     if (this.satOn) this.applySatellite();
+    this.onUpdate?.();
     return this.data;
+  }
+
+  /** Fetch the frame list again, keeping the last one if the fetch fails. */
+  async update() {
+    try { await this.refresh(); } catch (e) { if (!this.data) throw e; }
   }
 
   get frames() { return this.data?.radar?.frames || []; }
@@ -4081,6 +4103,9 @@ export class WeatherOverlay {
   applyRadar() {
     const frame = this.currentFrame();
     if (!frame) return;
+    // A refresh that brought no new frame leaves the layer alone rather than
+    // re-requesting every tile on screen.
+    if (this.radarLayer && this.radarUrl === frame.url) return;
     // Respect the source's real resolution ceiling; beyond it RainViewer
     // serves a "Zoom Level Not Supported" placeholder image.
     const next = this.makeLayer(frame.url, 0.78, this.data?.radar?.maxLevel ?? 7);
@@ -4089,7 +4114,19 @@ export class WeatherOverlay {
     // flashes bare basemap between frames.
     if (this.radarLayer) this.viewer.imageryLayers.remove(this.radarLayer, true);
     this.radarLayer = next;
+    this.radarUrl = frame.url;
+    this.redraw();
   }
+
+  /**
+   * Ask for a frame after a layer swap. The scene draws on demand, and
+   * Cesium answers an imagery change by asking for a frame only after the
+   * next one, so a swap made by a timer, with nothing else moving and no
+   * click to nudge it, would leave the old frame on screen until the map
+   * was touched. One frame is enough: Cesium keeps drawing while the new
+   * tiles load.
+   */
+  redraw() { this.viewer.scene?.requestRender?.(); }
 
   applySatellite() {
     // RainViewer advertises an infrared band but publishes no frames, so the
@@ -4099,10 +4136,13 @@ export class WeatherOverlay {
     const clouds = this.data?.clouds;
     const url = frames.length ? frames[frames.length - 1].url : clouds?.url;
     if (!url) return;
+    if (this.satLayer && this.satUrl === url) return;
     const next = this.makeLayer(url, 0.6, clouds?.maxLevel ?? 12);
     this.viewer.imageryLayers.add(next);
     if (this.satLayer) this.viewer.imageryLayers.remove(this.satLayer, true);
     this.satLayer = next;
+    this.satUrl = url;
+    this.redraw();
     this.cloudLabel = frames.length ? 'RainViewer infrared' : (clouds?.label || 'cloud imagery');
   }
 
@@ -4114,11 +4154,16 @@ export class WeatherOverlay {
   async setRadar(on) {
     this.radarOn = on;
     if (on) {
-      if (!this.data) await this.refresh();
+      // Switching radar on means "show me now": start from the newest frame
+      // of a fresh list, not whatever was fetched when the page loaded.
+      this.frameIndex = -1;
+      await this.update();
       this.applyRadar();
     } else {
       this.stop();
       if (this.radarLayer) { this.viewer.imageryLayers.remove(this.radarLayer, true); this.radarLayer = null; }
+      this.radarUrl = null;
+      this.redraw();
     }
     this.onUpdate?.();
   }
@@ -4126,11 +4171,13 @@ export class WeatherOverlay {
   async setSatellite(on) {
     this.satOn = on;
     if (on) {
-      if (!this.data) await this.refresh();
+      await this.update();
       this.applySatellite();
     } else if (this.satLayer) {
       this.viewer.imageryLayers.remove(this.satLayer, true);
       this.satLayer = null;
+      this.satUrl = null;
+      this.redraw();
     }
     this.onUpdate?.();
   }

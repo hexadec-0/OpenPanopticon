@@ -47,6 +47,19 @@ const el = (tag, cls, text) => {
 const QUERY_CEILING_DEFAULT_M = 45_000;
 const QUERY_CEILING_STEPS_M = [45_000, 100_000, 250_000, 500_000];
 
+/**
+ * The ceiling for wide-area layers (`Layer.wideArea`: aircraft, situational
+ * events such as TFRs and weather alerts, vessels).
+ *
+ * What these layers draw spans a region, so the view that makes sense of them
+ * is a regional one, well above the local FETCH ceiling. The WIDE cell in the
+ * HUD cycles it and the choice persists. It never sits below FETCH: raising
+ * FETCH past it lifts these layers too. The query box is still capped at 4
+ * degrees, so past ~500 km a fetch covers only the middle of the view.
+ */
+const WIDE_CEILING_DEFAULT_M = 250_000;
+const WIDE_CEILING_STEPS_M = [100_000, 250_000, 500_000];
+
 // Layers whose every upstream miss is paid for (a Shodan query credit). A
 // plain SYNC leaves them on their cached answers; Shift+SYNC forces them too.
 const METERED_LAYERS = new Set(['shodan']);
@@ -103,6 +116,7 @@ class OpenPanopticon {
     this.health = null;
     this.selected = null;
     this.queryCeilingM = QUERY_CEILING_DEFAULT_M;
+    this.wideCeilingM = WIDE_CEILING_DEFAULT_M;
     // Shodan's own settle delay (see SHODAN_SETTLE_DEFAULT_MS) and its timer.
     this.shodanSettleMs = SHODAN_SETTLE_DEFAULT_MS;
     this.shodanSettleTimer = null;
@@ -844,22 +858,53 @@ class OpenPanopticon {
   heldFor(layer) {
     if (globalThis.OP_DEMO || !layer.viewportBound) return false;
     if (layer.maxAltitudeM != null) return this.altitude() > layer.maxAltitudeM;
+    if (layer.wideArea) return this.altitude() > this.wideCeiling();
     return this.tooHigh();
   }
 
   /** The height a layer queries below, for the messages that explain a hold. */
-  ceilingFor(layer) { return layer.maxAltitudeM ?? this.queryCeilingM; }
+  ceilingFor(layer) {
+    return layer.maxAltitudeM ?? (layer.wideArea ? this.wideCeiling() : this.queryCeilingM);
+  }
+
+  /** The height wide-area layers query below: WIDE, or FETCH when that is higher. */
+  wideCeiling() { return Math.max(this.wideCeilingM, this.queryCeilingM); }
+
+  /** Whether any enabled, view-bound layer would query at the present height. */
+  anyQuerying() {
+    return Object.values(this.layers)
+      .some((l) => l.enabled && l.viewportBound && !this.heldFor(l));
+  }
+
+  /**
+   * Re-apply the altitude gate after a ceiling changed: refetch if anything
+   * now queries, and otherwise mark the layers the new ceiling holds.
+   */
+  applyCeilings() {
+    this.persist();
+    this.renderHud();
+    // Descending past the new ceiling should not wait for the next camera
+    // move to notice.
+    if (this.anyQuerying()) { this.refreshAll().catch(() => {}); return; }
+    for (const l of Object.values(this.layers)) if (l.enabled && this.heldFor(l)) l.holdForAltitude();
+    this.renderLayerStatus();
+  }
+
+  /** Step the wide-area ceiling up through its presets, wrapping round. */
+  cycleWideCeiling() {
+    const i = WIDE_CEILING_STEPS_M.indexOf(this.wideCeilingM);
+    this.wideCeilingM = WIDE_CEILING_STEPS_M[(i + 1) % WIDE_CEILING_STEPS_M.length];
+    this.applyCeilings();
+    const eff = Math.round(this.wideCeiling() / 1000);
+    this.toast(`Aircraft, events and vessels now load below ${eff} km`
+      + (this.wideCeiling() > this.wideCeilingM ? ' (FETCH is higher, so it sets the limit).' : '.'));
+  }
 
   /** Step the ceiling up through the presets, wrapping round. */
   cycleQueryCeiling() {
     const i = QUERY_CEILING_STEPS_M.indexOf(this.queryCeilingM);
     this.queryCeilingM = QUERY_CEILING_STEPS_M[(i + 1) % QUERY_CEILING_STEPS_M.length];
-    this.persist();
-    this.renderHud();
-    // Descending past the new ceiling should not wait for the next camera
-    // move to notice.
-    if (!this.tooHigh()) this.refreshAll().catch(() => {});
-    else this.renderLayerStatus();
+    this.applyCeilings();
     this.toast(`Queries now start below ${Math.round(this.queryCeilingM / 1000)} km.`);
   }
 
@@ -884,10 +929,17 @@ class OpenPanopticon {
       // about a deliberate hold, so say it plainly — once per arrival, not
       // on every settle.
       const sig = `${Math.round(this.altitude() / 1000)}`;
+      // Wide-area layers can still be loading up here; say so rather than
+      // claiming everything stopped.
+      const wide = Object.values(this.layers).filter((l) => l.enabled && l.wideArea && !this.heldFor(l));
       if (this._heldNotice !== sig) {
         this._heldNotice = sig;
-        this.toast(`Holding at ${Number(sig).toLocaleString()} km — nothing is queried above `
-          + `${Math.round(this.queryCeilingM / 1000)} km. Zoom in, or click FETCH to raise it.`);
+        this.toast(wide.length
+          ? `Holding at ${Number(sig).toLocaleString()} km — local layers are queried only below `
+            + `${Math.round(this.queryCeilingM / 1000)} km; ${wide.map((l) => l.label).join(', ')} `
+            + `keep loading below ${Math.round(this.wideCeiling() / 1000)} km (WIDE).`
+          : `Holding at ${Number(sig).toLocaleString()} km — nothing is queried above `
+            + `${Math.round(this.queryCeilingM / 1000)} km. Zoom in, or click FETCH to raise it.`);
       }
     } else this._heldNotice = null;
 
@@ -1111,7 +1163,7 @@ class OpenPanopticon {
     // on screen when it was hidden.
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState !== 'visible' || !this.autoRefresh) return;
-      if (this.tooHigh()) return;
+      // refreshOne applies each layer's own ceiling.
       if (this.layers.flights.enabled) this.refreshOne('flights').catch(() => {});
       if (this.layers.vessels.enabled) this.refreshOne('vessels').catch(() => {});
     });
@@ -1427,6 +1479,7 @@ class OpenPanopticon {
     this.buildDetailResize();
     this.buildCycleControl();
     $('#hud-gate').onclick = () => this.cycleQueryCeiling();
+    $('#hud-wide').onclick = () => this.cycleWideCeiling();
     this.setupAltitudeEntry();
     this.setupHeadingReset();
     $('#auto-toggle').onclick = (e) => {
@@ -1440,7 +1493,7 @@ class OpenPanopticon {
     // Shift+SYNC (or Shift+R) forces Shodan as well; a plain SYNC leaves it
     // on its cached answers, since forcing it spends a credit per cell.
     this.syncNow = (withMetered = false) => {
-      if (this.tooHigh()) {
+      if (this.tooHigh() && !this.anyQuerying()) {
         this.toast(`Nothing to refresh: holding above `
           + `${Math.round(this.queryCeilingM / 1000)} km. Zoom in, or click FETCH to raise it.`);
         return;
@@ -2125,8 +2178,19 @@ class OpenPanopticon {
     playBtn.onclick = () => w.toggleAnimation();
     slider.oninput = () => w.setFrame(Number(slider.value));
 
-    // RainViewer publishes a new radar frame every ~10 minutes.
-    setInterval(() => { if (w.radarOn || w.satOn) w.refresh().catch(() => {}); }, 5 * 60_000);
+    // RainViewer publishes a new radar frame every ~10 minutes and the server
+    // holds the frame list for 4, so asking every 2 minutes shows a new frame
+    // within a few minutes of it existing at little cost.
+    const WX_POLL_MS = 2 * 60_000;
+    // Lettering goes back on top of the swapped-in layer, as after a toggle.
+    const poll = () => {
+      if (w.radarOn || w.satOn) w.refresh().then(() => this.labels.bringToFront()).catch(() => {});
+    };
+    setInterval(poll, WX_POLL_MS);
+    // Background tabs have their timers throttled; catch up on return.
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible' && !(Date.now() - (w.fetchedAt || 0) < WX_POLL_MS)) poll();
+    });
   }
 
   buildImageryBar() {
@@ -2301,6 +2365,7 @@ class OpenPanopticon {
 
     if (s.mode && OPTICAL_MODES[s.mode]) this.setMode(s.mode);
     if (QUERY_CEILING_STEPS_M.includes(s.queryCeilingM)) this.queryCeilingM = s.queryCeilingM;
+    if (WIDE_CEILING_STEPS_M.includes(s.wideCeilingM)) this.wideCeilingM = s.wideCeilingM;
 
     if (s.autoRefresh === false) {
       this.autoRefresh = false;
@@ -2728,6 +2793,8 @@ class OpenPanopticon {
           + (layer.maxAltitudeM != null
             ? '\nThis layer has its own limit, separate from FETCH: above it a search '
               + 'covers a whole region and returns only a sample of it.'
+            : layer.wideArea
+            ? '\nA wide-area layer: it follows the WIDE ceiling in the HUD, not FETCH.'
             : '');
       }
       else if (layer.status === 'loading' && !frozen) {
@@ -3014,10 +3081,26 @@ class OpenPanopticon {
           + 'fetched — live aircraft and vessels included. Press AUTO to resume, '
           + 'or SYNC for a single update.'
         : high
-          ? `Holding: nothing is queried above ${km} km, and you are at `
+          ? `Holding: local layers are not queried above ${km} km, and you are at `
             + `${Math.round(this.altitude() / 1000).toLocaleString()} km. `
-            + 'Descend, or click to raise the ceiling.'
-          : `Querying. Nothing is fetched above ${km} km — click to change.`;
+            + 'Descend, or click to raise the ceiling. Aircraft, events and vessels '
+            + 'follow the WIDE ceiling instead.'
+          : `Querying. Local layers are not fetched above ${km} km — click to change.`;
+    }
+    const wide = $('#hud-wide');
+    if (wide) {
+      const wkm = Math.round(this.wideCeiling() / 1000);
+      const wideHigh = !globalThis.OP_DEMO && this.altitude() > this.wideCeiling();
+      wide.textContent = globalThis.OP_DEMO ? 'SNAPSHOT' : !this.autoRefresh ? 'PAUSED'
+        : wideHigh ? `HOLD ▲${wkm}km` : `ON <${wkm}km`;
+      wide.classList.toggle('holding', wideHigh || !this.autoRefresh);
+      wide.title = globalThis.OP_DEMO
+        ? 'Static snapshot: everything was loaded at once, so nothing more is fetched.'
+        : `Wide-area layers (aircraft, events and TFRs, vessels) load below ${wkm} km, `
+          + 'whatever FETCH says for local layers. Click to change.'
+          + (this.wideCeiling() > this.wideCeilingM
+            ? ` FETCH is set higher than WIDE (${Math.round(this.wideCeilingM / 1000)} km), so FETCH sets this limit.`
+            : '');
     }
     $('#hud-alt').textContent = c.height > 10000
       ? `${(c.height / 1000).toFixed(1)} km`
